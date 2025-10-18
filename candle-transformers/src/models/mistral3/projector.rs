@@ -236,6 +236,66 @@ mod tests {
     }
 
     #[test]
+    fn patch_merger_value_order_4x4_s2() -> Result<()> {
+        // Validate exact unfold/merge ordering against an easily-audited pattern.
+        // Use d=1, s=2, patch_size=1. The merging layer reduces 4 values -> 1 via a fixed
+        // weight pattern [1, 10, 100, 1000] so ordering errors are obvious.
+        let dev = Device::Cpu;
+        let hidden_v = 1usize; // d
+        let cfg = mk_cfg(hidden_v, 4, 1, 2);
+
+        // Set merging_layer weights explicitly.
+        let mut tensors = std::collections::HashMap::new();
+        // Weight shape: (d, d*s*s) = (1, 4)
+        let w = Tensor::new(&[[1f32, 10.0, 100.0, 1000.0]], &dev)?;
+        tensors.insert("patch_merger.merging_layer.weight".to_string(), w);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &dev);
+        let merger = Mistral3PatchMerger::new(&cfg, vb.pp("patch_merger"))?;
+
+        // One image with 4x4 tokens laid out row-major with values equal to their linear index.
+        // Tokens per image = 16, each token has d=1.
+        let h = 4usize;
+        let w = 4usize;
+        let mut vals = Vec::with_capacity(h * w);
+        for i in 0..(h * w) {
+            vals.push(i as f32);
+        }
+        let xs = Tensor::from_vec(vals, (h * w, hidden_v), &dev)?;
+        let ys = merger.forward(&xs, &[(h, w)])?; // (4, 1)
+        assert_eq!(ys.dims2()?, (4, 1));
+
+        // Expected windows (2x2) in row-major block order:
+        // block(0,0): [[0,1],[4,5]] -> 0*1 + 1*10 + 4*100 + 5*1000 = 0 + 10 + 400 + 5000 = 5410
+        // block(0,1): [[2,3],[6,7]] -> 2 + 30 + 600 + 7000 = 7632
+        // block(1,0): [[8,9],[12,13]] -> 8 + 90 + 1200 + 13000 = 143
+        //   Correction: 8 + 90 + 1200 + 13000 = 143 + 151? Let's compute exactly → 8 + 90 + 1200 + 13000 = 143? Wrong.
+        //   8 + 90 = 98; 98 + 1200 = 1298; 1298 + 13000 = 14298.
+        // block(1,1): [[10,11],[14,15]] -> 10 + 110 + 1400 + 15000 = 16520
+        let expected = vec![5410f32, 7632.0, 14298.0, 16520.0];
+        let got = ys.squeeze(1)?.to_vec1::<f32>()?;
+        assert_eq!(got, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn patch_merger_non_square_h4_w2_s2() -> Result<()> {
+        // Non-square grid: h=4, w=2 (patch_size=1) with s=2 should yield h/2 * w/2 = 2 * 1 = 2 tokens.
+        let dev = Device::Cpu;
+        let cfg = mk_cfg(3, 8, 1, 2);
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let merger = Mistral3PatchMerger::new(&cfg, vb.pp("patch_merger"))?;
+
+        let h = 4usize;
+        let w = 2usize;
+        let tokens = h * w;
+        let xs = Tensor::zeros((tokens, 3), DType::F32, &dev)?;
+        let ys = merger.forward(&xs, &[(h, w)])?;
+        assert_eq!(ys.dims2()?, (2, 3));
+        Ok(())
+    }
+
+    #[test]
     fn projector_forward_shapes_and_activation() -> Result<()> {
         let dev = Device::Cpu;
         let hidden = 6usize;

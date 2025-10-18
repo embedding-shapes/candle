@@ -165,3 +165,7 @@ required-features = ["single-file-binary-builder"]
 [[example]]
 name = "magistral"
 required-features = ["tekken"]
+
+[[example]]
+name = "magistral_sanity"
+required-features = ["tekken"]
