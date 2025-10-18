@@ -25,6 +25,14 @@ impl Mistral3PatchMerger {
         })
     }
 
+    pub fn spatial_merge_size(&self) -> usize {
+        self.spatial_merge_size
+    }
+
+    pub fn patch_size(&self) -> usize {
+        self.patch_size
+    }
+
     /// Forward pass matching the PyTorch `Mistral3PatchMerger` logic.
     ///
     /// - `image_features` shape: (total_tokens_across_images, hidden_v).
