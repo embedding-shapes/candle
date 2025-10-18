@@ -62,25 +62,37 @@ impl Mistral3PatchMerger {
         let mut merged: Vec<Tensor> = Vec::with_capacity(chunks.len());
         for (image_index, image_tokens) in chunks.into_iter().enumerate() {
             let (h, w) = grid_sizes[image_index];
-            // Safety: tests and typical usage ensure divisibility by s.
             let h_blocks = h / s;
             let w_blocks = w / s;
 
-            // Reshape to (h, w, d) then to (1, d, h, w).
-            let img = image_tokens.reshape((h, w, d))?;
-            let img = img.permute((2, 0, 1))?; // (d, h, w)
-            let img = img.unsqueeze(0)?; // (1, d, h, w)
+            // If either dimension has no full s-sized block, this image contributes zero tokens.
+            if h_blocks == 0 || w_blocks == 0 {
+                let dev = image_tokens.device();
+                let dtype = image_tokens.dtype();
+                let empty = Tensor::zeros((0, d), dtype, dev)?;
+                merged.push(empty);
+                continue;
+            }
 
-            // Space-to-depth (non-overlapping windows):
-            // (1, d, h, w) -> (1, d, s, s, h//s, w//s) -> (1, d*s*s, h//s, w//s)
+            let eff_h = h_blocks * s;
+            let eff_w = w_blocks * s;
+
+            // Reshape to (h, w, d), crop to multiples of s, then to (1, d, eff_h, eff_w).
+            let img = image_tokens.reshape((h, w, d))?;
+            let img = img.narrow(0, 0, eff_h)?;
+            let img = img.narrow(1, 0, eff_w)?;
+            let img = img.permute((2, 0, 1))?; // (d, eff_h, eff_w)
+            let img = img.unsqueeze(0)?; // (1, d, eff_h, eff_w)
+
+            // Space-to-depth (non-overlapping windows) like PyTorch unfold with kernel=stride=s.
+            // (1, d, eff_h, eff_w) -> (1, d, s, s, h_blocks, w_blocks) -> (1, d*s*s, h_blocks, w_blocks)
             let y = img
                 .reshape((1, d, h_blocks, s, w_blocks, s))?
                 .permute((0, 1, 3, 5, 2, 4))? // (1, d, s, s, h_blocks, w_blocks)
                 .reshape((1, d * s * s, h_blocks, w_blocks))?;
 
-            // (1, d*s*s, h_blocks, w_blocks) -> (h_blocks * w_blocks, d*s*s)
+            // (1, d*s*s, h_blocks, w_blocks) -> (h_blocks * w_blocks, d*s*s), then merge d*s*s -> d.
             let y = y.permute((0, 2, 3, 1))?.reshape((h_blocks * w_blocks, d * s * s))?;
-            // Apply the merging linear layer on each window.
             let y = y.apply(&self.merging_layer)?; // (h_blocks * w_blocks, d)
             merged.push(y);
         }

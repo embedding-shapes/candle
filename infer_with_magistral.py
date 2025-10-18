@@ -5,6 +5,7 @@ import torch
 from pathlib import Path
 
 from transformers import Mistral3ForConditionalGeneration, AutoTokenizer
+from PIL import Image
 import argparse
 import json
 
@@ -127,6 +128,101 @@ def main() -> None:
     attention_mask = torch.tensor(tokenized.attention_mask, device="cuda").unsqueeze(0)
     pixel_values = torch.tensor(tokenized.pixel_values[0], dtype=torch.bfloat16, device="cuda").unsqueeze(0)
     image_sizes = torch.tensor(pixel_values.shape[-2:], device="cuda").unsqueeze(0)
+
+    # Unified debug block (JSON) for cross-impl comparison
+    try:
+        # Image metadata
+        with Image.open(image_path) as im:
+            orig_w, orig_h = im.size
+        file_bytes = os.path.getsize(image_path)
+
+        # Preproc and grid
+        patch_size = int(getattr(getattr(model.config, "vision_config", object()), "patch_size", 14))
+        s = int(getattr(model.config, "spatial_merge_size", 2))
+        h, w = int(pixel_values.shape[-2]), int(pixel_values.shape[-1])
+        grid_h, grid_w = h // patch_size, w // patch_size
+        eff_grid_h, eff_grid_w = grid_h // s, grid_w // s
+        placeholders = int((grid_h // s) * (grid_w // s))
+        downsample_ratio = patch_size * s
+
+        # Tokenizer info
+        image_token_id = int(getattr(model.config, "image_token_id", -1))
+        eos_token_id = int(getattr(tokenizer, "eos_token_id", -1))
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        pad_token_id = int(pad_token_id) if pad_token_id is not None else None
+        num_image_placeholders = sum(1 for tid in tokenized.input_ids if tid == image_token_id)
+
+        # Pixel stats on normalized values
+        pv = pixel_values.to(dtype=torch.float32)
+        B, C, HH, WW = pv.shape
+        per_ch = []
+        for c in range(C):
+            t = pv[0, c]
+            vmin = float(t.min().item())
+            vmax = float(t.max().item())
+            mean = float(t.mean().item())
+            var = float(((t - mean) ** 2).mean().item())
+            std = float(var ** 0.5)
+            ssum = float(t.sum().item())
+            ssum2 = float((t * t).sum().item())
+            per_ch.append({"min": vmin, "max": vmax, "mean": mean, "std": std, "sum": ssum, "sum_sq": ssum2})
+        g = pv[0]
+        gmin = float(g.min().item())
+        gmax = float(g.max().item())
+        gmean = float(g.mean().item())
+        gvar = float(((g - gmean) ** 2).mean().item())
+        gstd = float(gvar ** 0.5)
+        gsum = float(g.sum().item())
+        gsum2 = float((g * g).sum().item())
+        first_vals = [float(x) for x in pv[0, 0, 0, :8].tolist()]
+
+        debug = {
+            "image": {
+                "path": str(image_path),
+                "orig_w": int(orig_w),
+                "orig_h": int(orig_h),
+                "file_bytes": int(file_bytes),
+            },
+            "preproc": {
+                "impl": "hf_llava_next",
+                "target_max_side": 1540,
+                "resample": "bicubic",
+                "patch_size": int(patch_size),
+                "spatial_merge_size": int(s),
+                "downsample_ratio": int(downsample_ratio),
+                "resized_h": int(h),
+                "resized_w": int(w),
+                "grid_h": int(grid_h),
+                "grid_w": int(grid_w),
+                "eff_grid_h": int(eff_grid_h),
+                "eff_grid_w": int(eff_grid_w),
+                "placeholders": int(placeholders),
+            },
+            "pixels": {
+                "dtype": "bf16",
+                "shape": [int(B), int(C), int(HH), int(WW)],
+                "per_channel": per_ch,
+                "global": {"min": gmin, "max": gmax, "mean": gmean, "std": gstd, "sum": gsum, "sum_sq": gsum2},
+                "first_values_ch0_row0": first_vals,
+            },
+            "tokenizer": {
+                "input_ids_len": int(len(tokenized.input_ids)),
+                "image_token_id": int(image_token_id),
+                "eos_token_id": int(eos_token_id),
+                "pad_token_id": pad_token_id,
+                "num_image_placeholders": int(num_image_placeholders),
+            },
+            "model": {
+                "id": args.model_id,
+                "device": "cuda",
+                "vision_dtype": "bf16",
+                "text_dtype": "bf16",
+            },
+        }
+        print("=== magistral_debug ===")
+        print(json.dumps(debug, indent=2, sort_keys=True))
+    except Exception as e:
+        print(f"debug block failed: {e}")
 
     # Compute patch grid dims
     patch_size = int(getattr(getattr(model.config, "vision_config", object()), "patch_size", 14))
