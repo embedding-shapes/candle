@@ -53,8 +53,10 @@ impl Model {
     /// are ever requested, concatenate along the feature dim before projection. Currently,
     /// Pixtral vision tower does not expose hidden states, so only `Single(-1)` is supported.
     ///
-    /// Returns (num_images, hidden_t) by mean-pooling merged tokens per image to provide a
-    /// single embedding per [IMG] placeholder.
+    /// Returns the full sequence of projected image tokens for the whole batch:
+    /// (sum over images of merged_token_count, hidden_t).
+    /// No pooling is applied; callers should ensure the text side contains the same number
+    /// of [IMG] placeholders so a one-to-one replacement can be performed.
     pub fn get_image_features(
         &self,
         pixel_values: &Tensor,
@@ -88,29 +90,7 @@ impl Model {
             .multi_modal_projector
             .forward(&flat, &image_sizes_usize)?; // (sum merged tokens, hidden_t)
 
-        // Compute merged tokens per image and mean-pool to get 1 embedding per image.
-        let s = self.multi_modal_projector.patch_merger.spatial_merge_size();
-        let mut per_image: Vec<Tensor> = Vec::with_capacity(b);
-        let mut start = 0usize;
-        for (h_px, w_px) in image_sizes_usize.iter().copied() {
-            // Convert pixel sizes to patch grid, then to merged grid size
-            let gh = h_px / self.patch_size;
-            let gw = w_px / self.patch_size;
-            let mh = gh / s;
-            let mw = gw / s;
-            let t_i = mh * mw;
-            if t_i == 0 {
-                candle::bail!(
-                    "invalid merged token count: image ({h_px}x{w_px}), patch_size {}, s {}",
-                    self.patch_size,
-                    s
-                );
-            }
-            let seg = projected.narrow(0, start, t_i)?; // (t_i, hidden_t)
-            per_image.push(seg.mean(0)?); // (hidden_t)
-            start += t_i;
-        }
-        Tensor::stack(&per_image, 0) // (B, hidden_t)
+        Ok(projected)
     }
 
     /// Find positions of [IMG] tokens in input_ids.
@@ -239,7 +219,32 @@ impl Model {
         }
 
         // Language model forward from embeddings
-        self.language_model.forward_embeds(&inputs_embeds, None, index_pos)
+        let seq_len = inputs_embeds.dim(1)?;
+        let attn_mask = if seq_len <= 1 {
+            None
+        } else {
+            // Build a standard causal mask of shape (1,1,L,L+index_pos)
+            let l = seq_len;
+            let device = inputs_embeds.device();
+            let mut mask: Vec<f32> = Vec::with_capacity(l * l);
+            for i in 0..l {
+                for j in 0..l {
+                    mask.push(if i < j { f32::NEG_INFINITY } else { 0.0 });
+                }
+            }
+            let mask = Tensor::from_vec(mask, (l, l), device)?;
+            let mask = if index_pos > 0 {
+                let prefix = Tensor::zeros((l, index_pos), DType::F32, device)?;
+                Tensor::cat(&[&prefix, &mask], candle::D::Minus1)?
+            } else {
+                mask
+            };
+            let mask = mask.expand((1, 1, l, l + index_pos))?;
+            let mask = mask.to_dtype(self.dtype)?;
+            Some(mask)
+        };
+        self.language_model
+            .forward_embeds(&inputs_embeds, attn_mask.as_ref(), index_pos)
     }
 }
 

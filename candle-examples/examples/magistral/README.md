@@ -9,7 +9,6 @@ Usage examples (CUDA, with default model id):
 
 Notes
 - The example fetches the following from the model snapshot: `config.json`, `model.safetensors.index.json` (+ shards), `tekken.json`, `SYSTEM_PROMPT.txt`.
-- Image preprocessing uses Pixtral’s normalization constants and resizes to 1540x1540.
+- Image preprocessing preserves aspect ratio: the longest side is 1540, both dimensions are rounded down to multiples of 14, and Pixtral mean/std normalization is applied.
 - Tokenization: special token ids are parsed from `tekken.json` (no hardcoding), normal text is encoded via `tekken-rs`.
 - Generation: on the first step, the model is called with `pixel_values` and `image_sizes`; subsequent steps use text-only.
-

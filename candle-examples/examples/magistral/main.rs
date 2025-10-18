@@ -12,7 +12,8 @@ use anyhow::{Context as _, Error as E, Result};
 use clap::Parser;
 
 use candle::{DType, IndexOp, Tensor};
-use candle_examples::imagenet::load_image_with_std_mean;
+mod preproc;
+use preproc::{compute_pixtral_resize_dims, load_image_pixtral};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::mistral3::{
@@ -120,7 +121,7 @@ fn build_input_ids(
     sp: &SpecialIds,
     system_prompt: &str,
     user_prompt: &str,
-    include_image: bool,
+    img_placeholders: usize,
 ) -> Result<Vec<u32>> {
     // Minimal instruct-style template using tekken special tokens.
     // <s>[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT][INST]{[IMG]?}{user}[/INST]
@@ -135,9 +136,9 @@ fn build_input_ids(
     ids.append(&mut sys_ids);
     ids.push(sp.sys_end);
 
-    // User instruction with optional [IMG]
+    // User instruction with optional [IMG] placeholders
     ids.push(sp.inst);
-    if include_image {
+    for _ in 0..img_placeholders {
         ids.push(sp.img);
     }
     let mut user_ids = tok
@@ -196,16 +197,40 @@ fn main() -> Result<()> {
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
     let mut model = Mistral3::new(&config, vb)?;
 
-    // Image preprocessing
-    let image = load_image_with_std_mean(&args.image, IMAGE_RES, &PIXTRAL_MEAN, &PIXTRAL_STD)?
+    // Image preprocessing (Pixtral-style):
+    // - Resize preserving aspect ratio so the longest edge is 1540
+    // - Round both H and W down to a multiple of the patch size (14)
+    // - Normalize using Pixtral mean/std
+    let patch = {
+        // Prefer reading from config to avoid drift
+        let p = config.vision_config.inner.patch_size as usize;
+        if p == 0 { 14 } else { p }
+    };
+    let s = config.spatial_merge_size.max(1);
+    let (new_h, new_w) = compute_pixtral_resize_dims(&args.image, IMAGE_RES, patch * s)?;
+    let image = load_image_pixtral(&args.image, new_h, new_w, &PIXTRAL_MEAN, &PIXTRAL_STD)?
         .to_device(&device)?
         .unsqueeze(0)?; // (1, C, H, W)
     let (_b, _c, h, w) = image.dims4()?;
     let image_sizes: Vec<(u32, u32)> = vec![(h as u32, w as u32)];
-    println!("loaded image with shape {:?}, sizes {:?}", image.dims(), image_sizes);
+    let grid_h = h / patch;
+    let grid_w = w / patch;
+    println!(
+        "loaded image with shape {:?}, sizes {:?} (patch={} grid={}x{})",
+        image.dims(), image_sizes, patch, grid_h, grid_w
+    );
+
+    // Compute the number of image placeholders needed after patch merging
+    let num_image_tokens = (grid_h / s) * (grid_w / s);
 
     // Build input ids
-    let input_ids_vec = build_input_ids(&tokenizer, &sp, &system_prompt, &args.prompt, true)?;
+    let input_ids_vec = build_input_ids(
+        &tokenizer,
+        &sp,
+        &system_prompt,
+        &args.prompt,
+        num_image_tokens,
+    )?;
     if args.print_token_ids {
         println!("input token ids ({}): {:?}", input_ids_vec.len(), input_ids_vec);
     }
