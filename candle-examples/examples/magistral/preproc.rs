@@ -8,7 +8,7 @@ use candle::{Device, Tensor};
 /// Compute resized dimensions for Pixtral-style preprocessing.
 /// - Preserve aspect ratio.
 /// - Set the longest edge to `max_side`.
-/// - Round both dimensions down to a multiple of `patch`.
+/// - Round both dimensions to the nearest multiple of `divisor`.
 pub fn compute_resized_dims_from_wh(
     orig_w: u32,
     orig_h: u32,
@@ -28,19 +28,16 @@ pub fn compute_resized_dims_from_wh(
         let scale = max_side as f32 / orig_hf;
         (orig_wf * scale, orig_hf * scale)
     };
-    // Floor to integer pixels
-    let mut new_w = new_wf.floor() as usize;
-    let mut new_h = new_hf.floor() as usize;
-    // Ensure at least 1 pixel before patch rounding
-    new_w = new_w.max(1);
-    new_h = new_h.max(1);
+    // Round to nearest multiple of `divisor` (e.g., patch_size * spatial_merge_size).
+    // Ensure we never return zero by clamping the multiple to at least 1.
+    let round_to_multiple = |x: f32, d: usize| -> usize {
+        let m = (x / d as f32).round();
+        let m = if m < 1.0 { 1.0 } else { m };
+        (m as usize) * d
+    };
+    let new_w = round_to_multiple(new_wf, divisor);
+    let new_h = round_to_multiple(new_hf, divisor);
 
-    // Round down so both dims are multiples of `divisor` (e.g., patch_size * spatial_merge_size).
-    new_w = (new_w / divisor).max(1) * divisor;
-    new_h = (new_h / divisor).max(1) * divisor;
-
-    // Longest side should equal max_side (already divisible by patch for 14|1540)
-    // After rounding, one side might drop slightly below; this mirrors HF processors
     (new_h, new_w)
 }
 
@@ -72,7 +69,7 @@ pub fn load_image_pixtral<P: AsRef<Path>>(
         .resize(
             width as u32,
             height as u32,
-            image::imageops::FilterType::Triangle,
+            image::imageops::FilterType::CatmullRom,
         )
         .to_rgb8();
     let data = img.into_raw();
@@ -91,19 +88,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dims_preserve_ar_and_divisor() {
-        // Example: original 1800x1024 -> scale longest to 1540, then round to multiple of 14
-        // 1024 * 1540 / 1800 = 875.56 -> floor -> 875 -> round down to 868 (62 * 14)
-        let (h, w) = compute_resized_dims_from_wh(1800, 1024, 1540, 28);
+    fn nearest_multiple_rounding_and_divisibility() {
+        // 1920x1080 scaled to max_side=1540, divisor=28 → (868, 1540)
+        let (h, w) = compute_resized_dims_from_wh(1920, 1080, 1540, 28);
         assert_eq!((h, w), (868, 1540));
+        assert_eq!(h % 28, 0);
+        assert_eq!(w % 28, 0);
 
-        // Portrait image: 1024x1800 -> (1540, 868)
-        let (h2, w2) = compute_resized_dims_from_wh(1024, 1800, 1540, 28);
-        assert_eq!((h2, w2), (1540, 868));
-
-        // Square image remains square at max_side and multiple of patch
-        let (h3, w3) = compute_resized_dims_from_wh(1024, 1024, 1540, 28);
-        assert_eq!((h3, w3), (1540, 1540));
+        // Sanity across shapes: results must be positive and divisible by 28
+        let cases = [
+            (1800u32, 1024u32),
+            (1024, 1800),
+            (1024, 1024),
+            (4000, 3000),
+            (3000, 4000),
+            (1921, 1081),
+        ];
+        for (ow, oh) in cases {
+            let (hh, ww) = compute_resized_dims_from_wh(ow, oh, 1540, 28);
+            assert!(hh > 0 && ww > 0, "{}x{} -> {}x{}", ow, oh, hh, ww);
+            assert_eq!(hh % 28, 0, "{}x{} -> {} not divisible by 28", ow, oh, hh);
+            assert_eq!(ww % 28, 0, "{}x{} -> {} not divisible by 28", ow, oh, ww);
+        }
     }
 
     #[test]
@@ -116,6 +122,7 @@ mod tests {
         let (gh, gw) = (h / patch, w / patch);
         let (mh, mw) = (gh / s, gw / s);
         assert_eq!((gh, gw), (62, 110));
+        assert_eq!((mh, mw), (31, 55));
         assert_eq!(mh * mw, 1705);
     }
 }

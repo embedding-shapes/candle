@@ -203,9 +203,9 @@ fn main() -> Result<()> {
         if p == 0 { 14 } else { p }
     };
     let s = config.spatial_merge_size.max(1);
-    // Resize rounding to multiples of the patch size (not patch*s),
-    // matching HF processors; the merge happens logically later.
-    let (new_h, new_w) = compute_pixtral_resize_dims(&args.image, IMAGE_RES, patch)?;
+    // Resize rounding to multiples of the downsample ratio (patch * s),
+    // matching HF/HuggingFace processors that operate on the merged-patch grid.
+    let (new_h, new_w) = compute_pixtral_resize_dims(&args.image, IMAGE_RES, patch * s)?;
     let image = load_image_pixtral(&args.image, new_h, new_w, &PIXTRAL_MEAN, &PIXTRAL_STD)?
         .to_device(&device)?
         .unsqueeze(0)?; // (1, C, H, W)
@@ -304,7 +304,7 @@ fn main() -> Result<()> {
         "preproc": {
             "impl": "candle_preproc",
             "target_max_side": IMAGE_RES as i64,
-            "resample": "triangle",
+            "resample": "bicubic",
             "patch_size": patch as i64,
             "spatial_merge_size": s as i64,
             "downsample_ratio": (patch * s) as i64,

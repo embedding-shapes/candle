@@ -14,7 +14,6 @@ use hf_hub::{api::sync::Api, Repo, RepoType};
 use serde::Deserialize;
 
 use candle::{DType, IndexOp, Tensor};
-use candle_examples::imagenet::load_image_with_std_mean;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::mistral3::{config::Mistral3Config, model::Mistral3Cache};
@@ -27,6 +26,39 @@ const DEFAULT_REVISION: &str = "main";
 const PIXTRAL_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
 const PIXTRAL_STD: [f32; 3] = [0.26862954, 0.2613026, 0.2757771];
 const IMAGE_RES: usize = 1540;
+
+// Minimal, self-contained Pixtral preproc helpers to mirror the main example.
+fn compute_resized_dims_from_wh(orig_w: u32, orig_h: u32, max_side: usize, divisor: usize) -> (usize, usize) {
+    let divisor = divisor.max(1);
+    let max_side = max_side.max(divisor);
+    let (wf, hf) = (orig_w as f32, orig_h as f32);
+    let (nw, nh) = if orig_w >= orig_h {
+        let s = max_side as f32 / wf;
+        (wf * s, hf * s)
+    } else {
+        let s = max_side as f32 / hf;
+        (wf * s, hf * s)
+    };
+    let round_mul = |x: f32, d: usize| -> usize {
+        let m = (x / d as f32).round();
+        let m = if m < 1.0 { 1.0 } else { m };
+        (m as usize) * d
+    };
+    (round_mul(nh, divisor), round_mul(nw, divisor))
+}
+
+fn load_image_pixtral(path: &str, h: usize, w: usize, mean: &[f32; 3], std: &[f32; 3]) -> Result<Tensor> {
+    use candle::{Device, Tensor};
+    if h == 0 || w == 0 { return Err(E::msg("invalid target size")); }
+    let img = image::ImageReader::open(path)?.decode().map_err(candle::Error::wrap)?
+        .resize(w as u32, h as u32, image::imageops::FilterType::CatmullRom)
+        .to_rgb8();
+    let data = img.into_raw();
+    let data = Tensor::from_vec(data, (h, w, 3), &Device::Cpu)?.permute((2, 0, 1))?;
+    let mean = Tensor::new(mean, &Device::Cpu)?.reshape((3, 1, 1))?;
+    let std = Tensor::new(std, &Device::Cpu)?.reshape((3, 1, 1))?;
+    Ok(((data.to_dtype(DType::F32)? / 255.)?).broadcast_sub(&mean)?.broadcast_div(&std)?)
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -247,16 +279,23 @@ fn main() -> Result<()> {
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
     let mut model = Mistral3::new(&config, vb)?;
 
-    // Image preprocessing (match Pixtral mean/std and 1540 resizing)
-    let image = load_image_with_std_mean(&args.image, IMAGE_RES, &PIXTRAL_MEAN, &PIXTRAL_STD)?
+    // Image preprocessing: use the same Pixtral pipeline as the main example
+    let patch = {
+        let p = config.vision_config.inner.patch_size as usize;
+        if p == 0 { 14 } else { p }
+    };
+    let s = config.spatial_merge_size.max(1);
+    let (ow, oh) = image::image_dimensions(&args.image).map_err(candle::Error::wrap)?;
+    let (h_tgt, w_tgt) = compute_resized_dims_from_wh(ow, oh, IMAGE_RES, patch * s);
+    let image = load_image_pixtral(&args.image, h_tgt, w_tgt, &PIXTRAL_MEAN, &PIXTRAL_STD)?
         .to_device(&device)?
         .unsqueeze(0)?; // (1, C, H, W)
     let (_b, _c, h, w) = image.dims4()?;
-    let rust_grid_h = h / config.vision_config.inner.patch_size;
-    let rust_grid_w = w / config.vision_config.inner.patch_size;
+    let rust_grid_h = h / patch;
+    let rust_grid_w = w / patch;
     println!(
         "rust image: {}x{}, patch {} → grid {}x{}",
-        h, w, config.vision_config.inner.patch_size, rust_grid_h, rust_grid_w
+        h, w, patch, rust_grid_h, rust_grid_w
     );
 
     assert_eq!(rust_grid_h, py.grid_h, "grid_h mismatch");
