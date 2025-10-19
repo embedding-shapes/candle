@@ -169,6 +169,74 @@ pub fn load_linear_maybe_mxfp4(
     candle_nn::linear_b(in_dim, out_dim, bias, vb_bf16)
 }
 
+/// Load a single expert’s Linear from grouped MXFP4 tensors stored under a common base
+/// such as "experts.gate_up_proj" where the underlying tensors have a leading expert
+/// dimension, e.g. `blocks: [n_experts, out_dim, in_dim/32, 16]` and `scales: [n_experts, out_dim, in_dim/32]`.
+///
+/// - `vb` should point at the module scope where the grouped tensors reside (e.g., the layer's `mlp`).
+/// - `base` is the common prefix (e.g., "experts.gate_up_proj" or "experts.down_proj").
+/// - `expert_idx` selects which expert slice to load.
+pub fn load_expert_linear_mxfp4_grouped(
+    in_dim: usize,
+    out_dim: usize,
+    bias: bool,
+    vb: candle_nn::VarBuilder,
+    base: &str,
+    expert_idx: usize,
+    n_experts: usize,
+) -> Result<Linear> {
+    // Try paired grouped names: either dot or underscore variants.
+    let blocks_dot = format!("{base}_blocks");
+    let scales_dot = format!("{base}_scales");
+    let has_us = vb.contains_tensor(&blocks_dot) && vb.contains_tensor(&scales_dot);
+    let (blocks_name, scales_name) = if has_us {
+        (blocks_dot, scales_dot)
+    } else {
+        // Also support dot suffix within grouped context: base.blocks / base.scales
+        let blocks_alt = format!("{base}.blocks");
+        let scales_alt = format!("{base}.scales");
+        if vb.contains_tensor(&blocks_alt) && vb.contains_tensor(&scales_alt) {
+            (blocks_alt, scales_alt)
+        } else {
+            candle::bail!("grouped MXFP4 tensors not found for base '{base}'")
+        }
+    };
+
+    if in_dim % MXFP4_BLOCK_ELEMS != 0 {
+        candle::bail!(
+            "MXFP4 grouped weight '{base}': in_dim must be multiple of {MXFP4_BLOCK_ELEMS}, got {in_dim}"
+        )
+    }
+    let nblocks = in_dim / MXFP4_BLOCK_ELEMS;
+
+    // Load U8 grouped tensors and select expert slice along the leading dimension.
+    let vb_u8 = vb.to_dtype(DType::U8);
+    let blocks_g = vb_u8.get((n_experts, out_dim, nblocks, MXFP4_BLOCK_BYTES), &blocks_name)?; // (E, out, nb, 16)
+    let scales_g = vb_u8.get((n_experts, out_dim, nblocks), &scales_name)?; // (E, out, nb)
+    let blocks = blocks_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb, 16)
+    let scales = scales_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb)
+
+    let weight = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
+
+    // Optional grouped bias under e.g. "experts.gate_up_proj_bias" (shape [E, out]).
+    let bias_t = if bias {
+        let bias_us = format!("{base}_bias");
+        let bias_dot = format!("{base}.bias");
+        let vb_bf16 = vb.to_dtype(DType::BF16);
+        if vb.contains_tensor(&bias_us) {
+            Some(vb_bf16.get((n_experts, out_dim), &bias_us)?.narrow(0, expert_idx, 1)?.squeeze(0)?)
+        } else if vb.contains_tensor(&bias_dot) {
+            Some(vb_bf16.get((n_experts, out_dim), &bias_dot)?.narrow(0, expert_idx, 1)?.squeeze(0)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(Linear::new(weight, bias_t))
+}
+
 // ============================
 // Attention with sinks helpers
 // ============================

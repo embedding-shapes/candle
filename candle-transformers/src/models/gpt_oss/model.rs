@@ -1,6 +1,6 @@
 use super::config::GptOssConfig;
 use super::experts::{ExpertMlp, GptOssExperts};
-use super::load_linear_maybe_mxfp4;
+use super::{load_expert_linear_mxfp4_grouped, load_linear_maybe_mxfp4};
 use crate::models::with_tracing::{linear_no_bias, Embedding, RmsNorm};
 use candle::{DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
@@ -74,23 +74,45 @@ impl GptOssModel {
             let experts = {
                 let mut all = Vec::with_capacity(cfg.num_local_experts);
                 for e in 0..cfg.num_local_experts {
-                    let ebase = mlp_vb.pp(&format!("experts.{e}"));
                     // Fused gate_up has output 2*intermediate_size
                     let inter = cfg.intermediate_size;
-                    let gate_up = load_linear_maybe_mxfp4(
+                    // Prefer grouped MXFP4 if present, otherwise try per-expert path.
+                    let gate_up = match load_expert_linear_mxfp4_grouped(
                         hidden,
                         2 * inter,
                         false,
-                        ebase.clone(),
-                        "gate_up_proj",
-                    )?;
-                    let down = load_linear_maybe_mxfp4(
+                        mlp_vb.clone(),
+                        "experts.gate_up_proj",
+                        e,
+                        cfg.num_local_experts,
+                    ) {
+                        Ok(l) => l,
+                        Err(_) => load_linear_maybe_mxfp4(
+                            hidden,
+                            2 * inter,
+                            false,
+                            mlp_vb.pp(&format!("experts.{e}")),
+                            "gate_up_proj",
+                        )?,
+                    };
+                    let down = match load_expert_linear_mxfp4_grouped(
                         inter,
                         hidden,
                         false,
-                        ebase.clone(),
-                        "down_proj",
-                    )?;
+                        mlp_vb.clone(),
+                        "experts.down_proj",
+                        e,
+                        cfg.num_local_experts,
+                    ) {
+                        Ok(l) => l,
+                        Err(_) => load_linear_maybe_mxfp4(
+                            inter,
+                            hidden,
+                            false,
+                            mlp_vb.pp(&format!("experts.{e}")),
+                            "down_proj",
+                        )?,
+                    };
                     all.push(ExpertMlp::new(gate_up, down, candle_nn::Activation::Silu));
                 }
                 GptOssExperts::new(router.clone(), all, Some(cfg.num_experts_per_tok))
