@@ -7,7 +7,8 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::gpt_oss::config::GptOssConfig;
 use candle_transformers::models::gpt_oss::model::GptOssModel;
 
-use openai_harmony::{chat::{Message, Role}, load_harmony_encoding, HarmonyEncodingName};
+use openai_harmony::{chat::{Message, Role}};
+use gpt_oss_tokenizer::{render_then_encode, load_stop_token_ids};
 
 // Constants
 const DEFAULT_SNAPSHOT_DIR: &str =
@@ -33,7 +34,7 @@ struct Args {
     seed: u64,
 
     /// Temperature for sampling (reserved for later model generation).
-    #[arg(long, default_value_t = 0.8)]
+    #[arg(long, default_value_t = 1.0)]
     temperature: f64,
 
     /// Nucleus sampling probability cutoff (reserved for later model generation).
@@ -65,38 +66,26 @@ fn main() -> Result<()> {
         dtype = DType::BF16;
     }
 
-    // Load Harmony (for prompt format + tokenizer) and build the prompt tokens via Harmony.
-    let encoding = load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
-        .context("failed to load Harmony encoding")?;
-    let tok = encoding.tokenizer();
-
-    // Conversation: one user message. Render completed history first.
+    // Conversation: one user message. Render via the model's chat_template.jinja and
+    // encode with tokenizer.json from the same snapshot. This guarantees exact parity.
     let user_msg = Message::from_role_and_content(Role::User, args.prompt.clone());
-    let mut tokens: Vec<u32> = encoding
-        .render_conversation([&user_msg], None)
-        .context("failed to render conversation")?
-        .into_iter()
-        .collect();
-
-    // Spec: insert a newline between <|end|> and the next <|start|>assistant.
-    // Use Harmony tokenizer for ordinary encoding of "\n".
-    tokens.extend(tok.encode_ordinary("\n"));
-
-    // Append the assistant header start explicitly: <|start|>assistant
-    tokens.extend(tok.encode_with_special_tokens("<|start|>"));
-    tokens.extend(tok.encode_ordinary("assistant"));
-
-    // Optionally prefill the assistant header channel and message marker.
-    if args.prefill {
-        let (hdr, _unstable) = tok.encode("<|channel|>final<|message|>", &tok.special_tokens());
-        tokens.extend(hdr);
-    }
+    let mut tokens: Vec<u32> = render_then_encode(&snapshot_dir, &[user_msg], true)
+        .context("failed to render+encode with chat_template.jinja + tokenizer.json")?;
 
     if std::env::var("CANDLE_DEBUG_TOKS").ok().as_deref() == Some("1") {
         eprintln!("first 32 token ids: {:?}", &tokens.iter().take(32).collect::<Vec<_>>());
         let ids_u32: Vec<u32> = tokens.iter().take(32).copied().collect();
-        let dec = tok.decode_utf8(ids_u32.into_iter()).unwrap_or_else(|_| String::from("<decode-error>"));
-        eprintln!("first 32 decode: {}", dec);
+        let tok_path = snapshot_dir.join("tokenizer.json");
+        match tokenizers::Tokenizer::from_file(&tok_path) {
+            Ok(hf_tok) => {
+                // Keep special tokens to inspect structural tags when debugging.
+                match hf_tok.decode(&ids_u32, /*skip_special_tokens=*/ false) {
+                    Ok(s) => eprintln!("first 32 decode: {}", s),
+                    Err(_) => eprintln!("first 32 decode: <decode-error>"),
+                }
+            }
+            Err(_) => eprintln!("first 32 decode: <tokenizer-load-error>"),
+        }
     }
 
     // Load GPT-OSS config from the local snapshot.
@@ -127,9 +116,9 @@ fn main() -> Result<()> {
     };
     let mut sampler = LogitsProcessor::from_sampling(args.seed, sampling);
 
-    // Stop only on <|return|> and <|call|> (Harmony authoritative IDs). Do not stop on <|end|>.
-    let stop_set = encoding.stop_tokens_for_assistant_actions().context("failed to resolve Harmony stop tokens")?;
-    let stop_tokens: std::collections::BTreeSet<u32> = stop_set.into_iter().collect();
+    // Stop tokens loaded from generation_config.json to match HF exactly.
+    let stop_ids = load_stop_token_ids(&snapshot_dir)?; // includes eos list + pad
+    let stop_tokens: std::collections::BTreeSet<u32> = stop_ids.into_iter().collect();
 
     // Decode loop using full forward with KV cache, RoPE (YARN), sinks and flash-attn.
     let mut index_pos = 0usize; // global position in sequence
@@ -137,49 +126,74 @@ fn main() -> Result<()> {
         let (context_size, context_index) = if step > 0 { (1usize, index_pos) } else { (tokens.len(), 0usize) };
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
         let t = Tensor::from_vec(ctxt.to_vec(), (1, context_size), &device)?;
+        // Optional debug: check lm_head-only projection from embeddings to see vocab alignment.
+        if step == 0 && std::env::var("CANDLE_DEBUG_HEAD_ONLY").ok().as_deref() == Some("1") {
+            let test_logits = model.forward_logits_minimal(&t)?; // (1, context_size, vocab)
+            let last = test_logits.i((0, context_size - 1))?;
+            let last = last.to_dtype(DType::F32)?;
+            let probs = candle_nn::ops::softmax_last_dim(&last)?;
+            let v = probs.to_vec1::<f32>()?;
+            let mut idx: Vec<usize> = (0..v.len()).collect();
+            idx.sort_by(|&i, &j| v[j].partial_cmp(&v[i]).unwrap());
+            let topn = 5usize;
+            let tok_path = snapshot_dir.join("tokenizer.json");
+            if let Ok(tk) = tokenizers::Tokenizer::from_file(&tok_path) {
+                eprintln!("[head-only] top-5 candidates:");
+                for &i in &idx[..topn] {
+                    let id = i as u32;
+                    let s = tk.decode(&[id], /*skip_special_tokens=*/ false).unwrap_or_else(|_| "<dec-err>".to_string());
+                    eprintln!("  id={:6} p={:.4} tok={}", id, v[i], s);
+                }
+                if let Some(ch_id) = tk.token_to_id("<|channel|>") {
+                    eprintln!("  [head-only] '<|channel|>' id={} p={:.6}", ch_id, v[ch_id as usize]);
+                }
+            }
+        }
+
         let logits = model.forward(&t, context_index)?; // (1, context_size, vocab)
         let last = logits.i((0, context_size - 1))?; // (vocab)
+        if step == 0 && std::env::var("CANDLE_DEBUG_TOPK").ok().as_deref() == Some("1") {
+            // Inspect the top-10 candidates for the first generated token
+            let last_f32 = last.to_dtype(DType::F32)?;
+            let probs = candle_nn::ops::softmax_last_dim(&last_f32)?;
+            let v = probs.to_vec1::<f32>()?;
+            let mut idx: Vec<usize> = (0..v.len()).collect();
+            idx.sort_by(|&i, &j| v[j].partial_cmp(&v[i]).unwrap());
+            let topn = 10usize.min(idx.len());
+            let tok_path = snapshot_dir.join("tokenizer.json");
+            if let Ok(tk) = tokenizers::Tokenizer::from_file(&tok_path) {
+                eprintln!("top-10 next-token candidates:");
+                for &i in &idx[..topn] {
+                    let id = i as u32;
+                    let s = tk.decode(&[id], /*skip_special_tokens=*/ false).unwrap_or_else(|_| "<dec-err>".to_string());
+                    eprintln!("  id={:6} p={:.4} tok={}", id, v[i], s);
+                }
+                if let Some(ch_id) = tk.token_to_id("<|channel|>") {
+                    eprintln!("  special '<|channel|>' id={} p={:.6}", ch_id, v[ch_id as usize]);
+                } else {
+                    eprintln!("  special '<|channel|>' not present in tokenizer");
+                }
+            }
+        }
         let next = sampler.sample(&last)?;
         tokens.push(next);
         index_pos += context_size;
         if stop_tokens.contains(&next) { break; }
     }
 
-    // Decode and print using Harmony’s tokenizer (raw view with specials).
-    let decoded_full = match tok.decode_utf8(tokens.iter().copied()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Harmony decode failed: {} — falling back to tokenizer.json", e);
-            // Fallback: decode via tokenizer.json in the snapshot
-            let tok_path = snapshot_dir.join("tokenizer.json");
-            match tokenizers::Tokenizer::from_file(&tok_path) {
-                Ok(hf_tok) => match hf_tok.decode(&tokens, true) {
-                    Ok(s) => s,
-                    Err(e2) => {
-                        eprintln!(
-                            "HF tokenizer decode failed as well: {} (path: {})",
-                            e2,
-                            tok_path.display()
-                        );
-                        String::from("<decode-error>")
-                    }
-                },
-                Err(e1) => {
-                    eprintln!(
-                        "Failed to load tokenizer.json at {}: {}",
-                        tok_path.display(),
-                        e1
-                    );
-                    String::from("<decode-error>")
-                }
-            }
-        }
-    };
-    println!("{}", decoded_full);
-
-    // Lightweight parsing from the decoded string: extract assistant final channel content.
+    // Decode via tokenizer.json to extract assistant final content and print only that.
+    let tok_path = snapshot_dir.join("tokenizer.json");
+    let hf_tok = tokenizers::Tokenizer::from_file(&tok_path)
+        .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
+    // Preserve special tokens so we can locate the assistant final channel content.
+    let decoded_full = hf_tok
+        .decode(&tokens, /*skip_special_tokens=*/ false)
+        .unwrap_or_else(|_| String::from("<decode-error>"));
     if let Some(reply) = extract_assistant_final_message(&decoded_full) {
-        println!("{}", reply);
+        println!("{}", reply.trim());
+    } else {
+        // As a fallback, print the decoded raw text once.
+        println!("{}", decoded_full.trim());
     }
 
     Ok(())

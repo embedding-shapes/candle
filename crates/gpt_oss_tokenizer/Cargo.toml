@@ -1,0 +1,13 @@
+[package]
+name = "gpt_oss_tokenizer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+minijinja = "2.1.2"
+tokenizers = { workspace = true, features = ["onig"] }
+openai-harmony = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

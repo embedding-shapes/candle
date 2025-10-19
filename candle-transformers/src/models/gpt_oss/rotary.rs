@@ -167,7 +167,7 @@ fn yarn_linear_ramp_mask(min: f32, mut max: f32, dim: usize, dev: &Device) -> Re
     linear.clamp(0.0, 1.0)
 }
 
-fn yarn_get_mscale(scale: f32) -> f32 {
+pub fn yarn_get_mscale(scale: f32) -> f32 {
     if scale <= 1.0 {
         1.0
     } else {

@@ -29,10 +29,10 @@ pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         Ok(xs)
     } else {
-        let (b_sz, n_kv_head, seq_len, head_dim) = xs.dims4()?;
-        // Using cat is faster than a broadcast as it avoids going through a potentially
-        // strided copy.
-        // https://github.com/huggingface/candle/pull/2043
-        Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
+    let (_b_sz, _n_kv_head, _seq_len, _head_dim) = xs.dims4()?;
+    // Repeat along the head dimension (dim=1) to go from (b, n_kv, t, d)
+    // to (b, n_kv * n_rep, t, d). Concatenating along seq_len (dim=2) and
+    // reshaping interleaves positions across heads, which is incorrect for GQA.
+    Tensor::cat(&vec![&xs; n_rep], 1)
     }
 }

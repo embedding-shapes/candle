@@ -138,7 +138,7 @@ fn t4_e8m0_gpu_scale_key_codes() -> Result<()> {
     for &code in &codes {
         let scales = Tensor::from_vec(vec![code], (rows, nblocks), &Device::Cpu)?;
         let scales_d = scales.to_device(&dev)?;
-        let out = super::dequant_mxfp4_to_bf16(&blocks_d, &scales_d, [rows, cols])?;
+        let out = dequant_mxfp4_to_bf16(&blocks_d, &scales_d, [rows, cols])?;
         let out_cpu = out.to_device(&Device::Cpu)?;
         let vals = out_cpu.to_vec2::<half::bf16>()?;
         let v0 = vals[0][0].to_f32();

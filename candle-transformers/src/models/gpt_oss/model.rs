@@ -224,7 +224,7 @@ impl GptOssModel {
                 .as_ref()
                 .and_then(|r| r.factor)
                 .unwrap_or(1.0);
-            if factor <= 1.0 { 1.0 } else { 0.1 * factor.ln() + 1.0 }
+            crate::models::gpt_oss::rotary::yarn_get_mscale(factor)
         };
         let softmax_scale = (1.0f32 / (head_dim as f32).sqrt()) * (yarn_mscale * yarn_mscale);
         
@@ -278,28 +278,32 @@ impl GptOssModel {
             } else {
                 Some(&layer.attn.sinks)
             };
+            #[cfg(feature = "flash-attn")]
             let y = {
-                #[cfg(feature = "flash-attn")]
-                {
+                let use_fa = !matches!(std::env::var("CANDLE_DISABLE_FLASH").ok().as_deref(), Some("1") | Some("true") | Some("TRUE"));
+                if use_fa {
                     match attn_mode {
                         AttnMode::Full => super::flash_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
                         AttnMode::Sliding { left, right } => super::flash_attn_windowed_with_sinks(
-                            &q,
-                            &k_btkhd,
-                            &v_btkhd,
-                            softmax_scale,
-                            Some(left),
-                            Some(right),
-                            sinks,
+                            &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
+                        )?,
+                    }
+                } else {
+                    match attn_mode {
+                        AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                        AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(
+                            &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
                         )?,
                     }
                 }
-                #[cfg(not(feature = "flash-attn"))]
-                {
-                    match attn_mode {
-                        AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                        AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
-                    }
+            };
+            #[cfg(not(feature = "flash-attn"))]
+            let y = {
+                match attn_mode {
+                    AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                    AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(
+                        &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
+                    )?,
                 }
             }; // (b,t,n_q,d)
 
