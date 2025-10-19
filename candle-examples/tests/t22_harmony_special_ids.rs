@@ -16,12 +16,14 @@ fn t22_harmony_special_token_ids() -> Result<()> {
         Ok(ids[0])
     };
 
+    let id_start = eid("<|start|>")?;
     let id_message = eid("<|message|>")?;
     let id_channel = eid("<|channel|>")?;
     let id_end = eid("<|end|>")?;
     let id_call = eid("<|call|>")?;
     let id_return = eid("<|return|>")?;
 
+    assert_eq!(id_start, 200006);
     assert_eq!(id_message, 200008);
     assert_eq!(id_channel, 200005);
     assert_eq!(id_end, 200007); // EOS

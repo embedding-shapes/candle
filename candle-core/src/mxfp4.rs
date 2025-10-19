@@ -191,8 +191,13 @@ pub fn dequant_mxfp4_to_bf16(
     scales: &Tensor,
     full_shape: [usize; 2],
 ) -> Result<Tensor> {
+    // Diagnostic override: allow forcing CPU dequantization regardless of device.
+    let force_cpu = matches!(std::env::var("CANDLE_DEQUANT_ON_CPU").ok().as_deref(), Some("1") | Some("true") | Some("TRUE"));
     match (blocks.device(), scales.device()) {
         (Device::Cuda(_), d2) if blocks.device().same_device(d2) => {
+            if force_cpu {
+                return dequant_mxfp4_to_bf16_cpu(blocks, scales, full_shape);
+            }
             #[cfg(feature = "cuda")]
             {
                 return dequant_mxfp4_to_bf16_cuda(blocks, scales, full_shape);

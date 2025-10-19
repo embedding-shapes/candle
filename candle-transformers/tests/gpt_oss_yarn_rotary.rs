@@ -74,10 +74,9 @@ fn make_reference_cos_sin(
         .reshape((max_t, 1))?;
     let freqs = t.matmul(&inv_freq)?; // (T, dim/2)
 
-    // attention factor (mscale)
-    let attention_scale = if factor <= 1.0 { 1.0 } else { 0.1 * factor.ln() + 1.0 };
-    let sin = (freqs.sin()? * attention_scale as f64)?.to_dtype(DType::F32)?;
-    let cos = (freqs.cos()? * attention_scale as f64)?.to_dtype(DType::F32)?;
+    // No amplitude scaling in tables; YARN scaling is applied in softmax path.
+    let sin = freqs.sin()?.to_dtype(DType::F32)?;
+    let cos = freqs.cos()?.to_dtype(DType::F32)?;
     Ok((cos, sin))
 }
 

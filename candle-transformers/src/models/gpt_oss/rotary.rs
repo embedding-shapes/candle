@@ -103,10 +103,10 @@ impl GptOssRotaryEmbedding {
             .reshape((cfg.max_position_embeddings, 1))?; // (T,1)
         let freqs = t.matmul(&inv_freq)?; // (T, dim/2)
 
-        // Attention scaling factor (mscale) recommended in YARN
-        let attention_scale = yarn_get_mscale(cfg.factor);
-        let sin = (freqs.sin()? * attention_scale as f64)?.to_dtype(dtype)?;
-        let cos = (freqs.cos()? * attention_scale as f64)?.to_dtype(dtype)?;
+        // Compute sin/cos tables without additional scaling. YARN attention scaling
+        // is applied in the attention softmax scale path (mscale^2), not here.
+        let sin = freqs.sin()?.to_dtype(dtype)?;
+        let cos = freqs.cos()?.to_dtype(dtype)?;
 
         Ok(Self { sin, cos })
     }
