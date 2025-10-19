@@ -89,7 +89,7 @@ fn t27_first_step_logit_parity() -> Result<()> {
             r#"import json, os, torch, sys
 sys.path.insert(0, {py_src})
 from transformers import AutoConfig, AutoModelForCausalLM
- snap = {snap}
+snap = {snap}
 tokens = {toks}
 channel_id = {chid}
 dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
