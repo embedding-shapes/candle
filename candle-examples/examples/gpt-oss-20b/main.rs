@@ -38,10 +38,6 @@ struct Args {
     /// Maximum new tokens to sample (reserved for later model generation).
     #[arg(long, default_value_t = 256)]
     sample_len: usize,
-
-    /// Prefill the assistant header with "<|channel|>final<|message|>" before sampling.
-    #[arg(long, default_value_t = true)]
-    prefill: bool,
 }
 
 fn main() -> Result<()> {
@@ -99,21 +95,10 @@ fn main() -> Result<()> {
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, &device)? };
     let mut model = GptOssModel::load(vb, &cfg).context("failed to load GPT-OSS model weights")?;
 
-    // Optionally prefill the assistant final header to start streaming the final content.
-    // This inserts: <|channel|>final<|message|> right after the assistant header.
+    // Load tokenizer for decoding and inspection.
     let tok_path = snapshot_dir.join("tokenizer.json");
     let hf_tok = tokenizers::Tokenizer::from_file(&tok_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
-    if args.prefill {
-        let (hdr, _unstable) = {
-            // Using tokenizers crate API: replicate encode("<|channel|>final<|message|>", allowed)
-            // The public API is slightly different; use direct helpers for parity.
-            let ids = hf_tok.encode("<|channel|>final<|message|>", /*add_special_tokens=*/ false)
-                .map_err(|e| anyhow::anyhow!("tokenizer.encode failed: {e}"))?;
-            (ids.get_ids().to_vec(), ())
-        };
-        tokens.extend(hdr);
-    }
 
     // Set up the logits processor / sampler.
     let sampling = if args.temperature <= 0.0 {
@@ -127,7 +112,9 @@ fn main() -> Result<()> {
     let mut sampler = LogitsProcessor::from_sampling(args.seed, sampling);
 
     // Stop tokens loaded from generation_config.json to match HF exactly.
-    let stop_ids = load_stop_token_ids(&snapshot_dir)?; // includes eos list + pad
+    // This includes <|return|> (200002), <|call|> (200012) and <|endoftext|> (199999 pad).
+    // We do not stop on <|end|> (200007).
+    let stop_ids = load_stop_token_ids(&snapshot_dir)?;
     let stop_tokens: std::collections::BTreeSet<u32> = stop_ids.into_iter().collect();
 
     // Decode loop using full forward with KV cache, RoPE (YARN), sinks and flash-attn.
@@ -207,10 +194,13 @@ fn main() -> Result<()> {
         if stop_tokens.contains(&next) { break; }
     }
 
-    // If we have streamed some content, terminate the line.
-    if last_emitted_len > 0 {
-        println!();
-    } else {
+    // Always print the full Harmony string (request + response with control tokens)
+    if let Ok(decoded_full) = hf_tok.decode(&tokens, /*skip_special_tokens=*/ false) {
+        println!("\n{}", decoded_full);
+    }
+
+    // If we have streamed some content, terminate the line after raw print.
+    if last_emitted_len == 0 {
         // Fallback: decode once and print extracted final portion if available,
         // else decode with skip_special_tokens to ensure we never print control tokens.
         if let Ok(decoded_full) = hf_tok.decode(&tokens, /*skip_special_tokens=*/ false) {
