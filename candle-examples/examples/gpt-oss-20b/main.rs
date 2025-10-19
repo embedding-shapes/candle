@@ -7,17 +7,20 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::gpt_oss::config::GptOssConfig;
 use candle_transformers::models::gpt_oss::model::GptOssModel;
 
-use openai_harmony::{
-    chat::{Message, Role},
-    load_harmony_encoding, HarmonyEncodingName,
-};
+use openai_harmony::{load_harmony_encoding, HarmonyEncodingName};
+use tokenizers::{EncodeInput, Tokenizer};
 
 // Constants
 const DEFAULT_SNAPSHOT_DIR: &str =
     "~/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee";
 const MODEL_INDEX_FILE: &str = "model.safetensors.index.json";
-const TOKEN_ID_RETURN: u32 = 200002; // <|return|>
-const TOKEN_ID_CALL: u32 = 200012; // <|call|>
+// Special token strings used in Harmony/GPT-OSS formatting.
+const ST_START: &str = "<|start|>";
+const ST_MESSAGE: &str = "<|message|>";
+const ST_END: &str = "<|end|>"; // not a stop criterion for sampling here
+const ST_CALL: &str = "<|call|>"; // stop criterion
+const ST_RETURN: &str = "<|return|>"; // primary stop criterion
+const ST_CHANNEL: &str = "<|channel|>";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "GPT-OSS-20B example (Harmony prompt formatting)")]
@@ -60,17 +63,35 @@ fn main() -> Result<()> {
     }
     let dtype = if device.supports_bf16() { DType::BF16 } else { DType::F16 };
 
-    // Load Harmony encoding for GPT-OSS prompt formatting.
-    let encoding = load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
+    // Load Harmony (for prompt format) and the HF tokenizer from the local snapshot (for ids).
+    let _encoding = load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
         .context("failed to load Harmony encoding")?;
 
-    // Build the conversation with a single user message using Harmony’s schema.
-    let user_msg = Message::from_role_and_content(Role::User, args.prompt.clone());
+    // HF tokenizer.json is authoritative for this model; use it for encoding/decoding.
+    let tokenizer_path = snapshot_dir.join("tokenizer.json");
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json at {}: {e}", tokenizer_path.display()))?;
 
-    // Format to completion tokens (adds the next assistant header), allowing special tokens.
-    let input_ids = encoding
-        .render_conversation_for_completion([&user_msg], Role::Assistant, None)
-        .context("failed to render conversation for completion")?;
+    // Build the conversation text in Harmony format (one user message, then next assistant header).
+    let prompt_text = build_harmony_prompt_text(&args.prompt, /*prefill_channel=*/args.prefill);
+    // Encode using HF tokenizer.
+    let enc = tokenizer
+        .encode(EncodeInput::Single(prompt_text.clone().into()), /*add_special_tokens=*/false)
+        .map_err(|e| anyhow::anyhow!("HF tokenizer encode failed: {e}"))?;
+    let mut tokens: Vec<u32> = enc
+        .get_ids()
+        .iter()
+        .map(|&id| id as u32)
+        .collect();
+
+    if std::env::var("CANDLE_DEBUG_TOKS").ok().as_deref() == Some("1") {
+        eprintln!("first 32 token ids: {:?}", &tokens.iter().take(32).collect::<Vec<_>>());
+        let ids_u32: Vec<u32> = tokens.iter().take(32).copied().collect();
+        let dec = tokenizer
+            .decode(&ids_u32, false)
+            .unwrap_or_else(|_| String::from("<decode-error>"));
+        eprintln!("first 32 decode: {}", dec);
+    }
 
     // Load GPT-OSS config from the local snapshot.
     let cfg_path = snapshot_dir.join("config.json");
@@ -100,17 +121,15 @@ fn main() -> Result<()> {
     };
     let mut sampler = LogitsProcessor::from_sampling(args.seed, sampling);
 
-    // Prepare input ids tensor on device.
-    let mut tokens: Vec<u32> = input_ids.iter().copied().collect();
-
-    // Optional prefill to force correct first token/channel sequence.
-    if args.prefill {
-        append_assistant_header(&encoding, &mut tokens)?;
-    }
+    // Prepare stop tokens by encoding the specials via the HF tokenizer to ensure id parity.
+    let token_id_return = encode_single_special(&tokenizer, ST_RETURN)
+        .context("failed to encode <|return|> with HF tokenizer")?;
+    let token_id_call = encode_single_special(&tokenizer, ST_CALL)
+        .context("failed to encode <|call|> with HF tokenizer")?;
 
     // Stop only on <|return|> and <|call|>. Do not stop on <|end|>.
     let stop_tokens: std::collections::BTreeSet<u32> =
-        [TOKEN_ID_RETURN, TOKEN_ID_CALL].into_iter().collect();
+        [token_id_return, token_id_call].into_iter().collect();
 
     // Decode loop using full forward with KV cache, RoPE (YARN), sinks and flash-attn.
     let mut index_pos = 0usize; // global position in sequence
@@ -126,56 +145,16 @@ fn main() -> Result<()> {
         if stop_tokens.contains(&next) { break; }
     }
 
-    // Decode and print the full token stream without stripping anything (raw view).
-    let decoded_full = match encoding.tokenizer().decode_utf8(tokens.iter().copied()) {
-        Ok(s) => s,
-        Err(_) => {
-            let bytes = encoding
-                .tokenizer()
-                .decode_bytes(tokens.iter().copied())
-                .context("failed to decode token bytes with Harmony tokenizer")?;
-            String::from_utf8_lossy(&bytes).into_owned()
-        }
-    };
+    // Decode and print the full token stream using the HF tokenizer (raw view).
+    let ids_u32: Vec<u32> = tokens.clone();
+    let decoded_full = tokenizer
+        .decode(&ids_u32, /*skip_special_tokens=*/false)
+        .map_err(|e| anyhow::anyhow!("HF tokenizer decode failed: {e}"))?;
     println!("{}", decoded_full);
 
-    // Ensure the trailing assistant header is complete (append header if needed),
-    // then parse messages from tokens via Harmony to extract a structured assistant reply.
-    ensure_complete_assistant_header(&encoding, &mut tokens)?;
-    // This handles channels (<|channel|>) and message segmentation correctly.
-    let messages = encoding
-        .parse_messages_from_completion_tokens(tokens.iter().copied(), None)
-        .context("failed to parse messages from completion tokens")?;
-    // Prefer the last assistant message with channel=="final"; fall back to last assistant.
-    let preferred = messages
-        .iter()
-        .rev()
-        .find(|m| m.author.role == Role::Assistant && m.channel.as_deref() == Some("final"))
-        .or_else(|| messages.iter().rev().find(|m| m.author.role == Role::Assistant));
-    if let Some(msg) = preferred {
-        let text = msg
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                openai_harmony::chat::Content::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("");
-        println!("{}", text);
-    } else {
-        // Fallback: raw decode
-        let decoded = match encoding.tokenizer().decode_utf8(tokens.iter().copied()) {
-            Ok(s) => s,
-            Err(_) => {
-                let bytes = encoding
-                    .tokenizer()
-                    .decode_bytes(tokens.iter().copied())
-                    .context("failed to decode token bytes with Harmony tokenizer")?;
-                String::from_utf8_lossy(&bytes).into_owned()
-            }
-        };
-        println!("{}", decoded);
+    // Lightweight parsing from the decoded string: extract assistant final channel content.
+    if let Some(reply) = extract_assistant_final_message(&decoded_full) {
+        println!("{}", reply);
     }
 
     Ok(())
@@ -192,33 +171,63 @@ fn expand_tilde(p: &str) -> Result<std::path::PathBuf> {
     }
 }
 
-fn append_assistant_header(encoding: &openai_harmony::HarmonyEncoding, tokens: &mut Vec<u32>) -> Result<()> {
-    let allowed = encoding.tokenizer().special_tokens();
-    let (hdr_tokens, _unstable) = encoding
-        .tokenizer()
-        .encode("<|channel|>final<|message|>", &allowed);
-    tokens.extend(hdr_tokens.into_iter().map(|t| t as u32));
-    Ok(())
+// --- Helpers (prompt/text + tokenizer encoding) ---
+
+fn build_harmony_prompt_text(user_prompt: &str, prefill_channel: bool) -> String {
+    let mut s = String::new();
+    // User message
+    s.push_str(ST_START);
+    s.push_str("user");
+    s.push_str(ST_MESSAGE);
+    s.push_str(user_prompt);
+    s.push_str(ST_END);
+    // Next assistant header
+    s.push_str(ST_START);
+    s.push_str("assistant");
+    if prefill_channel {
+        s.push_str(ST_CHANNEL);
+        s.push_str("final");
+        s.push_str(ST_MESSAGE);
+    }
+    s
 }
 
-fn ensure_complete_assistant_header(
-    encoding: &openai_harmony::HarmonyEncoding,
-    tokens: &mut Vec<u32>,
-) -> Result<()> {
-    let eid = |s: &str| -> Result<u32> {
-        let ids = encoding.tokenizer().encode_with_special_tokens(s);
-        if ids.len() != 1 { bail!("expected single id for {s}, got {:?}", ids); }
-        Ok(ids[0])
+fn encode_single_special(tokenizer: &Tokenizer, s: &str) -> Result<u32> {
+    let enc = tokenizer
+        .encode(EncodeInput::Single(s.to_string().into()), false)
+        .map_err(|e| anyhow::anyhow!("HF tokenizer encode failed for {s}: {e}"))?;
+    let ids = enc.get_ids();
+    if ids.len() != 1 {
+        bail!("expected single id for special token {s}, got {:?}", ids);
+    }
+    Ok(ids[0] as u32)
+}
+
+fn extract_assistant_final_message(decoded: &str) -> Option<String> {
+    // Find the last assistant header; then ensure message marker; capture until a stop.
+    let start_tag = format!("{}assistant", ST_START);
+    let start_pos = decoded.rfind(&start_tag)?;
+    let rest = &decoded[start_pos + start_tag.len()..];
+    let after_channel = if let Some(pos) = rest.find(ST_CHANNEL) {
+        let rest2 = &rest[pos + ST_CHANNEL.len()..];
+        // Expect channel name (e.g., "final") immediately following; skip it.
+        // Then expect message marker.
+        if let Some(mpos) = rest2.find(ST_MESSAGE) {
+            &rest2[mpos + ST_MESSAGE.len()..]
+        } else {
+            return None;
+        }
+    } else if let Some(mpos) = rest.find(ST_MESSAGE) {
+        &rest[mpos + ST_MESSAGE.len()..]
+    } else {
+        return None;
     };
-    let id_start = eid("<|start|>")?;
-    let id_message = eid("<|message|>")?;
-    if let Some(start_pos) = tokens.iter().rposition(|&t| t == id_start) {
-        let has_message = tokens[start_pos + 1..].iter().any(|&t| t == id_message);
-        if !has_message {
-            append_assistant_header(encoding, tokens)?;
+    // Stop at first of return/call/end or next start.
+    let mut end_idx = after_channel.len();
+    for stop in [ST_RETURN, ST_CALL, ST_END, ST_START] {
+        if let Some(p) = after_channel.find(stop) {
+            end_idx = end_idx.min(p);
         }
     }
-    Ok(())
+    Some(after_channel[..end_idx].to_string())
 }
-
-// No longer needed with Harmony message parsing
