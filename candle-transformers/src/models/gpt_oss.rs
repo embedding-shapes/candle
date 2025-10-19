@@ -7,6 +7,9 @@
 use candle::{DType, Result, Tensor, D};
 use candle_nn::Linear;
 
+// Submodule(s)
+pub mod rotary;
+
 // Constants/config
 const MXFP4_BLOCK_ELEMS: usize = 32; // k=32 elements per block on the last dim.
 const MXFP4_BLOCK_BYTES: usize = 16; // packed two nibbles per byte.
