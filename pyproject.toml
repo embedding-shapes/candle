@@ -5,7 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "accelerate>=1.10.1",
+    "hf-transfer>=0.1.9",
     "huggingface-hub>=0.35.3",
+    "kernels>=0.10.4",
     "torch>=2.9.0",
     "transformers[mistral-common]>=4.57.1",
+    "triton>=3.5.0",
 ]
