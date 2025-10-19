@@ -5,3 +5,4 @@ pub mod pipelines;
 pub mod quantized_nn;
 pub mod quantized_var_builder;
 pub mod utils;
+pub mod mxfp4;
