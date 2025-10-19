@@ -212,6 +212,388 @@ impl FlashAttn {
     }
 }
 
+// New helpers exposing the softmax LSE alongside the output. These mirror the existing
+// FlashAttn forward implementations but return an additional Tensor capturing the LSE.
+//
+// LSE layout semantics (as written by the kernel):
+// - Padded path (non-varlen): LSE is written as (batch, heads, seqlen_q) with contiguous strides.
+// - Varlen path (unpadded):  LSE is written as (heads, total_q) with contiguous strides.
+// The functions below allocate tensors with those exact shapes and pass their buffers to the kernel.
+
+fn flash_attn_fwd_with_lse_t<
+    T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+>(
+    q: &candle::CudaStorage,
+    q_l: &Layout,
+    k: &candle::CudaStorage,
+    k_l: &Layout,
+    v: &candle::CudaStorage,
+    v_l: &Layout,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+    is_bf16: bool,
+) -> Result<(Tensor, Tensor)> {
+    let dev = q.device();
+    let out_shape = q_l.shape().clone();
+    let out_l = Layout::contiguous(&out_shape);
+
+    let q = q.as_cuda_slice::<T>()?;
+    let k = k.as_cuda_slice::<T>()?;
+    let v = v.as_cuda_slice::<T>()?;
+    let q = q.slice(q_l.start_offset()..);
+    let k = k.slice(k_l.start_offset()..);
+    let v = v.slice(v_l.start_offset()..);
+
+    let q_stride = q_l.stride();
+    let k_stride = k_l.stride();
+    let v_stride = v_l.stride();
+    let o_stride = out_l.stride();
+
+    let q_rank = q_stride.len();
+    let k_rank = k_stride.len();
+    let v_rank = v_stride.len();
+    let o_rank = o_stride.len();
+
+    if q_rank != 4 || k_rank != 4 || v_rank != 4 {
+        candle::bail!(
+            "flash-attn expects input tensors of rank 4 (q: {q_rank}, k: {k_rank}, v: {v_rank}"
+        )
+    }
+    if q_stride[q_rank - 1] != 1 {
+        candle::bail!("the last dim of q must be contiguous {q_stride:?}")
+    }
+    if k_stride[k_rank - 1] != 1 {
+        candle::bail!("the last dim of k must be contiguous {k_stride:?}")
+    }
+    if v_stride[v_rank - 1] != 1 {
+        candle::bail!("the last dim of v must be contiguous {v_stride:?}")
+    }
+
+    let (b_sz, seqlen_q, num_heads, head_size_og) = q_l.shape().dims4()?;
+    let (_b_sz, seqlen_k, num_heads_k, _head_size_og) = k_l.shape().dims4()?;
+    let expected_kv = (b_sz, seqlen_k, num_heads_k, head_size_og);
+    if expected_kv != k_l.shape().dims4()? {
+        candle::bail!("shape mismatch q {:?} and k {:?}", q_l.shape(), k_l.shape())
+    }
+    if expected_kv != v_l.shape().dims4()? {
+        candle::bail!("shape mismatch q {:?} and v {:?}", q_l.shape(), v_l.shape())
+    }
+    if head_size_og > 256 {
+        candle::bail!("only supports head dimension at most 256 (got {head_size_og})")
+    }
+    if head_size_og % 8 != 0 {
+        candle::bail!("only supports head sizes that are a multiple of 8 (got {head_size_og})")
+    }
+    if num_heads % num_heads_k != 0 {
+        candle::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
+    }
+
+    let stream = dev.cuda_stream();
+    let alibi_slopes_ptr = std::ptr::null();
+
+    // if window_size_left > seqlen_k or None => -1
+    let mut window_size_left = window_size_left
+        .filter(|v| v <= &seqlen_k)
+        .map(|v| v as i32)
+        .unwrap_or(-1);
+
+    // if window_size_right > seqlen_k or None => -1
+    let mut window_size_right = window_size_right
+        .filter(|v| v <= &seqlen_k)
+        .map(|v| v as i32)
+        .unwrap_or(-1);
+
+    let head_size = round_multiple(head_size_og, 8);
+    let head_size_rounded = round_multiple(head_size, 32);
+    let seqlen_q_rounded = round_multiple(seqlen_q, 128);
+    let seqlen_k_rounded = round_multiple(seqlen_k, 128);
+
+    // Allocate output and LSE tensors directly as tensors so we can return them.
+    let o_dtype = if is_bf16 { DType::BF16 } else { DType::F16 };
+    let o_tensor = Tensor::zeros(out_shape.clone(), o_dtype, &candle::Device::Cuda(dev.clone()))?;
+    let lse_tensor = Tensor::zeros(
+        (b_sz, num_heads, seqlen_q),
+        DType::F32,
+        &candle::Device::Cuda(dev.clone()),
+    )?;
+
+    let is_bf16 = if is_bf16 { 1 } else { 0 };
+
+    // Causal is the special case where window_size_right == 0 and window_size_left < 0.
+    // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
+    let is_causal = if window_size_left < 0 && window_size_right == 0 { 1 } else { 0 };
+    if window_size_left < 0 && window_size_right >= 0 {
+        window_size_left = seqlen_k as i32;
+    }
+    if window_size_left >= 0 && window_size_right < 0 {
+        window_size_right = seqlen_k as i32;
+    }
+
+    unsafe {
+        let (q_ptr, _guard) = q.device_ptr(&stream);
+        let (k_ptr, _guard) = k.device_ptr(&stream);
+        let (v_ptr, _guard) = v.device_ptr(&stream);
+
+        let (o_storage, _o_layout) = o_tensor.storage_and_layout();
+        let o_cuda = match &*o_storage {
+            candle::Storage::Cuda(c) => c,
+            _ => candle::bail!("output must be a cuda tensor"),
+        };
+        let o_cuda = o_cuda.as_cuda_slice::<T>()?;
+        let (dst_ptr, _guard) = o_cuda.device_ptr(&stream);
+
+        let (lse_storage, _lse_layout) = lse_tensor.storage_and_layout();
+        let lse_cuda = match &*lse_storage {
+            candle::Storage::Cuda(c) => c,
+            _ => candle::bail!("lse must be a cuda tensor"),
+        };
+        let lse_cuda = lse_cuda.as_cuda_slice::<f32>()?;
+        let (softmax_lse_ptr, _guard) = lse_cuda.device_ptr(&stream);
+
+        ffi::run_mha(
+            q_ptr as *const core::ffi::c_void,
+            k_ptr as *const core::ffi::c_void,
+            v_ptr as *const core::ffi::c_void,
+            dst_ptr as *const core::ffi::c_void,
+            softmax_lse_ptr as *const core::ffi::c_void,
+            /* alibi_slopes_ptr */ alibi_slopes_ptr,
+            /* cu_seqlens_q_ptr */ std::ptr::null(),
+            /* cu_seqlens_k_ptr */ std::ptr::null(),
+            /* q_batch_stride */ q_stride[0] as u32,
+            /* k_batch_stride */ k_stride[0] as u32,
+            /* v_batch_stride */ v_stride[0] as u32,
+            /* o_batch_stride */ o_stride[0] as u32,
+            /* alibi_slopes_batch_stride */ 0,
+            /* q_row_stride   */ q_stride[q_rank - 3] as u32,
+            /* k_row_stride   */ k_stride[k_rank - 3] as u32,
+            /* v_row_stride   */ v_stride[v_rank - 3] as u32,
+            /* o_row_stride   */ o_stride[o_rank - 3] as u32,
+            /* q_head_stride  */ q_stride[q_rank - 2] as u32,
+            /* k_head_stride  */ k_stride[k_rank - 2] as u32,
+            /* v_head_stride  */ v_stride[v_rank - 2] as u32,
+            /* o_head_stride  */ o_stride[o_rank - 2] as u32,
+            /* b */ b_sz as u32,
+            /* h */ num_heads as u32,
+            /* h_k */ num_heads_k as u32,
+            /* d */ head_size as u32,
+            /* d_rounded */ head_size_rounded as u32,
+            /* softmax_scale*/ softmax_scale,
+            /* seqlen_q */ seqlen_q as u32,
+            /* seqlen_k */ seqlen_k as u32,
+            /* seqlen_q_rounded */ seqlen_q_rounded as u32,
+            /* seqlen_k_rounded */ seqlen_k_rounded as u32,
+            /* is_bf16 */ is_bf16,
+            /* is_causal */ is_causal,
+            /* upadded_lse */ 0,
+            /* window_size_left */ window_size_left,
+            /* window_size_right */ window_size_right,
+            /* softcap */ 0.0,
+        )
+    }
+
+    Ok((o_tensor, lse_tensor))
+}
+
+fn flash_attn_varlen_fwd_with_lse_t<
+    T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+>(
+    q: &candle::CudaStorage,
+    q_l: &Layout,
+    k: &candle::CudaStorage,
+    k_l: &Layout,
+    v: &candle::CudaStorage,
+    v_l: &Layout,
+    seqlens_q_t: &Tensor,
+    seqlens_k_t: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+    is_bf16: bool,
+) -> Result<(Tensor, Tensor)> {
+    let dev = q.device();
+    let out_shape = q_l.shape().clone();
+    let out_l = Layout::contiguous(&out_shape);
+
+    let (seqlens_q, seqlens_q_layout) = seqlens_q_t.storage_and_layout();
+    let seqlens_q = match &*seqlens_q {
+        candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+        _ => candle::bail!("seqlens_q must be a cuda tensor"),
+    };
+    let seqlens_q = match seqlens_q_layout.contiguous_offsets() {
+        Some((o1, o2)) => seqlens_q.slice(o1..o2),
+        None => candle::bail!("seqlens_q has to be contiguous"),
+    };
+
+    let (seqlens_k, seqlens_k_layout) = seqlens_k_t.storage_and_layout();
+    let seqlens_k = match &*seqlens_k {
+        candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+        _ => candle::bail!("seqlens_k must be a cuda tensor"),
+    };
+    let seqlens_k = match seqlens_k_layout.contiguous_offsets() {
+        Some((o1, o2)) => seqlens_k.slice(o1..o2),
+        None => candle::bail!("seqlens_k has to be contiguous"),
+    };
+
+    let q = q.as_cuda_slice::<T>()?;
+    let k = k.as_cuda_slice::<T>()?;
+    let v = v.as_cuda_slice::<T>()?;
+    let q = q.slice(q_l.start_offset()..);
+    let k = k.slice(k_l.start_offset()..);
+    let v = v.slice(v_l.start_offset()..);
+
+    let q_stride = q_l.stride();
+    let k_stride = k_l.stride();
+    let v_stride = v_l.stride();
+    let o_stride = out_l.stride();
+
+    let q_rank = q_stride.len();
+    let k_rank = k_stride.len();
+    let v_rank = v_stride.len();
+    let o_rank = o_stride.len();
+
+    if q_rank != 3 || k_rank != 3 || v_rank != 3 {
+        candle::bail!("flash-attn-varlen expects input tensors of rank 3")
+    }
+
+    let (total_q, num_heads, head_size_og) = q_l.shape().dims3()?;
+    let (total_k, num_heads_k, _head_size_og) = k_l.shape().dims3()?;
+    let expected_kv = (total_k, num_heads_k, head_size_og);
+    if expected_kv != k_l.shape().dims3()? {
+        candle::bail!("shape mismatch q {:?} and k {:?}", q_l.shape(), k_l.shape())
+    }
+    if expected_kv != v_l.shape().dims3()? {
+        candle::bail!("shape mismatch q {:?} and v {:?}", q_l.shape(), v_l.shape())
+    }
+    if head_size_og > 256 {
+        candle::bail!("only supports head dimension at most 256 (got {head_size_og})")
+    }
+    if head_size_og % 8 != 0 {
+        candle::bail!("only supports head sizes that are a multiple of 8 (got {head_size_og})")
+    }
+    if num_heads % num_heads_k != 0 {
+        candle::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
+    }
+
+    let nseqlens_q = seqlens_q_layout.shape().dims1()?;
+    if nseqlens_q < 2 {
+        candle::bail!("seqlens_q should have a len >= 2 {nseqlens_q}")
+    }
+    let nseqlens_k = seqlens_k_layout.shape().dims1()?;
+    if nseqlens_k != nseqlens_q {
+        candle::bail!("seqlens_q and seqlens_k should have the same number of elements {nseqlens_q} <> {nseqlens_k}")
+    }
+
+    let batch_size = nseqlens_q - 1;
+
+    let stream = dev.cuda_stream();
+    let alibi_slopes_ptr = std::ptr::null();
+
+    // if window_size_left > max_seqlen_k or None => -1
+    let mut window_size_left = window_size_left
+        .filter(|v| v <= &max_seqlen_k)
+        .map(|v| v as i32)
+        .unwrap_or(-1);
+
+    // if window_size_right > max_seqlen_k or None => -1
+    let mut window_size_right = window_size_right
+        .filter(|v| v <= &max_seqlen_k)
+        .map(|v| v as i32)
+        .unwrap_or(-1);
+
+    let head_size = round_multiple(head_size_og, 8);
+    let head_size_rounded = round_multiple(head_size, 32);
+    let seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
+    let seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
+
+    // Allocate output and LSE tensors directly.
+    let o_dtype = if is_bf16 { DType::BF16 } else { DType::F16 };
+    let o_tensor = Tensor::zeros(out_shape.clone(), o_dtype, &candle::Device::Cuda(dev.clone()))?;
+    // Varlen/unpadded LSE is (heads, total_q)
+    let lse_tensor = Tensor::zeros((num_heads, total_q), DType::F32, &candle::Device::Cuda(dev.clone()))?;
+
+    let is_bf16 = if is_bf16 { 1 } else { 0 };
+
+    // Causal is the special case where window_size_right == 0 and window_size_left < 0.
+    // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
+    let is_causal = if window_size_left < 0 && window_size_right == 0 { 1 } else { 0 };
+    if window_size_left < 0 && window_size_right >= 0 {
+        window_size_left = max_seqlen_k as i32;
+    }
+    if window_size_left >= 0 && window_size_right < 0 {
+        window_size_right = max_seqlen_k as i32;
+    }
+
+    unsafe {
+        let (q_ptr, _guard) = q.device_ptr(&stream);
+        let (k_ptr, _guard) = k.device_ptr(&stream);
+        let (v_ptr, _guard) = v.device_ptr(&stream);
+
+        let (o_storage, _o_layout) = o_tensor.storage_and_layout();
+        let o_cuda = match &*o_storage {
+            candle::Storage::Cuda(c) => c,
+            _ => candle::bail!("output must be a cuda tensor"),
+        };
+        let o_cuda = o_cuda.as_cuda_slice::<T>()?;
+        let (dst_ptr, _guard) = o_cuda.device_ptr(&stream);
+
+        let (lse_storage, _lse_layout) = lse_tensor.storage_and_layout();
+        let lse_cuda = match &*lse_storage {
+            candle::Storage::Cuda(c) => c,
+            _ => candle::bail!("lse must be a cuda tensor"),
+        };
+        let lse_cuda = lse_cuda.as_cuda_slice::<f32>()?;
+        let (softmax_lse_ptr, _guard) = lse_cuda.device_ptr(&stream);
+
+        let (seqlens_q_ptr, _guard) = seqlens_q.device_ptr(&stream);
+        let (seqlens_k_ptr, _guard) = seqlens_k.device_ptr(&stream);
+
+        ffi::run_mha(
+            q_ptr as *const core::ffi::c_void,
+            k_ptr as *const core::ffi::c_void,
+            v_ptr as *const core::ffi::c_void,
+            dst_ptr as *const core::ffi::c_void,
+            softmax_lse_ptr as *const core::ffi::c_void,
+            /* alibi_slopes_ptr */ alibi_slopes_ptr,
+            /* cu_seqlens_q_ptr */ seqlens_q_ptr as *const i32,
+            /* cu_seqlens_k_ptr */ seqlens_k_ptr as *const i32,
+            /* q_batch_stride */ 0,
+            /* k_batch_stride */ 0,
+            /* v_batch_stride */ 0,
+            /* o_batch_stride */ 0,
+            /* alibi_slopes_batch_stride */ 0,
+            /* q_row_stride   */ q_stride[q_rank - 3] as u32,
+            /* k_row_stride   */ k_stride[k_rank - 3] as u32,
+            /* v_row_stride   */ v_stride[v_rank - 3] as u32,
+            /* o_row_stride   */ o_stride[o_rank - 3] as u32,
+            /* q_head_stride  */ q_stride[q_rank - 2] as u32,
+            /* k_head_stride  */ k_stride[k_rank - 2] as u32,
+            /* v_head_stride  */ v_stride[v_rank - 2] as u32,
+            /* o_head_stride  */ o_stride[o_rank - 2] as u32,
+            /* b */ batch_size as u32,
+            /* h */ num_heads as u32,
+            /* h_k */ num_heads_k as u32,
+            /* d */ head_size as u32,
+            /* d_rounded */ head_size_rounded as u32,
+            /* softmax_scale*/ softmax_scale,
+            /* seqlen_q */ max_seqlen_q as u32,
+            /* seqlen_k */ max_seqlen_k as u32,
+            /* seqlen_q_rounded */ seqlen_q_rounded as u32,
+            /* seqlen_k_rounded */ seqlen_k_rounded as u32,
+            /* is_bf16 */ is_bf16,
+            /* is_causal */ is_causal,
+            /* upadded_lse */ 1,
+            /* window_size_left */ window_size_left,
+            /* window_size_right */ window_size_right,
+            /* softcap */ 0.0,
+        )
+    }
+
+    Ok((o_tensor, lse_tensor))
+}
+
 impl candle::CustomOp3 for FlashAttn {
     fn name(&self) -> &'static str {
         "flash-attn"
@@ -279,6 +661,37 @@ pub fn flash_attn(
     q.apply_op3(k, v, op)
 }
 
+/// Flash-attention v2 layer returning both the output and the per-(b,h,q) softmax LSE.
+///
+/// Returns `(O, LSE)` where `O` has shape `(batch, seqlen_q, num_heads_q, head_size)` and
+/// `LSE` has shape `(batch, num_heads_q, seqlen_q)`.
+pub fn flash_attn_with_lse(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<(Tensor, Tensor)> {
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+
+    let (q_s, q_l) = q.storage_and_layout();
+    let (k_s, k_l) = k.storage_and_layout();
+    let (v_s, v_l) = v.storage_and_layout();
+    match (&*q_s, &*k_s, &*v_s) {
+        (candle::Storage::Cuda(q), candle::Storage::Cuda(k), candle::Storage::Cuda(v)) => match q.dtype() {
+            DType::F16 => flash_attn_fwd_with_lse_t::<f16>(
+                q, q_l, k, k_l, v, v_l, softmax_scale, window_size_left, window_size_right, false,
+            ),
+            DType::BF16 => flash_attn_fwd_with_lse_t::<bf16>(
+                q, q_l, k, k_l, v, v_l, softmax_scale, window_size_left, window_size_right, true,
+            ),
+            dt => candle::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
+        },
+        _ => candle::bail!("flash-attn_with_lse expects cuda tensors"),
+    }
+}
+
 /// Flash-attention v2 layer.
 ///
 /// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
@@ -315,6 +728,35 @@ pub fn flash_attn_windowed(
         softcap: None,
     };
     q.apply_op3(k, v, op)
+}
+
+/// Windowed flash-attention returning both the output and LSE.
+///
+/// Returns `(O, LSE)` where `O` has shape `(batch, seqlen_q, num_heads_q, head_size)` and
+/// `LSE` has shape `(batch, num_heads_q, seqlen_q)`.
+pub fn flash_attn_windowed_with_lse(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+) -> Result<(Tensor, Tensor)> {
+    let (q_s, q_l) = q.storage_and_layout();
+    let (k_s, k_l) = k.storage_and_layout();
+    let (v_s, v_l) = v.storage_and_layout();
+    match (&*q_s, &*k_s, &*v_s) {
+        (candle::Storage::Cuda(q), candle::Storage::Cuda(k), candle::Storage::Cuda(v)) => match q.dtype() {
+            DType::F16 => flash_attn_fwd_with_lse_t::<f16>(
+                q, q_l, k, k_l, v, v_l, softmax_scale, window_size_left, window_size_right, false,
+            ),
+            DType::BF16 => flash_attn_fwd_with_lse_t::<bf16>(
+                q, q_l, k, k_l, v, v_l, softmax_scale, window_size_left, window_size_right, true,
+            ),
+            dt => candle::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
+        },
+        _ => candle::bail!("flash-attn_windowed_with_lse expects cuda tensors"),
+    }
 }
 
 /// Flash-attention v2 layer.
@@ -758,6 +1200,128 @@ pub fn flash_attn_varlen(
         softcap: None,
     };
     q.apply_op3(k, v, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Varlen flash-attention returning both the output and LSE.
+///
+/// Returns `(O, LSE)` where `O` has shape `(total_q, num_heads_q, head_size)` and
+/// `LSE` has shape `(num_heads_q, total_q)`.
+pub fn flash_attn_varlen_with_lse(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<(Tensor, Tensor)> {
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+
+    let (q_s, q_l) = q.storage_and_layout();
+    let (k_s, k_l) = k.storage_and_layout();
+    let (v_s, v_l) = v.storage_and_layout();
+    match (&*q_s, &*k_s, &*v_s) {
+        (candle::Storage::Cuda(q), candle::Storage::Cuda(k), candle::Storage::Cuda(v)) => match q.dtype() {
+            DType::F16 => flash_attn_varlen_fwd_with_lse_t::<f16>(
+                q,
+                q_l,
+                k,
+                k_l,
+                v,
+                v_l,
+                seqlens_q,
+                seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                window_size_left,
+                window_size_right,
+                false,
+            ),
+            DType::BF16 => flash_attn_varlen_fwd_with_lse_t::<bf16>(
+                q,
+                q_l,
+                k,
+                k_l,
+                v,
+                v_l,
+                seqlens_q,
+                seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                window_size_left,
+                window_size_right,
+                true,
+            ),
+            dt => candle::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
+        },
+        _ => candle::bail!("flash-attn_varlen_with_lse expects cuda tensors"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Varlen windowed flash-attention returning both the output and LSE.
+///
+/// Returns `(O, LSE)` where `O` has shape `(total_q, num_heads_q, head_size)` and
+/// `LSE` has shape `(num_heads_q, total_q)`.
+pub fn flash_attn_varlen_windowed_with_lse(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+) -> Result<(Tensor, Tensor)> {
+    let (q_s, q_l) = q.storage_and_layout();
+    let (k_s, k_l) = k.storage_and_layout();
+    let (v_s, v_l) = v.storage_and_layout();
+    match (&*q_s, &*k_s, &*v_s) {
+        (candle::Storage::Cuda(q), candle::Storage::Cuda(k), candle::Storage::Cuda(v)) => match q.dtype() {
+            DType::F16 => flash_attn_varlen_fwd_with_lse_t::<f16>(
+                q,
+                q_l,
+                k,
+                k_l,
+                v,
+                v_l,
+                seqlens_q,
+                seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                window_size_left,
+                window_size_right,
+                false,
+            ),
+            DType::BF16 => flash_attn_varlen_fwd_with_lse_t::<bf16>(
+                q,
+                q_l,
+                k,
+                k_l,
+                v,
+                v_l,
+                seqlens_q,
+                seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                window_size_left,
+                window_size_right,
+                true,
+            ),
+            dt => candle::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
+        },
+        _ => candle::bail!("flash-attn_varlen_windowed_with_lse expects cuda tensors"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

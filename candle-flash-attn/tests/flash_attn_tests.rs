@@ -185,3 +185,101 @@ fn flash_attn_varlen() -> Result<()> {
     );
     Ok(())
 }
+
+// T9 LSE shape sanity: For toy shapes, assert LSE shape matches input
+// and causal/windowed settings for padded and varlen paths.
+#[test]
+fn flash_attn_lse_shape_sanity() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+
+    // Padded path
+    let q = Tensor::arange(0u32, 3 * 2 * 8, &device)?
+        .to_dtype(DType::F16)?
+        .reshape((1, 3, 2, 8))?; // (b=1, seqlen_q=3, heads=2, dim=8)
+    let k = (&q / 40.)?;
+    let v = (&q / 50.)?;
+    let q = (&q / 30.)?;
+
+    let (o, lse) = candle_flash_attn::flash_attn_with_lse(&q, &k, &v, 0.5, false)?;
+    assert_eq!(o.dims(), &[1, 3, 2, 8]);
+    assert_eq!(lse.dims(), &[1, 2, 3]); // (b, h, seqlen_q)
+
+    // Windowed (same shape for lse)
+    let (_o2, lse2) = candle_flash_attn::flash_attn_windowed_with_lse(&q, &k, &v, 0.5, Some(1), Some(1))?;
+    assert_eq!(lse2.dims(), &[1, 2, 3]);
+
+    // Varlen path: LSE shape (heads, total_q)
+    let qv = Tensor::arange(0u32, 3 * 2 * 8, &device)?
+        .to_dtype(DType::F16)?
+        .reshape((3, 2, 8))?; // (seqlen_q_total=3, heads=2, dim=8)
+    let kv = (&qv / 40.)?;
+    let vv = (&qv / 50.)?;
+    let qv = (&qv / 30.)?;
+    let seqlens_q = Tensor::new(&[0u32, 3u32], &device)?;
+    let seqlens_k = Tensor::new(&[0u32, 3u32], &device)?;
+    let (_ov, lsev) = candle_flash_attn::flash_attn_varlen_with_lse(
+        &qv,
+        &kv,
+        &vv,
+        &seqlens_q,
+        &seqlens_k,
+        3,
+        3,
+        0.5,
+        false,
+    )?;
+    assert_eq!(lsev.dims(), &[2, 3]); // (heads, total_q)
+    Ok(())
+}
+
+// T10 LSE vs eager: Build tiny q/k and compute logits on CPU to get
+// lse = logsumexp(qk + mask), compare to LSE returned by FA (same softmax_scale).
+#[test]
+fn flash_attn_lse_vs_eager() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    // Small toy example: b=1, h=2, q=3, k=4, d=8
+    let b = 1usize;
+    let h = 2usize;
+    let qlen = 3usize;
+    let klen = 4usize;
+    let d = 8usize;
+    let scale = 0.5f32;
+
+    // Build q/k/v in FA layout: (b, q, h, d)
+    let q_bqhd = Tensor::arange(0u32, (b * h * qlen * d) as u32, &device)?
+        .to_dtype(DType::F16)?
+        .reshape((b, qlen, h, d))?;
+    let k_bkhd = Tensor::arange(0u32, (b * h * klen * d) as u32, &device)?
+        .to_dtype(DType::F16)?
+        .reshape((b, klen, h, d))?;
+    let v_bkhd = (&k_bkhd / 50.)?;
+    let q = (&q_bqhd / 30.)?;
+    let k = k_bkhd.clone();
+    let v = v_bkhd.clone();
+
+    let (_o, lse) = candle_flash_attn::flash_attn_with_lse(&q, &k, &v, scale, false)?;
+    // Compute eager LSE on CPU: for each (b,h) compute logsumexp over K.
+    let q_cpu = q.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+    let k_cpu = k.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+
+    // Reshape to (b*h, q, d) and (b*h, k, d)
+    let q_bh_q_d = q_cpu.transpose(1, 2)?.reshape((b * h, qlen, d))?;
+    let k_bh_k_d = k_cpu.transpose(1, 2)?.reshape((b * h, klen, d))?;
+    // For each bh row: logits = scale * (Q @ K^T), lse = logsumexp over k axis
+    let mut lse_rows: Vec<f32> = Vec::with_capacity(b * h * qlen);
+    for bh in 0..(b * h) {
+        let q_i = q_bh_q_d.i(bh)?.clone(); // (q, d)
+        let k_i = k_bh_k_d.i(bh)?.clone(); // (k, d)
+        let logits = (q_i.matmul(&k_i.t()?)? * scale as f64)?; // (q, k)
+        let lse_i = logits.log_sum_exp(D::Minus1)?; // (q)
+        let v: Vec<f32> = lse_i.to_vec1()?;
+        lse_rows.extend(v);
+    }
+    let lse_eager = Tensor::from_vec(lse_rows, (b, h, qlen), &Device::Cpu)?;
+    let lse_gpu = lse.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+
+    // Compare within a small tolerance
+    let diff = (lse_eager - lse_gpu)?.abs()?.flatten_all()?.max(0)?;
+    assert!(diff.to_vec0::<f32>()? < 1e-3);
+    Ok(())
+}
