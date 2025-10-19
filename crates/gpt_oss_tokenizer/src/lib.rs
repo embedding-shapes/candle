@@ -11,6 +11,14 @@ const TOKENIZER_FILE: &str = "tokenizer.json";
 const GENERATION_CONFIG_FILE: &str = "generation_config.json";
 const SPECIAL_TOKENS_MAP_FILE: &str = "special_tokens_map.json";
 
+// Harmony special token markers used in decoded text parsing
+const ST_START: &str = "<|start|>";
+const ST_MESSAGE: &str = "<|message|>";
+const ST_END: &str = "<|end|>";
+const ST_CALL: &str = "<|call|>";
+const ST_RETURN: &str = "<|return|>";
+const ST_CHANNEL: &str = "<|channel|>";
+
 #[derive(Debug, Clone, Serialize)]
 struct JinjaMessage {
     role: String,
@@ -181,4 +189,35 @@ pub fn load_special_ids_from_map<P: AsRef<Path>>(snapshot_dir: P) -> Result<(u32
         _ => anyhow::bail!("invalid eos_token in special_tokens_map.json"),
     };
     Ok((bos, pad, eos))
+}
+
+/// Extract the assistant's final channel message content from a decoded Harmony string.
+/// Returns the inner text between the assistant header `<|channel|>final<|message|>`
+/// and the next control token (one of `<|return|>`, `<|call|>`, `<|end|>`, or the
+/// start of another header `<|start|>`). Control tokens are never included.
+pub fn extract_final_assistant_text_from_decoded(decoded: &str) -> Option<String> {
+    // Find the last assistant header; then locate channel -> message and slice until stop.
+    let start_tag = format!("{}assistant", ST_START);
+    let start_pos = decoded.rfind(&start_tag)?;
+    let rest = &decoded[start_pos + start_tag.len()..];
+    let after_channel = if let Some(pos) = rest.find(ST_CHANNEL) {
+        let rest2 = &rest[pos + ST_CHANNEL.len()..];
+        // Skip channel name (e.g., "final") then require message marker.
+        if let Some(mpos) = rest2.find(ST_MESSAGE) {
+            &rest2[mpos + ST_MESSAGE.len()..]
+        } else {
+            return None;
+        }
+    } else if let Some(mpos) = rest.find(ST_MESSAGE) {
+        &rest[mpos + ST_MESSAGE.len()..]
+    } else {
+        return None;
+    };
+    let mut end_idx = after_channel.len();
+    for stop in [ST_RETURN, ST_CALL, ST_END, ST_START] {
+        if let Some(p) = after_channel.find(stop) {
+            end_idx = end_idx.min(p);
+        }
+    }
+    Some(after_channel[..end_idx].to_string())
 }

@@ -8,19 +8,13 @@ use candle_transformers::models::gpt_oss::config::GptOssConfig;
 use candle_transformers::models::gpt_oss::model::GptOssModel;
 
 use openai_harmony::{chat::{Message, Role}};
-use gpt_oss_tokenizer::{render_then_encode, load_stop_token_ids};
+use gpt_oss_tokenizer::{render_then_encode, load_stop_token_ids, extract_final_assistant_text_from_decoded};
 
 // Constants
 const DEFAULT_SNAPSHOT_DIR: &str =
     "~/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee";
 const MODEL_INDEX_FILE: &str = "model.safetensors.index.json";
-// Special token strings used in Harmony/GPT-OSS formatting.
-const ST_START: &str = "<|start|>";
-const ST_MESSAGE: &str = "<|message|>";
-const ST_END: &str = "<|end|>"; // not a stop criterion for sampling here
-const ST_CALL: &str = "<|call|>"; // stop criterion
-const ST_RETURN: &str = "<|return|>"; // primary stop criterion
-const ST_CHANNEL: &str = "<|channel|>";
+// Special tokens are handled via tokenizer decoding and the shared helper in gpt_oss_tokenizer.
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "GPT-OSS-20B example (Harmony prompt formatting)")]
@@ -105,6 +99,22 @@ fn main() -> Result<()> {
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, &device)? };
     let mut model = GptOssModel::load(vb, &cfg).context("failed to load GPT-OSS model weights")?;
 
+    // Optionally prefill the assistant final header to start streaming the final content.
+    // This inserts: <|channel|>final<|message|> right after the assistant header.
+    let tok_path = snapshot_dir.join("tokenizer.json");
+    let hf_tok = tokenizers::Tokenizer::from_file(&tok_path)
+        .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
+    if args.prefill {
+        let (hdr, _unstable) = {
+            // Using tokenizers crate API: replicate encode("<|channel|>final<|message|>", allowed)
+            // The public API is slightly different; use direct helpers for parity.
+            let ids = hf_tok.encode("<|channel|>final<|message|>", /*add_special_tokens=*/ false)
+                .map_err(|e| anyhow::anyhow!("tokenizer.encode failed: {e}"))?;
+            (ids.get_ids().to_vec(), ())
+        };
+        tokens.extend(hdr);
+    }
+
     // Set up the logits processor / sampler.
     let sampling = if args.temperature <= 0.0 {
         Sampling::ArgMax
@@ -121,7 +131,9 @@ fn main() -> Result<()> {
     let stop_tokens: std::collections::BTreeSet<u32> = stop_ids.into_iter().collect();
 
     // Decode loop using full forward with KV cache, RoPE (YARN), sinks and flash-attn.
+    // Stream only the assistant final-channel content as it appears.
     let mut index_pos = 0usize; // global position in sequence
+    let mut last_emitted_len = 0usize; // number of bytes already emitted from final-channel text
     for step in 0..args.sample_len {
         let (context_size, context_index) = if step > 0 { (1usize, index_pos) } else { (tokens.len(), 0usize) };
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
@@ -178,22 +190,36 @@ fn main() -> Result<()> {
         let next = sampler.sample(&last)?;
         tokens.push(next);
         index_pos += context_size;
+        // Streaming: decode and extract after each token; emit only the newly appended portion.
+        if let Ok(decoded_full) = hf_tok.decode(&tokens, /*skip_special_tokens=*/ false) {
+            if let Some(final_text) = extract_final_assistant_text_from_decoded(&decoded_full) {
+                // Emit the delta only; guard against truncation/reset by clamping.
+                let new_len = final_text.len();
+                if new_len > last_emitted_len {
+                    let delta = &final_text[last_emitted_len..];
+                    print!("{}", delta);
+                    use std::io::Write as _;
+                    std::io::stdout().flush().ok();
+                    last_emitted_len = new_len;
+                }
+            }
+        }
         if stop_tokens.contains(&next) { break; }
     }
 
-    // Decode via tokenizer.json to extract assistant final content and print only that.
-    let tok_path = snapshot_dir.join("tokenizer.json");
-    let hf_tok = tokenizers::Tokenizer::from_file(&tok_path)
-        .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
-    // Preserve special tokens so we can locate the assistant final channel content.
-    let decoded_full = hf_tok
-        .decode(&tokens, /*skip_special_tokens=*/ false)
-        .unwrap_or_else(|_| String::from("<decode-error>"));
-    if let Some(reply) = extract_assistant_final_message(&decoded_full) {
-        println!("{}", reply.trim());
+    // If we have streamed some content, terminate the line.
+    if last_emitted_len > 0 {
+        println!();
     } else {
-        // As a fallback, print the decoded raw text once.
-        println!("{}", decoded_full.trim());
+        // Fallback: decode once and print extracted final portion if available, else raw decoded.
+        let decoded_full = hf_tok
+            .decode(&tokens, /*skip_special_tokens=*/ false)
+            .unwrap_or_else(|_| String::from("<decode-error>"));
+        if let Some(reply) = extract_final_assistant_text_from_decoded(&decoded_full) {
+            println!("{}", reply.trim());
+        } else {
+            println!("{}", decoded_full.trim());
+        }
     }
 
     Ok(())
@@ -210,33 +236,4 @@ fn expand_tilde(p: &str) -> Result<std::path::PathBuf> {
     }
 }
 
-// --- Helpers (prompt parsing from decoded string) ---
-
-fn extract_assistant_final_message(decoded: &str) -> Option<String> {
-    // Find the last assistant header; then ensure message marker; capture until a stop.
-    let start_tag = format!("{}assistant", ST_START);
-    let start_pos = decoded.rfind(&start_tag)?;
-    let rest = &decoded[start_pos + start_tag.len()..];
-    let after_channel = if let Some(pos) = rest.find(ST_CHANNEL) {
-        let rest2 = &rest[pos + ST_CHANNEL.len()..];
-        // Expect channel name (e.g., "final") immediately following; skip it.
-        // Then expect message marker.
-        if let Some(mpos) = rest2.find(ST_MESSAGE) {
-            &rest2[mpos + ST_MESSAGE.len()..]
-        } else {
-            return None;
-        }
-    } else if let Some(mpos) = rest.find(ST_MESSAGE) {
-        &rest[mpos + ST_MESSAGE.len()..]
-    } else {
-        return None;
-    };
-    // Stop at first of return/call/end or next start.
-    let mut end_idx = after_channel.len();
-    for stop in [ST_RETURN, ST_CALL, ST_END, ST_START] {
-        if let Some(p) = after_channel.find(stop) {
-            end_idx = end_idx.min(p);
-        }
-    }
-    Some(after_channel[..end_idx].to_string())
-}
+// No local extraction helpers; use gpt_oss_tokenizer::extract_final_assistant_text_from_decoded
