@@ -18,6 +18,7 @@ const ST_END: &str = "<|end|>";
 const ST_CALL: &str = "<|call|>";
 const ST_RETURN: &str = "<|return|>";
 const ST_CHANNEL: &str = "<|channel|>";
+const ST_CONSTRAIN: &str = "<|constrain|>";
 
 #[derive(Debug, Clone, Serialize)]
 struct JinjaMessage {
@@ -222,4 +223,83 @@ pub fn extract_final_assistant_text_from_decoded(decoded: &str) -> Option<String
         }
     }
     Some(slice_after[..end_idx].to_string())
+}
+
+/// Compute which Harmony special tokens must remain allowed (not masked) for the
+/// very next token emission, given the decoded Harmony string observed so far.
+///
+/// This reflects the minimal grammar used during completion:
+/// - After "...<|start|>assistant" → must allow <|channel|>.
+/// - After "...<|channel|>" → allow free-form channel text (e.g. "final|analysis|commentary"),
+///   then require <|message|> as the next special control.
+/// - After "...<|message|>..." → allow free text plus terminators <|end|>, <|return|>, <|call|>;
+///   never pre-zero their logits; stopping is handled on emission.
+///
+/// Returns the set of special token strings that MUST NOT be masked at this step.
+pub fn allowed_specials_for_next(decoded_so_far: &str) -> std::collections::BTreeSet<&'static str> {
+    let mut allow: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+
+    // Find the last assistant header start, if any.
+    let assistant_hdr = format!("{}assistant", ST_START);
+    let last_asst = decoded_so_far.rfind(&assistant_hdr);
+    if last_asst.is_none() {
+        // No assistant yet: do not enforce any special allowances.
+        return allow;
+    }
+    let after_asst = &decoded_so_far[last_asst.unwrap() + assistant_hdr.len()..];
+
+    // Case 1: immediately after assistant header, before <|channel|>
+    if !after_asst.contains(ST_CHANNEL) {
+        allow.insert(ST_CHANNEL);
+        return allow;
+    }
+
+    // Strip up to and including <|channel|>
+    let ch_pos = after_asst.rfind(ST_CHANNEL).unwrap();
+    let after_channel = &after_asst[ch_pos + ST_CHANNEL.len()..];
+    // If <|message|> has not yet appeared after channel, permit only the <|message|> control
+    // (channel qualifier like "final"/"analysis"/"commentary" are normal tokens, not specials).
+    if !after_channel.contains(ST_MESSAGE) {
+        allow.insert(ST_MESSAGE);
+        return allow;
+    }
+
+    // After <|message|>, allow terminators but do not force-stop via masking.
+    allow.insert(ST_END);
+    allow.insert(ST_RETURN);
+    allow.insert(ST_CALL);
+    // Also keep <|constrain|> unmasked if present in this vocabulary.
+    allow.insert(ST_CONSTRAIN);
+    allow
+}
+
+/// Apply a conservative mask to logits that would otherwise suppress Harmony specials
+/// globally: ensure the required specials for the next step remain untouched.
+///
+/// - `logits` is a mutable slice of length equal to the vocabulary size.
+/// - `tokenizer` maps special token strings to ids.
+/// - `decoded_so_far` is the full decoded Harmony string up to (and including) the last token.
+/// - `globally_forbidden_special_ids` is an optional set of ids that external code intends to
+///   suppress; this function will un-suppress the specials required by the Harmony grammar.
+pub fn unmask_required_harmony_specials(
+    logits: &mut [f32],
+    tokenizer: &Tokenizer,
+    decoded_so_far: &str,
+    globally_forbidden_special_ids: &std::collections::BTreeSet<u32>,
+) {
+    let allow = allowed_specials_for_next(decoded_so_far);
+    for s in allow {
+        if let Some(id) = tokenizer.token_to_id(s) {
+            if globally_forbidden_special_ids.contains(&id) {
+                // Ensure this id remains usable by restoring logits to finite range if needed.
+                if logits.get_mut(id as usize).is_some() {
+                    let v = &mut logits[id as usize];
+                    if !v.is_finite() || *v <= f32::NEG_INFINITY / 2.0 {
+                        // Reset to a neutral small logit instead of -inf; caller may overwrite.
+                        *v = 0.0;
+                    }
+                }
+            }
+        }
+    }
 }
