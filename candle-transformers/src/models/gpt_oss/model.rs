@@ -214,8 +214,9 @@ impl GptOssModel {
         let head_dim = self.cfg.head_dim();
         let n_q = self.cfg.num_attention_heads;
         let n_kv = self.cfg.num_key_value_heads;
-        // Apply YARN attention scaling in the score path. The rotary table already applies
-        // mscale to sin/cos; multiply the score scale by mscale^2 per standard YARN guidance.
+        // Apply YARN attention scaling in the score path. We follow the variant where
+        // sin/cos tables are unscaled and only the attention softmax scale is multiplied
+        // by mscale^2. Do not also scale sin/cos to avoid double-application.
         let yarn_mscale = {
             let factor = self
                 .cfg
