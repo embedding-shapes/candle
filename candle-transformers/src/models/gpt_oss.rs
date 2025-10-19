@@ -450,3 +450,44 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor>
     let m = mask.where_cond(&on_true, on_false)?;
     Ok(m)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::{Device, Tensor};
+
+    // Validate sinks_scale_from_lse matches 1 / (1 + exp(sink - lse)).
+    #[test]
+    fn t18_sinks_scale_formula() -> Result<()> {
+        let dev = Device::Cpu;
+        // lse: (b=1, h=2, q=3)
+        let lse = Tensor::from_vec(
+            vec![
+                // h0
+                0.0f32, 1.0, 2.0,
+                // h1
+                -1.0, 0.5, 3.0,
+            ],
+            (1, 2, 3),
+            &dev,
+        )?;
+        // sinks: (h=2)
+        let sinks = Tensor::from_vec(vec![0.5f32, -0.5], 2, &dev)?;
+        let scale = sinks_scale_from_lse(&lse, &sinks)?; // (1,2,3)
+        let got = scale.to_vec3::<f32>()?;
+        // Compute reference
+        let lse_host = lse.to_vec3::<f32>()?;
+        for b in 0..1 {
+            for h in 0..2 {
+                for q in 0..3 {
+                    let lse_v = lse_host[b][h][q];
+                    let s = if h == 0 { 0.5 } else { -0.5 };
+                    let ref_v = 1.0 / (1.0 + (s - lse_v).exp());
+                    let diff = (ref_v - got[b][h][q]).abs();
+                    assert!(diff < 1e-6, "mismatch at (b={b},h={h},q={q}): ref={ref_v} got={} diff={diff}", got[b][h][q]);
+                }
+            }
+        }
+        Ok(())
+    }
+}

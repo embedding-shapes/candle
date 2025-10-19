@@ -119,7 +119,7 @@ impl GptOssModel {
                     let gate_up = match load_expert_linear_mxfp4_grouped(
                         hidden,
                         2 * inter,
-                        false,
+                        true,
                         mlp_vb.clone(),
                         "experts.gate_up_proj",
                         e,
@@ -129,7 +129,7 @@ impl GptOssModel {
                         Err(_) => load_linear_maybe_mxfp4(
                             hidden,
                             2 * inter,
-                            false,
+                            true,
                             mlp_vb.pp(&format!("experts.{e}")),
                             "gate_up_proj",
                         )?,
@@ -137,7 +137,7 @@ impl GptOssModel {
                     let down = match load_expert_linear_mxfp4_grouped(
                         inter,
                         hidden,
-                        false,
+                        true,
                         mlp_vb.clone(),
                         "experts.down_proj",
                         e,
@@ -147,7 +147,7 @@ impl GptOssModel {
                         Err(_) => load_linear_maybe_mxfp4(
                             inter,
                             hidden,
-                            false,
+                            true,
                             mlp_vb.pp(&format!("experts.{e}")),
                             "down_proj",
                         )?,
@@ -214,7 +214,18 @@ impl GptOssModel {
         let head_dim = self.cfg.head_dim();
         let n_q = self.cfg.num_attention_heads;
         let n_kv = self.cfg.num_key_value_heads;
-        let softmax_scale = 1.0f32 / (head_dim as f32).sqrt();
+        // Apply YARN attention scaling in the score path. The rotary table already applies
+        // mscale to sin/cos; multiply the score scale by mscale^2 per standard YARN guidance.
+        let yarn_mscale = {
+            let factor = self
+                .cfg
+                .rope_scaling
+                .as_ref()
+                .and_then(|r| r.factor)
+                .unwrap_or(1.0);
+            if factor <= 1.0 { 1.0 } else { 0.1 * factor.ln() + 1.0 }
+        };
+        let softmax_scale = (1.0f32 / (head_dim as f32).sqrt()) * (yarn_mscale * yarn_mscale);
         
 
         for (i, layer) in self.layers.iter_mut().enumerate() {

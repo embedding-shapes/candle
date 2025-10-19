@@ -1,4 +1,42 @@
-commit 8b691d4ded326223ad4cba8a41b3d089c38c56d0
+commit 59c25c6cdf01cee8a43741ad60fcc63d240b598c
+Author: user <user@user.user>
+Date:   Sun Oct 19 17:18:08 2025 +0200
+
+    examples(gpt-oss-20b): fix Harmony channel/EOS parsing; print raw decoded output
+    
+    - Stop only on <|return|> (200002) and <|call|> (200012); do not stop on <|end|>.
+    - Prefill assistant header with "<|channel|>final<|message|>" by default to avoid dangling headers.
+    - Ensure trailing assistant header is complete before parsing; append header if needed.
+    - Decode and print the full token stream (including specials) before structured parsing.
+    - Prefer assistant message with channel="final"; fallback to last assistant if none.
+    - Tests: update t22 to assert <|channel|>/<|return|> ids; add t23 to validate parsing with channel header.
+
+commit e8d79601a5f6f6ede523371a647b45302c6329bf
+Author: user <user@user.user>
+Date:   Sun Oct 19 16:26:18 2025 +0200
+
+    gpt-oss+mxfp4: fix E8M0 decode; wire full forward (MoE+GQA+YARN+sliding/full+sinks); allow Harmony specials and EOS in sampling
+    
+    - MXFP4 E8M0: use biased exponent 2^(u8-127), 0xFF -> NaN. Update CUDA/CPU paths and add unit tests for codes {0,127,128,254,255}. Add CPU↔CUDA parity tests and small throughput sanity.
+    - GPT-OSS forward: implement full transformer path with MoE top-K=4 (softmax over selected), GQA (64 Q heads, 8 KV heads), YARN RoPE per config (factor=32, beta_fast=32, beta_slow=1, original_max=4096, theta=150000), attention sinks renorm using FA LSE, and alternating sliding/full attention (sliding_window=128). Add per-layer norms and rotating KV cache (seq-dim indexed).
+    - Flash-attn: provide eager + FA paths; renormalize with LSE for sinks; windowed/full variants consistent with softmax scale.
+    - Harmony generation: keep special tokens allowed (<|message|> not banned); stop on EOS set {200007 <|end|>, 199999 <|pad|>, 200012 <|call|>, 200002 <|return|>}. Example now runs full forward on CUDA with flash-attn, uses Harmony prompt formatting.
+    - Loader robustness: handle presence/absence of biases for q/k/v/o projections and router when constructing layers; derive Default for rope_scaling config.
+    - Tests: adjust GPT-OSS shape test for required per-layer norms; guard FA-specific tests behind feature flag.
+
+commit aa05d174b4d7c63f38334468376a1e1dd20b64db
+Author: user <user@user.user>
+Date:   Sun Oct 19 16:06:35 2025 +0200
+
+    fix(mxfp4): correct E8M0 scale decode on CPU/CUDA; add tests
+    
+    - Use biased-exponent E8M0 mapping: scale = 2^(u8 - 127); 0xFF => NaN.
+    - Update candle-core dequant and CUDA kernel; align transformers helper.
+    - Adjust quantization tests to encode scales with bias 127.
+    - Add focused unit tests for key E8M0 codes and Harmony special token IDs.
+    - No changes to GPT-OSS forward/sampling in this commit; example still WIP.
+
+commit 3bd1f7ddfc8418ea9daeec5a4bfad65e83a06563
 Author: user <user@user.user>
 Date:   Sun Oct 19 15:32:14 2025 +0200
 
