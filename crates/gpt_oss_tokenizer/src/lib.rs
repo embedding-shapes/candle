@@ -196,28 +196,30 @@ pub fn load_special_ids_from_map<P: AsRef<Path>>(snapshot_dir: P) -> Result<(u32
 /// and the next control token (one of `<|return|>`, `<|call|>`, `<|end|>`, or the
 /// start of another header `<|start|>`). Control tokens are never included.
 pub fn extract_final_assistant_text_from_decoded(decoded: &str) -> Option<String> {
-    // Find the last assistant header; then locate channel -> message and slice until stop.
-    let start_tag = format!("{}assistant", ST_START);
-    let start_pos = decoded.rfind(&start_tag)?;
-    let rest = &decoded[start_pos + start_tag.len()..];
-    let after_channel = if let Some(pos) = rest.find(ST_CHANNEL) {
-        let rest2 = &rest[pos + ST_CHANNEL.len()..];
-        // Skip channel name (e.g., "final") then require message marker.
-        if let Some(mpos) = rest2.find(ST_MESSAGE) {
+    // Prefer an explicit match on the 'final' channel, if present.
+    let preferred = format!("{}assistant{}final{}", ST_START, ST_CHANNEL, ST_MESSAGE);
+    let slice_after = if let Some(pos) = decoded.rfind(&preferred) {
+        &decoded[pos + preferred.len()..]
+    } else {
+        // Fallback: find the last assistant header, then locate the next message marker.
+        let start_tag = format!("{}assistant", ST_START);
+        let start_pos = decoded.rfind(&start_tag)?;
+        let rest = &decoded[start_pos + start_tag.len()..];
+        if let Some(pos) = rest.find(ST_CHANNEL) {
+            let rest2 = &rest[pos + ST_CHANNEL.len()..];
+            let mpos = rest2.find(ST_MESSAGE)?;
             &rest2[mpos + ST_MESSAGE.len()..]
         } else {
-            return None;
+            let mpos = rest.find(ST_MESSAGE)?;
+            &rest[mpos + ST_MESSAGE.len()..]
         }
-    } else if let Some(mpos) = rest.find(ST_MESSAGE) {
-        &rest[mpos + ST_MESSAGE.len()..]
-    } else {
-        return None;
     };
-    let mut end_idx = after_channel.len();
+
+    let mut end_idx = slice_after.len();
     for stop in [ST_RETURN, ST_CALL, ST_END, ST_START] {
-        if let Some(p) = after_channel.find(stop) {
+        if let Some(p) = slice_after.find(stop) {
             end_idx = end_idx.min(p);
         }
     }
-    Some(after_channel[..end_idx].to_string())
+    Some(slice_after[..end_idx].to_string())
 }

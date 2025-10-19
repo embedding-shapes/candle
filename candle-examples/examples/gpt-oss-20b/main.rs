@@ -211,14 +211,22 @@ fn main() -> Result<()> {
     if last_emitted_len > 0 {
         println!();
     } else {
-        // Fallback: decode once and print extracted final portion if available, else raw decoded.
-        let decoded_full = hf_tok
-            .decode(&tokens, /*skip_special_tokens=*/ false)
-            .unwrap_or_else(|_| String::from("<decode-error>"));
-        if let Some(reply) = extract_final_assistant_text_from_decoded(&decoded_full) {
-            println!("{}", reply.trim());
+        // Fallback: decode once and print extracted final portion if available,
+        // else decode with skip_special_tokens to ensure we never print control tokens.
+        if let Ok(decoded_full) = hf_tok.decode(&tokens, /*skip_special_tokens=*/ false) {
+            if let Some(reply) = extract_final_assistant_text_from_decoded(&decoded_full) {
+                println!("{}", reply.trim());
+            } else {
+                let sanitized = hf_tok
+                    .decode(&tokens, /*skip_special_tokens=*/ true)
+                    .unwrap_or_else(|_| String::from(""));
+                println!("{}", sanitized.trim());
+            }
         } else {
-            println!("{}", decoded_full.trim());
+            let sanitized = hf_tok
+                .decode(&tokens, /*skip_special_tokens=*/ true)
+                .unwrap_or_else(|_| String::from(""));
+            println!("{}", sanitized.trim());
         }
     }
 
