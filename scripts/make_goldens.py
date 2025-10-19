@@ -1,8 +1,16 @@
 import json
 from pathlib import Path
-from transformers import AutoTokenizer
 import numpy as np
 from safetensors import safe_open
+import torch
+from transformers import AutoTokenizer
+from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
+from transformers.models.gpt_oss.modeling_gpt_oss import (
+    GptOssModel,
+    GptOssAttention,
+    GptOssRotaryEmbedding,
+    apply_rotary_pos_emb,
+)
 
 SNAPSHOT = Path.home() / \
     ".cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee"
@@ -120,6 +128,117 @@ def main():
         })
     with open(fixtures_dir / "mxfp4_stats_layer0_expert0_gate_up_proj.json", "w") as f:
         json.dump({"rows": stats, "shape": [int(out), int(cols)]}, f)
+
+    # Also dump a small raw+decoded slice for row 0, block 0 (pre/post decode check)
+    raw_bytes = [int(x) for x in b0[0, 0].tolist()]
+    decoded32 = [float(x) for x in out_bf16[0, :32].tolist()]
+    with open(fixtures_dir / "mxfp4_row0_block0_slice.json", "w") as f:
+        json.dump({
+            "raw_bytes": raw_bytes,  # 16 bytes (each carries 2 fp4 values)
+            "scale_u8": int(s0[0, 0]),
+            "decoded32": decoded32,
+        }, f)
+
+    # 2) Dump per-layer hidden states for the first 2 decode steps (tiny synthetic config for speed)
+    torch.manual_seed(13)
+    cfg = GptOssConfig(
+        num_hidden_layers=3,
+        num_local_experts=2,
+        num_experts_per_tok=1,
+        vocab_size=256,
+        hidden_size=32,
+        intermediate_size=32,
+        head_dim=8,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=64,
+        rope_parameters={
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "truncate": False,
+            "original_max_position_embeddings": 16,
+        },
+        sliding_window=8,
+        attention_dropout=0.0,
+    )
+    model = GptOssModel(cfg).eval()
+    # Two decode steps with caching
+    ids0 = torch.tensor([[42]], dtype=torch.long)
+    out0 = model(ids0, use_cache=True, output_hidden_states=True)
+    step1_hidden = [h.detach().cpu().numpy()[0, -1, :].tolist() for h in out0.hidden_states]
+    # second token with cache
+    ids1 = torch.tensor([[17]], dtype=torch.long)
+    out1 = model(ids1, use_cache=True, past_key_values=out0.past_key_values, output_hidden_states=True)
+    step2_hidden = [h.detach().cpu().numpy()[0, -1, :].tolist() for h in out1.hidden_states]
+    with open(fixtures_dir / "hidden_states_step1.json", "w") as f:
+        json.dump({
+            "layers": len(step1_hidden),
+            "hidden_size": len(step1_hidden[0]),
+            "data": step1_hidden,
+        }, f)
+    with open(fixtures_dir / "hidden_states_step2.json", "w") as f:
+        json.dump({
+            "layers": len(step2_hidden),
+            "hidden_size": len(step2_hidden[0]),
+            "data": step2_hidden,
+        }, f)
+
+    # 3) Dump attention outputs for two short cases (use GptOssAttention directly, tiny config)
+    def run_attn_case(seq_len: int, case_name: str):
+        torch.manual_seed(123 + seq_len)
+        attn_mod = GptOssAttention(cfg, layer_idx=0).eval()
+        # hidden_states shape: (b, t, h)
+        hs = torch.randn(1, seq_len, cfg.hidden_size, dtype=torch.float32)
+        # Build rotary caches
+        rope = GptOssRotaryEmbedding(config=cfg)
+        pos_ids = torch.arange(0, seq_len, dtype=torch.long).unsqueeze(0)
+        cos, sin = rope(hs, pos_ids)
+        attn_out, attn_w = attn_mod(
+            hidden_states=hs,
+            attention_mask=None,
+            position_ids=pos_ids,
+            past_key_values=None,
+            use_cache=False,
+            cache_position=None,
+            position_embeddings=(cos, sin),
+            output_attentions=True,
+        )
+        # Serialize minimal shapes for speed
+        with open(fixtures_dir / case_name, "w") as f:
+            json.dump({
+                "output_shape": list(attn_out.shape),
+                "weights_shape": list(attn_w.shape),
+                "output_sample": attn_out.detach().cpu().numpy()[0, -1, :8].tolist(),
+                "weights_sample": attn_w.detach().cpu().numpy()[0, 0].tolist(),
+            }, f)
+
+    run_attn_case(2, "attn_case1.json")
+    run_attn_case(3, "attn_case2.json")
+
+    # 4) Dump YARN-rotated Q,K slices at positions of interest using tiny head_dim
+    def dump_yarn_qk(pos: int, fname: str):
+        torch.manual_seed(999 + pos)
+        rope = GptOssRotaryEmbedding(config=cfg)
+        b, h, t, d = 1, 2, 1, cfg.head_dim
+        q_in = torch.randn(b, h, t, d, dtype=torch.float32)
+        k_in = torch.randn(b, 1, t, d, dtype=torch.float32)
+        pos_ids = torch.tensor([[pos]])
+        cos, sin = rope(q_in, pos_ids)
+        q_rot, k_rot = apply_rotary_pos_emb(q_in, k_in, cos, sin)
+        with open(fixtures_dir / fname, "w") as f:
+            json.dump({
+                "head_dim": d,
+                "pos": pos,
+                "q_in": q_in.detach().cpu().numpy()[0, 0, 0].tolist(),
+                "k_in": k_in.detach().cpu().numpy()[0, 0, 0].tolist(),
+                "q_rot": q_rot.detach().cpu().numpy()[0, 0, 0].tolist(),
+                "k_rot": k_rot.detach().cpu().numpy()[0, 0, 0].tolist(),
+            }, f)
+
+    dump_yarn_qk(0, "yarn_qk_pos0.json")
+    dump_yarn_qk(17, "yarn_qk_pos17.json")
 
 if __name__ == "__main__":
     main()
