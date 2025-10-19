@@ -3,6 +3,7 @@
 #include "cuda_fp16.h"
 #include "cuda_bf16.h"
 #include<stdint.h>
+#include<math.h>
 
 #define GGML_UNUSED(x) (void)(x)
 #define GGML_CUDA_ASSUME(x)
@@ -2509,6 +2510,72 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     return dall * sumf_d - dmin * sumf_m;
 #endif
+}
+
+// -----------------------------------------------------------------------------
+// MXFP4 (FP4 E2M1 + E8M0 scale) fused dequantize to BF16
+// Input layout:
+//  - blocks: [rows, nblocks, 16] (two FP4 per byte => 32 values per block)
+//  - scales: [rows, nblocks] (u8 E8M0 exponent, signed)
+// Output layout:
+//  - out: [rows, cols] where cols = nblocks * 32 (BF16)
+// Grid config suggestion: dim3 grid(rows, nblocks), dim3 block(32)
+
+static __device__ __forceinline__ float decode_fp4_e2m1_device(uint8_t n) {
+    // s e e m  (E2M1), bias = 1
+    const uint8_t s = (n >> 3) & 0x1;
+    const uint8_t e = (n >> 1) & 0x3;
+    const uint8_t m = (n >> 0) & 0x1;
+    const float sign = s ? -1.0f : 1.0f;
+    if (e == 0) {
+        // subnormal: 2^(1-bias) * (m * 2^-1) = 2^0 * (m * 0.5)
+        const float frac = (float)m * 0.5f;
+        return sign * frac; // since 2^(0) == 1
+    } else {
+        // normal: 2^(E-bias) * (1 + m/2)
+        const float frac = 1.0f + (float)m * 0.5f;
+        const int exp = (int)e - 1; // bias=1
+        return sign * ldexpf(frac, exp);
+    }
+}
+
+static __device__ __forceinline__ float pow2_e8m0_device(uint8_t bexp) {
+    // Signed 8-bit exponent: scale = 2^(int8)
+    const int8_t e = *(reinterpret_cast<int8_t*>(&bexp));
+    // Use exp2f for efficiency and accuracy on device
+    return exp2f((float)e);
+}
+
+extern "C" __global__ void dequant_mxfp4_to_bf16(
+    const uint8_t* __restrict__ blocks, // [rows, nblocks, 16]
+    const uint8_t* __restrict__ scales, // [rows, nblocks]
+    __nv_bfloat16* __restrict__ out,    // [rows, cols]
+    const int rows,
+    const int nblocks,
+    const int cols
+) {
+    const int r = blockIdx.x;
+    const int b = blockIdx.y;
+    const int t = threadIdx.x; // 0..31 (one thread per FP4 value in block)
+
+    if (r >= rows || b >= nblocks || t >= 32) return;
+
+    // Load scale for this block.
+    const int sb_index = r * nblocks + b;
+    const float scale = pow2_e8m0_device(scales[sb_index]);
+
+    // Packed bytes for this block (16 bytes), two FP4 per byte.
+    const int block_base = (r * nblocks + b) * 16;
+    const int byte_idx = t >> 1; // 0..15
+    const uint8_t packed = blocks[block_base + byte_idx];
+    const uint8_t nibble = (t & 1) ? (packed >> 4) : (packed & 0x0f);
+
+    const float v = decode_fp4_e2m1_device(nibble) * scale;
+
+    // Output index
+    const int out_c = b * 32 + t;
+    const int out_index = r * cols + out_c;
+    out[out_index] = __float2bfloat16(v);
 }
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(

@@ -16,6 +16,42 @@ const MXFP4_FP4_BIAS: i32 = 1; // IEEE754-style bias for E=2
 const MXFP4_BLOCK_ELEMS: usize = 32; // k=32 elements per block
 const MXFP4_BLOCK_BYTES: usize = 16; // 2 values per byte
 
+// Shared shape validation used by CPU/CUDA paths.
+fn validate_mxfp4_shapes(
+    blocks: &Tensor,
+    scales: &Tensor,
+    full_shape: [usize; 2],
+) -> Result<(usize, usize, usize)> {
+    if blocks.dtype() != DType::U8 {
+        bail!("mxfp4 blocks must be U8, got {:?}", blocks.dtype())
+    }
+    if scales.dtype() != DType::U8 {
+        bail!("mxfp4 scales must be U8, got {:?}", scales.dtype())
+    }
+    let rows = full_shape[0];
+    let cols = full_shape[1];
+    if cols % MXFP4_BLOCK_ELEMS != 0 {
+        bail!("mxfp4 cols must be multiple of 32, got {cols}")
+    }
+    let nblocks = cols / MXFP4_BLOCK_ELEMS;
+    let bdims = blocks.dims();
+    if bdims != [rows, nblocks, MXFP4_BLOCK_BYTES] {
+        bail!(
+            "mxfp4 blocks shape mismatch, expected [rows, cols/32, 16]=[{rows}, {nblocks}, 16], got {:?}",
+            bdims
+        )
+    }
+    let sdims = scales.dims();
+    if sdims != [rows, nblocks] {
+        bail!(
+            "mxfp4 scales shape mismatch, expected [rows, cols/32]=[{rows}, {nblocks}], got {:?}",
+            sdims
+        )
+    }
+    Ok((rows, cols, nblocks))
+}
+// CPU-only dequant remains as-is below.
+
 /// Decode a single 4-bit E2M1 (FP4) code into f32 according to:
 /// - Normal (E>0): (-1)^S * 2^(E-bias) * (1 + M * 2^-1)
 /// - Subnormal (E=0): (-1)^S * 2^(1-bias) * (M * 2^-1)
@@ -58,36 +94,7 @@ pub fn dequant_mxfp4_to_bf16_cpu(
     scales: &Tensor,
     full_shape: [usize; 2],
 ) -> Result<Tensor> {
-    // Validate dtypes.
-    if blocks.dtype() != DType::U8 {
-        bail!("mxfp4 blocks must be U8, got {:?}", blocks.dtype())
-    }
-    if scales.dtype() != DType::U8 {
-        bail!("mxfp4 scales must be U8, got {:?}", scales.dtype())
-    }
-
-    // Validate shapes.
-    let rows = full_shape[0];
-    let cols = full_shape[1];
-    if cols % MXFP4_BLOCK_ELEMS != 0 {
-        bail!("mxfp4 cols must be multiple of 32, got {cols}")
-    }
-    let nblocks = cols / MXFP4_BLOCK_ELEMS;
-
-    let bdims = blocks.dims();
-    if bdims != [rows, nblocks, MXFP4_BLOCK_BYTES] {
-        bail!(
-            "mxfp4 blocks shape mismatch, expected [rows, cols/32, 16]=[{rows}, {nblocks}, 16], got {:?}",
-            bdims
-        )
-    }
-    let sdims = scales.dims();
-    if sdims != [rows, nblocks] {
-        bail!(
-            "mxfp4 scales shape mismatch, expected [rows, cols/32]=[{rows}, {nblocks}], got {:?}",
-            sdims
-        )
-    }
+    let (rows, cols, nblocks) = validate_mxfp4_shapes(blocks, scales, full_shape)?;
 
     // Materialize to CPU host vectors; accept non-contiguous tensors.
     let blocks_v = blocks.to_vec3::<u8>()?; // [rows][nblocks][16]
@@ -122,6 +129,78 @@ pub fn dequant_mxfp4_to_bf16_cpu(
     }
 
     Tensor::from_vec(out, (rows, cols), &Device::Cpu)
+}
+
+/// CUDA fused dequant (if compiled with `feature = "cuda"`). Returns BF16 tensor on same CUDA device.
+#[cfg(feature = "cuda")]
+pub fn dequant_mxfp4_to_bf16_cuda(
+    blocks: &Tensor,
+    scales: &Tensor,
+    full_shape: [usize; 2],
+) -> Result<Tensor> {
+    use crate::{cuda_backend::WrapErr, op::BackpropOp, storage::Storage, CudaDevice, CudaStorage};
+    use cudarc::driver::PushKernelArg;
+    let (rows, cols, nblocks) = validate_mxfp4_shapes(blocks, scales, full_shape)?;
+    // Both inputs must be on CUDA and same device.
+    if !matches!(blocks.device(), Device::Cuda(_)) || !blocks.device().same_device(scales.device()) {
+        bail!("dequant_mxfp4_to_bf16_cuda expects both inputs on the same CUDA device")
+    }
+    let dev: &CudaDevice = blocks.device().as_cuda_device()?;
+    let blocks_c = blocks.contiguous()?;
+    let scales_c = scales.contiguous()?;
+    let blocks_s = blocks_c.storage();
+    let scales_s = scales_c.storage();
+    let blocks_view = match &*blocks_s {
+        Storage::Cuda(s) => s.as_cuda_slice::<u8>()?,
+        _ => bail!("expected CUDA storage for blocks"),
+    };
+    let scales_view = match &*scales_s {
+        Storage::Cuda(s) => s.as_cuda_slice::<u8>()?,
+        _ => bail!("expected CUDA storage for scales"),
+    };
+
+    // Allocate output BF16 on device.
+    let elem_count = rows * cols;
+    let mut out_slice = unsafe { dev.alloc::<bf16>(elem_count)? };
+
+    // Launch kernel: grid=(rows, nblocks, 1), block=(32,1,1)
+    let func = dev.get_or_load_func("dequant_mxfp4_to_bf16", &candle_kernels::QUANTIZED)?;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (rows as u32, nblocks as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    builder.arg(blocks_view);
+    builder.arg(scales_view);
+    builder.arg(&mut out_slice);
+    crate::builder_arg!(builder, rows as i32, nblocks as i32, cols as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    let out_storage = CudaStorage::wrap_cuda_slice(out_slice, dev.clone());
+    let tensor = crate::tensor::from_storage(Storage::Cuda(out_storage), (rows, cols), BackpropOp::none(), false);
+    Ok(tensor)
+}
+
+/// Dispatch dequantize based on device: CUDA if available, else CPU.
+pub fn dequant_mxfp4_to_bf16(
+    blocks: &Tensor,
+    scales: &Tensor,
+    full_shape: [usize; 2],
+) -> Result<Tensor> {
+    match (blocks.device(), scales.device()) {
+        (Device::Cuda(_), d2) if blocks.device().same_device(d2) => {
+            #[cfg(feature = "cuda")]
+            {
+                return dequant_mxfp4_to_bf16_cuda(blocks, scales, full_shape);
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                bail!("CUDA dequant requested but candle built without feature=\"cuda\"")
+            }
+        }
+        _ => dequant_mxfp4_to_bf16_cpu(blocks, scales, full_shape),
+    }
 }
 
 #[cfg(test)]
