@@ -12,6 +12,8 @@ use candle_nn::Linear;
 // Submodule(s)
 pub mod rotary;
 pub mod experts;
+pub mod config;
+pub mod model;
 
 // ============================
 // Config and layer selection
@@ -76,20 +78,37 @@ const MXFP4_BLOCK_BYTES: usize = 16; // packed two nibbles per byte.
 /// Try to resolve the MXFP4 pair names for a given base, supporting both dot and underscore
 /// variants ("base.blocks"/"base.scales" or "base_blocks"/"base_scales"). Returns the fully
 /// qualified names including any VarBuilder path.
-fn detect_mxfp4_pair_names(vb: &candle_nn::VarBuilder, base: &str) -> Option<(String, String)> {
+fn detect_mxfp4_pair_names(
+    vb: &candle_nn::VarBuilder,
+    base: &str,
+) -> Result<Option<(String, String)>> {
     // 1) Dot-separated variant
     let blocks_dot = format!("{base}.blocks");
     let scales_dot = format!("{base}.scales");
     if vb.contains_tensor(&blocks_dot) && vb.contains_tensor(&scales_dot) {
-        return Some((blocks_dot, scales_dot));
+        return Ok(Some((blocks_dot, scales_dot)));
+    }
+    if vb.contains_tensor(&blocks_dot) ^ vb.contains_tensor(&scales_dot) {
+        if vb.contains_tensor(&blocks_dot) {
+            candle::bail!("found '{base}.blocks' but missing '{base}.scales'")
+        } else {
+            candle::bail!("found '{base}.scales' but missing '{base}.blocks'")
+        }
     }
     // 2) Underscore-joined variant (helps with simplified unit-test backends)
     let blocks_us = format!("{base}_blocks");
     let scales_us = format!("{base}_scales");
     if vb.contains_tensor(&blocks_us) && vb.contains_tensor(&scales_us) {
-        return Some((blocks_us, scales_us));
+        return Ok(Some((blocks_us, scales_us)));
     }
-    None
+    if vb.contains_tensor(&blocks_us) ^ vb.contains_tensor(&scales_us) {
+        if vb.contains_tensor(&blocks_us) {
+            candle::bail!("found '{base}_blocks' but missing '{base}_scales'")
+        } else {
+            candle::bail!("found '{base}_scales' but missing '{base}_blocks'")
+        }
+    }
+    Ok(None)
 }
 
 /// Load a Linear layer weight for base `base` where the weight is either stored as BF16
@@ -109,7 +128,7 @@ pub fn load_linear_maybe_mxfp4(
     base: &str,
 ) -> Result<Linear> {
     // Detect paired MXFP4 tensors.
-    if let Some((blocks_name, scales_name)) = detect_mxfp4_pair_names(&vb, base) {
+    if let Some((blocks_name, scales_name)) = detect_mxfp4_pair_names(&vb, base)? {
         // Validate shape alignment to block size.
         if in_dim % MXFP4_BLOCK_ELEMS != 0 {
             candle::bail!(
