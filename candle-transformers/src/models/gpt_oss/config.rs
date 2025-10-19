@@ -4,7 +4,7 @@ use super::GptOssLayerType;
 // model assembly and weight loading. The structure is intentionally minimal and
 // focused on wiring; behavior beyond loading is handled in other modules.
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct RopeScalingConfig {
     #[serde(default)]
     pub r#type: Option<String>, // typically "yarn"
@@ -65,4 +65,3 @@ impl GptOssConfig {
         }
     }
 }
-

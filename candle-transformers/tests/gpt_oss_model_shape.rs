@@ -55,6 +55,15 @@ fn t19_minimal_forward_shape_dtype() -> Result<()> {
     let l0 = 0usize;
     let q_out = cfg.num_attention_heads * cfg.head_dim.unwrap();
     let kv_out = cfg.num_key_value_heads * cfg.head_dim.unwrap();
+    // Pre/post norms
+    tmap.insert(
+        format!("model.layers.{l0}.input_layernorm.weight"),
+        bf16_rand((1, cfg.hidden_size), &dev).reshape(cfg.hidden_size)?,
+    );
+    tmap.insert(
+        format!("model.layers.{l0}.post_attention_layernorm.weight"),
+        bf16_rand((1, cfg.hidden_size), &dev).reshape(cfg.hidden_size)?,
+    );
     tmap.insert(format!("model.layers.{l0}.self_attn.q_proj.weight"), bf16_rand((q_out, cfg.hidden_size), &dev));
     tmap.insert(format!("model.layers.{l0}.self_attn.k_proj.weight"), bf16_rand((kv_out, cfg.hidden_size), &dev));
     tmap.insert(format!("model.layers.{l0}.self_attn.v_proj.weight"), bf16_rand((kv_out, cfg.hidden_size), &dev));

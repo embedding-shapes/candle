@@ -3,7 +3,7 @@ use clap::Parser;
 
 use candle::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::generation::LogitsProcessor;
+use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::gpt_oss::config::GptOssConfig;
 use candle_transformers::models::gpt_oss::model::GptOssModel;
 
@@ -81,28 +81,45 @@ fn main() -> Result<()> {
 
     // Map weights and instantiate the model.
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, &device)? };
-    let model = GptOssModel::load(vb, &cfg).context("failed to load GPT-OSS model weights")?;
+    let mut model = GptOssModel::load(vb, &cfg).context("failed to load GPT-OSS model weights")?;
 
     // Set up the logits processor / sampler.
-    let mut sampler = LogitsProcessor::new(args.seed, Some(args.temperature), args.top_p);
+    let sampling = if args.temperature <= 0.0 {
+        Sampling::ArgMax
+    } else {
+        match args.top_p {
+            None => Sampling::All { temperature: args.temperature },
+            Some(p) => Sampling::TopP { p, temperature: args.temperature },
+        }
+    };
+    let mut sampler = LogitsProcessor::from_sampling(args.seed, sampling);
 
     // Prepare input ids tensor on device.
     let mut tokens: Vec<u32> = input_ids.iter().copied().collect();
-    let stop_tokens = encoding.stop_tokens().context("could not compute Harmony stop tokens")?;
+    let stop_tokens = {
+        let mut set: std::collections::BTreeSet<u32> = encoding
+            .stop_tokens()
+            .context("could not compute Harmony stop tokens")?
+            .into_iter()
+            .collect();
+        // Ensure Harmony EOS and padding/tool tokens are included.
+        // <|end|>=200007, <|endoftext|>=199999 (pad), <|call|>=200012, <|return|>=200002.
+        for id in [200007u32, 199999u32, 200012u32, 200002u32] { set.insert(id); }
+        set
+    };
 
-    // Simple decode loop using the model’s minimal logits forward (embed -> lm_head).
-    // This establishes the end-to-end wiring; subsequent steps will replace it with the
-    // full transformer decode with attention, KV-cache, sinks, and flash-attn.
-    for _ in 0..args.sample_len {
-        let t = Tensor::from_vec(tokens.clone(), (1, tokens.len()), &device)?;
-        let logits = model.forward_logits_minimal(&t)?; // (1, T, vocab)
-        let (_b, _t, _v) = logits.dims3()?;
-        let last = logits.i((0, tokens.len() - 1))?; // (vocab)
+    // Decode loop using full forward with KV cache, RoPE (YARN), sinks and flash-attn.
+    let mut index_pos = 0usize; // global position in sequence
+    for step in 0..args.sample_len {
+        let (context_size, context_index) = if step > 0 { (1usize, index_pos) } else { (tokens.len(), 0usize) };
+        let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
+        let t = Tensor::from_vec(ctxt.to_vec(), (1, context_size), &device)?;
+        let logits = model.forward(&t, context_index)?; // (1, context_size, vocab)
+        let last = logits.i((0, context_size - 1))?; // (vocab)
         let next = sampler.sample(&last)?;
         tokens.push(next);
-        if stop_tokens.contains(&next) {
-            break;
-        }
+        index_pos += context_size;
+        if stop_tokens.contains(&next) { break; }
     }
 
     // Decode full sequence using Harmony tokenizer and extract assistant text.

@@ -121,6 +121,40 @@ fn t5_cpu_gpu_parity_small() -> Result<()> {
 }
 
 #[test]
+fn t4_e8m0_gpu_scale_key_codes() -> Result<()> {
+    let dev = Device::new_cuda(0)?;
+    // Single row, one block (32 elems)
+    let rows = 1usize;
+    let cols = K_BLOCK;
+    let nblocks = 1usize;
+
+    // FP4 nibble for +1.0 is 0b0010; pack two per byte => 0x22
+    let blocks_host = vec![0x22u8; 16];
+    let blocks_t = Tensor::from_vec(blocks_host.clone(), (rows, nblocks, 16), &Device::Cpu)?;
+    let blocks_d = blocks_t.to_device(&dev)?;
+
+    // Test key scale codes: 0, 127, 128, 254, 255
+    let codes = [0u8, 127u8, 128u8, 254u8, 255u8];
+    for &code in &codes {
+        let scales = Tensor::from_vec(vec![code], (rows, nblocks), &Device::Cpu)?;
+        let scales_d = scales.to_device(&dev)?;
+        let out = super::dequant_mxfp4_to_bf16(&blocks_d, &scales_d, [rows, cols])?;
+        let out_cpu = out.to_device(&Device::Cpu)?;
+        let vals = out_cpu.to_vec2::<half::bf16>()?;
+        let v0 = vals[0][0].to_f32();
+        match code {
+            0 => assert!((v0 - 2f32.powi(-127)).abs() < 1e-7, "code=0 expected 2^-127, got {v0}"),
+            127 => assert!((v0 - 1.0).abs() < 1e-7, "code=127 expected 1.0, got {v0}"),
+            128 => assert!((v0 - 2.0).abs() < 1e-7, "code=128 expected 2.0, got {v0}"),
+            254 => assert!((v0 - 2f32.powi(127)).abs() < 1e-2, "code=254 expected 2^127, got {v0}"),
+            255 => assert!(v0.is_nan(), "code=255 expected NaN"),
+            _ => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn t6_throughput_sanity_short() -> Result<()> {
     let rows = 64usize;
     let cols = 2048usize; // small to keep test fast

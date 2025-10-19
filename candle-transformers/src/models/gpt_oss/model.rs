@@ -1,7 +1,8 @@
 use super::config::GptOssConfig;
 use super::experts::{ExpertMlp, GptOssExperts};
-use super::{load_expert_linear_mxfp4_grouped, load_linear_maybe_mxfp4};
-use crate::models::with_tracing::{linear_no_bias, Embedding, RmsNorm};
+use super::{load_expert_linear_mxfp4_grouped, load_linear_maybe_mxfp4, select_attn_mode_for_layer, AttnMode};
+use crate::models::with_tracing::{linear, Embedding, RmsNorm};
+use crate::models::gpt_oss::rotary::{GptOssRopeConfig, GptOssRotaryEmbedding};
 use candle::{DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
@@ -20,6 +21,8 @@ pub struct GptOssAttentionWeights {
 #[derive(Debug, Clone)]
 pub struct GptOssLayerWeights {
     pub attn: GptOssAttentionWeights,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
     pub router: candle_nn::Linear, // hidden -> num_local_experts
     pub experts: GptOssExperts,
 }
@@ -31,6 +34,10 @@ pub struct GptOssModel {
     pub norm: RmsNorm,
     pub layers: Vec<GptOssLayerWeights>,
     pub lm_head: candle_nn::Linear,
+    // Rotary embedding (YARN) shared across layers.
+    pub rope: GptOssRotaryEmbedding,
+    // Per-layer rotating KV cache (stores KV in (b, h_kv, t, d) layout).
+    pub kv_caches: Vec<candle_nn::kv_cache::RotatingKvCache>,
 }
 
 impl GptOssModel {
@@ -46,18 +53,46 @@ impl GptOssModel {
             let eps = cfg.rms_norm_eps.unwrap_or(DEFAULT_RMS_EPS);
             RmsNorm::new(hidden, eps, vb_bf16.pp("model.norm"))?
         };
+        
+        // Rotary (YARN) configuration
+        let rope_cfg = {
+            let rs = cfg.rope_scaling.clone().unwrap_or_default();
+            let factor = rs.factor.unwrap_or(32.0);
+            let beta_fast = rs.beta_fast.unwrap_or(32.0);
+            let beta_slow = rs.beta_slow.unwrap_or(1.0);
+            let original_max = rs.original_max_position_embeddings.unwrap_or(4096);
+            let theta = cfg.rope_theta.unwrap_or(150000.0);
+            GptOssRopeConfig::new(cfg.head_dim(), cfg.max_position_embeddings, theta, factor, beta_fast, beta_slow, original_max)
+        };
+        let rope = GptOssRotaryEmbedding::new_yarn(DType::BF16, &dev, &rope_cfg)?;
 
         // Per-layer weights
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let l_vb = vb_bf16.pp(&format!("model.layers.{i}"));
 
-            // Attention projections
+            // Attention projections (attention_bias=true in config; be robust to missing bias in tests)
             let attn_vb = l_vb.pp("self_attn");
-            let q_proj = linear_no_bias(hidden, cfg.num_attention_heads * head_dim, attn_vb.pp("q_proj"))?;
-            let k_proj = linear_no_bias(hidden, cfg.num_key_value_heads * head_dim, attn_vb.pp("k_proj"))?;
-            let v_proj = linear_no_bias(hidden, cfg.num_key_value_heads * head_dim, attn_vb.pp("v_proj"))?;
-            let o_proj = linear_no_bias(cfg.num_attention_heads * head_dim, hidden, attn_vb.pp("o_proj"))?;
+            let q_proj = if attn_vb.contains_tensor("q_proj.bias") {
+                linear(hidden, cfg.num_attention_heads * head_dim, attn_vb.pp("q_proj"))?
+            } else {
+                crate::models::with_tracing::linear_no_bias(hidden, cfg.num_attention_heads * head_dim, attn_vb.pp("q_proj"))?
+            };
+            let k_proj = if attn_vb.contains_tensor("k_proj.bias") {
+                linear(hidden, cfg.num_key_value_heads * head_dim, attn_vb.pp("k_proj"))?
+            } else {
+                crate::models::with_tracing::linear_no_bias(hidden, cfg.num_key_value_heads * head_dim, attn_vb.pp("k_proj"))?
+            };
+            let v_proj = if attn_vb.contains_tensor("v_proj.bias") {
+                linear(hidden, cfg.num_key_value_heads * head_dim, attn_vb.pp("v_proj"))?
+            } else {
+                crate::models::with_tracing::linear_no_bias(hidden, cfg.num_key_value_heads * head_dim, attn_vb.pp("v_proj"))?
+            };
+            let o_proj = if attn_vb.contains_tensor("o_proj.bias") {
+                linear(cfg.num_attention_heads * head_dim, hidden, attn_vb.pp("o_proj"))?
+            } else {
+                crate::models::with_tracing::linear_no_bias(cfg.num_attention_heads * head_dim, hidden, attn_vb.pp("o_proj"))?
+            };
             let sinks = if attn_vb.contains_tensor("sinks") {
                 attn_vb.get(cfg.num_attention_heads, "sinks")?
             } else {
@@ -68,7 +103,11 @@ impl GptOssModel {
 
             // MoE router and experts
             let mlp_vb = l_vb.pp("mlp");
-            let router = candle_nn::linear_no_bias(hidden, cfg.num_local_experts, mlp_vb.pp("router"))?;
+            let router = if mlp_vb.contains_tensor("router.bias") {
+                candle_nn::linear(hidden, cfg.num_local_experts, mlp_vb.pp("router"))?
+            } else {
+                candle_nn::linear_no_bias(hidden, cfg.num_local_experts, mlp_vb.pp("router"))?
+            };
 
             // Experts: fused gate_up and down. Use MXFP4 dequant path if available.
             let experts = {
@@ -117,14 +156,38 @@ impl GptOssModel {
                 }
                 GptOssExperts::new(router.clone(), all, Some(cfg.num_experts_per_tok))
             };
+            // Per-layer norms
+            let eps = cfg.rms_norm_eps.unwrap_or(DEFAULT_RMS_EPS);
+            let input_layernorm = RmsNorm::new(hidden, eps, vb_bf16.pp(&format!("model.layers.{i}.input_layernorm")))?;
+            let post_attention_layernorm = RmsNorm::new(hidden, eps, vb_bf16.pp(&format!("model.layers.{i}.post_attention_layernorm")))?;
 
-            layers.push(GptOssLayerWeights { attn, router, experts });
+            layers.push(GptOssLayerWeights { attn, input_layernorm, post_attention_layernorm, router, experts });
         }
 
         // Untied LM head
         let lm_head = candle_nn::linear_no_bias(hidden, cfg.vocab_size, vb_bf16.pp("lm_head"))?;
+        // Per-layer KV caches initialized with appropriate window sizes
+        let mut kv_caches = Vec::with_capacity(cfg.num_hidden_layers);
+        let layer_types = cfg.effective_layer_types();
+        for (i, _ly) in layer_types.iter().enumerate() {
+            let attn_mode = select_attn_mode_for_layer(
+                &super::GptOssConfigMinimal {
+                    num_hidden_layers: cfg.num_hidden_layers,
+                    layer_types: layer_types.clone(),
+                    max_position_embeddings: cfg.max_position_embeddings,
+                    sliding_window: cfg.sliding_window,
+                },
+                i,
+            );
+            let window = match attn_mode {
+                AttnMode::Full => cfg.max_position_embeddings,
+                AttnMode::Sliding { left, .. } => left,
+            };
+            // Cache along the sequence dimension (index 2) for K/V tensors shaped (b, h_kv, t, d)
+            kv_caches.push(candle_nn::kv_cache::RotatingKvCache::new(2, window));
+        }
 
-        Ok(Self { cfg: cfg.clone(), embed, norm, layers, lm_head })
+        Ok(Self { cfg: cfg.clone(), embed, norm, layers, lm_head, rope, kv_caches })
     }
 
     /// Minimal forward used for shape/dtype validation: embed tokens and project to logits via lm_head.
@@ -139,6 +202,105 @@ impl GptOssModel {
         let w = self.lm_head.weight().to_dtype(DType::F32)?; // (vocab, h)
         let logits = xs2.matmul(&w.t()?)?; // (bt, vocab)
         let logits = logits.reshape((b, t, self.cfg.vocab_size))?.to_dtype(DType::BF16)?;
+        Ok(logits)
+    }
+
+    /// Full forward for causal decode with KV cache, GQA, YARN RoPE, sinks + flash-attn.
+    /// Returns logits for all provided tokens (b, t, vocab).
+    pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        // Embed tokens
+        let mut xs = self.embed.forward(input_ids)?; // (b,t,hidden)
+        let (b, t, hidden) = xs.dims3()?;
+        let head_dim = self.cfg.head_dim();
+        let n_q = self.cfg.num_attention_heads;
+        let n_kv = self.cfg.num_key_value_heads;
+        let softmax_scale = 1.0f32 / (head_dim as f32).sqrt();
+        
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            // Pre-attention norm
+            let x_norm = layer.input_layernorm.forward(&xs)?; // (b,t,h)
+
+            // Projections
+            let q = x_norm.apply(&layer.attn.q_proj)?; // (b,t,n_q*hd)
+            let k = x_norm.apply(&layer.attn.k_proj)?; // (b,t,n_kv*hd)
+            let v = x_norm.apply(&layer.attn.v_proj)?; // (b,t,n_kv*hd)
+
+            // Reshape to heads
+            let q = q.reshape((b, t, n_q, head_dim))?;
+            let k = k.reshape((b, t, n_kv, head_dim))?;
+            let v = v.reshape((b, t, n_kv, head_dim))?;
+
+            // Apply RoPE (expects (b,h,t,d)) with offset
+            let q_bhtd = q.transpose(1, 2)?; // (b,n_q,t,d)
+            let k_bhtd = k.transpose(1, 2)?; // (b,n_kv,t,d)
+            let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+            let q = q_bhtd.transpose(1, 2)?; // (b,t,n_q,d)
+            let k_step = k_bhtd; // (b,n_kv,t,d) for cache
+            let v_step = v.transpose(1, 2)?; // (b,n_kv,t,d)
+
+            // Append to KV cache (trimmed to layer’s window if sliding)
+            let (k_all, v_all) = self.kv_caches[i].append(&k_step.contiguous()?, &v_step.contiguous()?)?; // (b,n_kv,tk,d)
+
+            // Prepare K,V for attention: repeat for GQA and transpose to (b,tk,n_q,d)
+            let n_rep = n_q / n_kv;
+            let k_rep = crate::utils::repeat_kv(k_all.clone(), n_rep)?; // (b,n_q,tk,d)
+            let v_rep = crate::utils::repeat_kv(v_all.clone(), n_rep)?; // (b,n_q,tk,d)
+            let k_btkhd = k_rep.transpose(1, 2)?; // (b,tk,n_q,d)
+            let v_btkhd = v_rep.transpose(1, 2)?; // (b,tk,n_q,d)
+
+            // Choose attention mode based on layer_types
+            let attn_mode = super::select_attn_mode_for_layer(
+                &super::GptOssConfigMinimal {
+                    num_hidden_layers: self.cfg.num_hidden_layers,
+                    layer_types: self.cfg.effective_layer_types(),
+                    max_position_embeddings: self.cfg.max_position_embeddings,
+                    sliding_window: self.cfg.sliding_window,
+                },
+                i,
+            );
+
+            let sinks = Some(&layer.attn.sinks);
+            let y = {
+                #[cfg(feature = "flash-attn")]
+                {
+                    match attn_mode {
+                        AttnMode::Full => super::flash_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                        AttnMode::Sliding { left, right } => super::flash_attn_windowed_with_sinks(
+                            &q,
+                            &k_btkhd,
+                            &v_btkhd,
+                            softmax_scale,
+                            Some(left),
+                            Some(right),
+                            sinks,
+                        )?,
+                    }
+                }
+                #[cfg(not(feature = "flash-attn"))]
+                {
+                    match attn_mode {
+                        AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                        AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                    }
+                }
+            }; // (b,t,n_q,d)
+
+            // Merge heads and project out
+            let y = y.reshape((b, t, n_q * head_dim))?;
+            let y = y.apply(&layer.attn.o_proj)?; // (b,t,h)
+            xs = (xs + y)?;
+
+            // Post-attention norm + MoE MLP
+            let x_norm2 = layer.post_attention_layernorm.forward(&xs)?; // (b,t,h)
+            let mlp_out = layer.experts.forward(&x_norm2)?; // (b,t,h)
+            xs = (xs + mlp_out)?;
+        }
+
+        // Final norm and lm head
+        let xs = self.norm.forward(&xs)?; // (b,t,h)
+        let xs2 = xs.reshape(((), hidden))?;
+        let logits = xs2.apply(&self.lm_head)?.reshape((b, t, self.cfg.vocab_size))?;
         Ok(logits)
     }
 }

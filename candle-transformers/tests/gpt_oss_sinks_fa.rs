@@ -1,8 +1,7 @@
 use candle::{Device, DType, Result, Tensor};
-use candle_transformers::models::gpt_oss::{
-    eager_attn_with_sinks, eager_attn_windowed_with_sinks, flash_attn_with_sinks,
-    flash_attn_windowed_with_sinks,
-};
+use candle_transformers::models::gpt_oss::{eager_attn_with_sinks, eager_attn_windowed_with_sinks};
+#[cfg(feature = "flash-attn")]
+use candle_transformers::models::gpt_oss::{flash_attn_with_sinks, flash_attn_windowed_with_sinks};
 
 // T12: FA (+LSE sinks) vs eager sinks parity on tiny shapes
 #[cfg(feature = "flash-attn")]
