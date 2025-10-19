@@ -264,4 +264,192 @@ mod tests {
             }
         }
     }
+
+    // Encode helper used only in tests: round-to-nearest with ties-to-even
+    // (even means mantissa bit == 0). Saturates beyond 6.0, underflows below 0.25 to +0.0.
+    fn encode_fp4_e2m1_ties_even(x: f32) -> u8 {
+        let sign = if x.is_sign_negative() { 1u8 } else { 0u8 };
+        let ax = x.abs();
+        // Representable magnitudes and their codes (s=0 variants).
+        // Codes: (e_bits << 1) | m_bit, with bias=1, e in {0,1,2,3}, m in {0,1}
+        const POS: &[(f32, u8)] = &[
+            (0.0, 0b000), // e=0,m=0 (subnormal zero)
+            (0.5, 0b001), // e=0,m=1 (subnormal half)
+            (1.0, 0b010), // e=1,m=0
+            (1.5, 0b011), // e=1,m=1
+            (2.0, 0b100), // e=2,m=0
+            (3.0, 0b101), // e=2,m=1
+            (4.0, 0b110), // e=3,m=0
+            (6.0, 0b111), // e=3,m=1
+        ];
+        // Fast-path saturation and underflow
+        if ax < 0.25 { return sign << 3 /* +0.0 or -0.0, both decode to 0.0 */; }
+        if ax >= 6.0 { return (sign << 3) | POS[7].1; }
+        // Search nearest; on exact ties prefer the candidate with mantissa bit 0 (even)
+        let mut best = 0usize;
+        let mut best_d = f32::INFINITY;
+        let mut best_m_bit = 1u8;
+        for (i, &(val, code)) in POS.iter().enumerate() {
+            let d = (ax - val).abs();
+            let m_bit = code & 0x1;
+            if d < best_d {
+                best = i;
+                best_d = d;
+                best_m_bit = m_bit;
+            } else if (d - best_d).abs() <= 0.0 { // exact tie
+                // prefer even mantissa (m_bit == 0)
+                if m_bit == 0 && best_m_bit == 1 { best = i; best_m_bit = 0; }
+            }
+        }
+        // If the chosen representable is +0.0, force sign to + (ties-to-even near zero)
+        let code_mag = POS[best].1;
+        let sign_bit = if code_mag == 0 { 0u8 } else { sign };
+        (sign_bit << 3) | code_mag
+    }
+
+    #[test]
+    fn fp4_encode_ties_to_even_key_midpoints() {
+        // Midpoints between representables should round to the even (mantissa bit 0) code.
+        // 0.25 is midpoint between 0.0 (m=0) and 0.5 (m=1) => +0.0
+        assert_eq!(encode_fp4_e2m1_ties_even(0.25) & 0x7, 0b000);
+        // 0.75 midpoint between 0.5 (m=1) and 1.0 (m=0) => 1.0
+        assert_eq!(encode_fp4_e2m1_ties_even(0.75) & 0x7, 0b010);
+        // 1.25 midpoint between 1.0 (m=0) and 1.5 (m=1) => 1.0
+        assert_eq!(encode_fp4_e2m1_ties_even(1.25) & 0x7, 0b010);
+        // 1.75 midpoint between 1.5 (m=1) and 2.0 (m=0) => 2.0
+        assert_eq!(encode_fp4_e2m1_ties_even(1.75) & 0x7, 0b100);
+        // 2.5 midpoint between 2.0 (m=0) and 3.0 (m=1) => 2.0
+        assert_eq!(encode_fp4_e2m1_ties_even(2.5) & 0x7, 0b100);
+        // 3.5 midpoint between 3.0 (m=1) and 4.0 (m=0) => 4.0
+        assert_eq!(encode_fp4_e2m1_ties_even(3.5) & 0x7, 0b110);
+        // 5.0 midpoint between 4.0 (m=0) and 6.0 (m=1) => 4.0
+        assert_eq!(encode_fp4_e2m1_ties_even(5.0) & 0x7, 0b110);
+
+        // Side checks just below/above midpoints
+        assert_eq!(encode_fp4_e2m1_ties_even(0.75 - 1e-6) & 0x7, 0b001);
+        assert_eq!(encode_fp4_e2m1_ties_even(0.75 + 1e-6) & 0x7, 0b010);
+    }
+
+    #[test]
+    fn fp4_encode_overflow_and_underflow() {
+        // Underflow: magnitude < 0.25 -> 0.0 (sign ignored for zero code selection)
+        assert_eq!(encode_fp4_e2m1_ties_even(0.0) & 0x7, 0b000);
+        assert_eq!(encode_fp4_e2m1_ties_even(0.24999999) & 0x7, 0b000);
+        // Exactly 0.25 -> ties-to-even => +0.0 (mantissa 0)
+        assert_eq!(encode_fp4_e2m1_ties_even(0.25) & 0x7, 0b000);
+        // Overflow: magnitude > 6.0 -> clamp to 6.0
+        assert_eq!(encode_fp4_e2m1_ties_even(6.000001) & 0x7, 0b111);
+        assert_eq!(encode_fp4_e2m1_ties_even(1234.0) & 0x7, 0b111);
+        // Signs preserved on non-zero magnitudes
+        assert_eq!(encode_fp4_e2m1_ties_even(-1.0) >> 3, 1);
+        assert_eq!(encode_fp4_e2m1_ties_even(1.0) >> 3, 0);
+    }
+
+    // Helper: block-scale selection rule per spec.
+    // X = (largest power-of-two <= max|v|) / 2^2 = 2^(floor(log2(max|v|)) - 2)
+    fn select_block_scale_pow2(vals: &[f32]) -> f32 {
+        let max_abs = vals.iter().map(|v| v.abs()).fold(0f32, |a, b| a.max(b));
+        if max_abs == 0.0 { return (2f32).powi(-127); } // arbitrary minimal scale
+        let e = max_abs.log2().floor() as i32 - 2;
+        (2f32).powi(e)
+    }
+
+    #[test]
+    fn block_scale_selection_rule() {
+        let v = [0.3f32, -1.75, 6.5, 0.0, 2.2, -0.9];
+        let x = select_block_scale_pow2(&v);
+        // max|v| = 6.5, floor_pow2=4, X=4/4=1
+        assert!((x - 1.0).abs() < 1e-6, "scale mismatch: {x}");
+        // Modify non-max element should not change X
+        let mut v2 = v.clone();
+        v2[0] = 0.31;
+        let x2 = select_block_scale_pow2(&v2);
+        assert!((x - x2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn idempotent_round_trip_fixed_scale() {
+        // Fix scale X, quantize -> dequantize -> requantize reproduces codes.
+        let vals = [
+            -7.1, -6.0, -5.0, -3.7, -2.5, -1.75, -1.25, -0.75, -0.25, 0.0,
+             0.25, 0.3, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.1
+        ];
+        let x = 2.0f32; // power-of-two scale
+        // Quantize codes
+        let mut codes = Vec::new();
+        for &v in &vals {
+            let q = v / x;
+            codes.push(encode_fp4_e2m1_ties_even(q));
+        }
+        // Dequantize and requantize
+        let mut rec = Vec::new();
+        for &c in &codes {
+            let v = decode_fp4_e2m1(c) * x;
+            let c2 = encode_fp4_e2m1_ties_even(v / x);
+            rec.push(c2);
+        }
+        assert_eq!(codes, rec, "codes not preserved under fixed-scale round-trip");
+    }
+
+    #[test]
+    fn scale_nan_propagation_all_elements_nan() -> Result<()> {
+        // One row, one block, any bytes; scale 0xFF => NaN for all outputs
+        let rows = 1usize;
+        let cols = MXFP4_BLOCK_ELEMS;
+        let nblocks = 1usize;
+        let blocks = Tensor::from_vec(vec![0x22u8; MXFP4_BLOCK_BYTES], (rows, nblocks, MXFP4_BLOCK_BYTES), &Device::Cpu)?;
+        let scales = Tensor::from_vec(vec![0xFFu8], (rows, nblocks), &Device::Cpu)?;
+        let out = dequant_mxfp4_to_bf16_cpu(&blocks, &scales, [rows, cols])?;
+        let v = out.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        for i in 0..cols { assert!(v[0][i].is_nan(), "elem {i} expected NaN"); }
+        Ok(())
+    }
+
+    #[test]
+    fn dot_product_semantics_match() {
+        // Build two 32-element vectors in one block
+        let mut a = [0f32; MXFP4_BLOCK_ELEMS];
+        let mut b = [0f32; MXFP4_BLOCK_ELEMS];
+        for i in 0..MXFP4_BLOCK_ELEMS {
+            a[i] = ((i as f32) * 0.31).sin() * 3.2;
+            b[i] = ((i as f32) * 0.17).cos() * 2.7;
+        }
+        // Select scales by rule and quantize codes
+        let xa = select_block_scale_pow2(&a);
+        let xb = select_block_scale_pow2(&b);
+        let mut pa = [0u8; MXFP4_BLOCK_ELEMS];
+        let mut pb = [0u8; MXFP4_BLOCK_ELEMS];
+        for i in 0..MXFP4_BLOCK_ELEMS {
+            pa[i] = encode_fp4_e2m1_ties_even(a[i] / xa);
+            pb[i] = encode_fp4_e2m1_ties_even(b[i] / xb);
+        }
+        // Dot semantics: (Xa*Xb) * sum_i(Pa*Pb)
+        let mut sum_pp = 0f32;
+        for i in 0..MXFP4_BLOCK_ELEMS {
+            sum_pp += decode_fp4_e2m1(pa[i]) * decode_fp4_e2m1(pb[i]);
+        }
+        let dot_q = xa * xb * sum_pp;
+        // Reference: dequantize then f32 dot
+        let mut a_dq = [0f32; MXFP4_BLOCK_ELEMS];
+        let mut b_dq = [0f32; MXFP4_BLOCK_ELEMS];
+        for i in 0..MXFP4_BLOCK_ELEMS {
+            a_dq[i] = decode_fp4_e2m1(pa[i]) * xa;
+            b_dq[i] = decode_fp4_e2m1(pb[i]) * xb;
+        }
+        let dot_ref: f32 = a_dq.iter().zip(b_dq.iter()).map(|(x, y)| x * y).sum();
+        assert!((dot_q - dot_ref).abs() < 1e-6, "dot semantics mismatch: {} vs {}", dot_q, dot_ref);
+    }
+
+    #[test]
+    fn last_dim_not_multiple_of_k_is_error() {
+        // Validate we fail fast when cols is not divisible by k=32.
+        let rows = 1usize;
+        let cols = 48usize; // not divisible by 32
+        let nblocks = 1usize; // mismatch on purpose
+        let blocks = Tensor::from_vec(vec![0u8; MXFP4_BLOCK_BYTES], (rows, nblocks, MXFP4_BLOCK_BYTES), &Device::Cpu).unwrap();
+        let scales = Tensor::from_vec(vec![0u8; nblocks], (rows, nblocks), &Device::Cpu).unwrap();
+        let err = dequant_mxfp4_to_bf16_cpu(&blocks, &scales, [rows, cols]).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("must be multiple of 32"), "unexpected error: {}", msg);
+    }
 }
