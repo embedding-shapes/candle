@@ -2,6 +2,7 @@
 //!
 
 use candle::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
+use std::ops::{Div, Mul};
 use rayon::prelude::*;
 
 /// Applies the softmax function to the input tensor, rescaling the element so that elements on
@@ -981,6 +982,81 @@ impl Module for Identity {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         Ok(xs.clone())
     }
+}
+
+/// Eager scaled-dot product attention with an additional per-head sink logit.
+///
+/// This implements the non-flash attention path used by GPT-OSS when a "sink" logit
+/// is present per (batch*head, query) position. The algorithm:
+/// - Compute attention scores `scores = (q * scale) @ k^T`.
+/// - Optionally apply softcapping: scores = tanh(scores/softcap) * softcap.
+/// - Append the sink logit as an extra column to scores along the key dimension.
+/// - Softmax over the last dimension in fp32.
+/// - Drop the sink column from the probabilities.
+/// - Multiply by V to obtain the attention output.
+///
+/// Shapes:
+/// - q: (bh, tq, dk)
+/// - k: (bh, tk, dk)
+/// - v: (bh, tk, dv)
+/// - sink_logits: (bh, tq)
+/// Returns: (bh, tq, dv)
+pub fn attention_with_sink(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+    sink_logits: &Tensor,
+) -> Result<Tensor> {
+    let (bh_q, tq, dq) = q.dims3()?;
+    let (bh_k, tk, dk) = k.dims3()?;
+    let (bh_v, tk_v, _dv) = v.dims3()?;
+    let (bh_sink, tq_sink) = sink_logits.dims2()?;
+
+    if bh_q != bh_k || bh_q != bh_v || bh_q != bh_sink {
+        candle::bail!(
+            "batch*head mismatch q:{:?} k:{:?} v:{:?} sink:{:?}",
+            q.shape(),
+            k.shape(),
+            v.shape(),
+            sink_logits.shape()
+        )
+    }
+    if dq != dk {
+        candle::bail!("q/k head dim mismatch: dq={dq} dk={dk}");
+    }
+    if tk != tk_v {
+        candle::bail!("k/v seq mismatch: tk={tk} tk_v={tk_v}");
+    }
+    if tq != tq_sink {
+        candle::bail!("q/sink seq mismatch: tq={tq} sink_tq={tq_sink}");
+    }
+
+    // scores: (bh, tq, tk)
+    let mut scores = (q.clone() * scale as f64)?.matmul(&k.clone().t()?)?;
+
+    // Softcapping follows the same formulation used in tests for sdpa: tanh(scores/softcap)*softcap
+    if (softcapping - 1.0).abs() > f32::EPSILON {
+        scores = scores
+            .to_dtype(DType::F32)?
+            .div(softcapping as f64)?
+            .tanh()?
+            .mul(softcapping as f64)?
+            .to_dtype(q.dtype())?;
+    }
+
+    // Append sink logits as an extra key column: (bh, tq, tk+1)
+    let sink_col = sink_logits.unsqueeze(2)?; // (bh, tq, 1)
+    let scores_with_sink = Tensor::cat(&[&scores, &sink_col], 2)?;
+
+    // Softmax over tokens + sink in fp32, then drop sink column
+    let probs_with_sink = softmax_last_dim(&scores_with_sink.to_dtype(DType::F32)?)?
+        .to_dtype(q.dtype())?;
+    let probs = probs_with_sink.narrow(2, 0, tk)?; // remove sink column
+
+    // Output: (bh, tq, dv)
+    probs.matmul(v)
 }
 
 #[allow(dead_code)]
