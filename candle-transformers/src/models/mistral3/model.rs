@@ -1,5 +1,6 @@
 use candle::{IndexOp, Module, Result, Tensor, DType};
 use candle_nn::VarBuilder;
+use std::time::Instant;
 
 use super::config::{Mistral3Config, VisionFeatureLayer};
 use super::projector::Mistral3MultiModalProjector;
@@ -27,15 +28,32 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Mistral3Config, vb: VarBuilder) -> Result<Self> {
+        let t_total = Instant::now();
+        let t_lm = Instant::now();
         let language_model = mistral::Model::new(&cfg.text_config.inner, vb.pp("language_model"))?;
+        let dt_lm = t_lm.elapsed();
 
-        // Vision + projector use F32 to match Pixtral implementation
+        // Use the same dtype as the top-level VarBuilder (bf16 when available)
+        let vbdt = vb.dtype();
+        let t_vis = Instant::now();
         let vision_tower = vision_model::Model::new(
             &cfg.vision_config.inner,
-            vb.pp("vision_tower").to_dtype(candle::DType::F32),
+            vb.pp("vision_tower").to_dtype(vbdt),
         )?;
+        let dt_vis = t_vis.elapsed();
+
+        let t_proj = Instant::now();
         let multi_modal_projector =
-            Mistral3MultiModalProjector::new(cfg, vb.pp("multi_modal_projector").to_dtype(candle::DType::F32))?;
+            Mistral3MultiModalProjector::new(cfg, vb.pp("multi_modal_projector").to_dtype(vbdt))?;
+        let dt_proj = t_proj.elapsed();
+
+        eprintln!(
+            "TIMING magistral:model_new language_ms={} vision_ms={} projector_ms={} total_ms={}",
+            dt_lm.as_millis(),
+            dt_vis.as_millis(),
+            dt_proj.as_millis(),
+            t_total.elapsed().as_millis()
+        );
 
         Ok(Self {
             vision_tower,
@@ -63,12 +81,15 @@ impl Model {
         image_sizes: &[(u32, u32)],
         feature_layer: &VisionFeatureLayer,
     ) -> Result<Tensor> {
+        let t_total = Instant::now();
         if !matches!(feature_layer, VisionFeatureLayer::Single(_)) {
             candle::bail!("Pixtral vision tower only supports a single feature layer (-1)");
         }
 
         // (B, C, H, W) -> (B, P, hidden_v)
+        let t_v = Instant::now();
         let feats = self.vision_tower.forward(pixel_values)?;
+        let dt_v = t_v.elapsed();
         let (b, p, h_v) = feats.dims3()?;
         if image_sizes.len() != b {
             candle::bail!(
@@ -86,9 +107,21 @@ impl Model {
             .iter()
             .map(|(h, w)| (*h as usize, *w as usize))
             .collect();
+        let t_p = Instant::now();
         let projected = self
             .multi_modal_projector
             .forward(&flat, &image_sizes_usize)?; // (sum merged tokens, hidden_t)
+        let dt_p = t_p.elapsed();
+
+        eprintln!(
+            "TIMING magistral:get_image_features vision_ms={} projector_ms={} total_ms={} (B={}, P={}, h_v={})",
+            dt_v.as_millis(),
+            dt_p.as_millis(),
+            t_total.elapsed().as_millis(),
+            b,
+            p,
+            h_v
+        );
 
         Ok(projected)
     }
@@ -122,6 +155,7 @@ impl Model {
         image_embeds: &Tensor,
         positions: &[(usize, usize)],
     ) -> Result<Tensor> {
+        let t_rep = Instant::now();
         if positions.is_empty() {
             return Ok(inputs_embeds.clone());
         }
@@ -180,7 +214,12 @@ impl Model {
             let inv = (1.0 - &mask)?;
             result = (result.broadcast_mul(&inv)? + emb_brd.broadcast_mul(&mask)?)?;
         }
-
+        let dt = t_rep.elapsed();
+        eprintln!(
+            "TIMING magistral:replace_image_tokens positions={} ms={}",
+            positions.len(),
+            dt.as_millis()
+        );
         Ok(result)
     }
 
@@ -195,8 +234,11 @@ impl Model {
         index_pos: usize,
         feature_layer: &VisionFeatureLayer,
     ) -> Result<Tensor> {
+        let t_total = Instant::now();
         // Text embeddings from language model's embedding table
+        let t_emb = Instant::now();
         let mut inputs_embeds = self.language_model.embed_tokens().forward(input_ids)?;
+        let dt_emb = t_emb.elapsed();
 
         // Insert image embeddings on the first step when provided
         if let (Some(pixels), Some(sizes)) = (pixel_values, image_sizes) {
@@ -215,6 +257,11 @@ impl Model {
 
                 inputs_embeds = Self::replace_image_tokens(&inputs_embeds, &image_embeds, &positions)?;
                 cache.image_processed = true;
+                eprintln!(
+                    "TIMING magistral:image_embed_insert total_ms={} positions={}",
+                    t_total.elapsed().as_millis(),
+                    positions.len()
+                );
             }
         }
 
@@ -243,8 +290,21 @@ impl Model {
             let mask = mask.to_dtype(self.dtype)?;
             Some(mask)
         };
-        self.language_model
-            .forward_embeds(&inputs_embeds, attn_mask.as_ref(), index_pos)
+        let t_lm = Instant::now();
+        let out = self
+            .language_model
+            .forward_embeds(&inputs_embeds, attn_mask.as_ref(), index_pos)?;
+        let dt_lm = t_lm.elapsed();
+        if index_pos == 0 {
+            eprintln!(
+                "TIMING magistral:forward step0 embed_ms={} lm_ms={} total_ms={} seq_len={}",
+                dt_emb.as_millis(),
+                dt_lm.as_millis(),
+                t_total.elapsed().as_millis(),
+                seq_len
+            );
+        }
+        Ok(out)
     }
 }
 

@@ -365,4 +365,30 @@ mod tests {
         assert!(ys_v.iter().all(|v| *v >= 0.0));
         Ok(())
     }
+
+    #[test]
+    fn projector_constructs_with_bf16_weights() -> Result<()> {
+        // Ensure we can initialize the projector with bf16 weights on CPU. We avoid running
+        // matmul-heavy forward here since CPU bf16 matmul is not supported in candle.
+        let dev = Device::Cpu;
+        let hidden = 4usize;
+        let cfg = mk_cfg(hidden, hidden, 1, 1);
+
+        let mut tensors = std::collections::HashMap::new();
+        let norm_w = Tensor::ones(hidden, DType::BF16, &dev)?;
+        tensors.insert("multi_modal_projector.norm.weight".to_string(), norm_w);
+        let merge_w = Tensor::zeros((hidden, hidden), DType::BF16, &dev)?;
+        tensors.insert(
+            "multi_modal_projector.patch_merger.merging_layer.weight".to_string(),
+            merge_w,
+        );
+        let l1_w = Tensor::zeros((hidden, hidden), DType::BF16, &dev)?;
+        tensors.insert("multi_modal_projector.linear_1.weight".to_string(), l1_w);
+        let l2_w = Tensor::zeros((hidden, hidden), DType::BF16, &dev)?;
+        tensors.insert("multi_modal_projector.linear_2.weight".to_string(), l2_w);
+
+        let vb = VarBuilder::from_tensors(tensors, DType::BF16, &dev);
+        let _ = Mistral3MultiModalProjector::new(&cfg, vb.pp("multi_modal_projector"))?;
+        Ok(())
+    }
 }

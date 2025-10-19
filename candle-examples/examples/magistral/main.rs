@@ -23,6 +23,7 @@ use candle_transformers::models::mistral3::{
 use serde_json::json;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tekken::Tekkenizer;
+use std::time::Instant;
 
 // Constants/configurable values placed below imports
 const DEFAULT_MODEL_ID: &str = "mistralai/magistral-small-2509";
@@ -82,8 +83,11 @@ struct SpecialIds {
     inst: u32,
     end_inst: u32,
     img: u32,
+    img_end: u32,
     sys_start: u32,
     sys_end: u32,
+    think: u32,
+    end_think: u32,
 }
 
 fn load_special_ids(tekken_json: &PathBuf) -> Result<SpecialIds> {
@@ -112,8 +116,11 @@ fn load_special_ids(tekken_json: &PathBuf) -> Result<SpecialIds> {
         inst: fetch("[INST]")?,
         end_inst: fetch("[/INST]")?,
         img: fetch("[IMG]")?,
+        img_end: fetch("[IMG_END]")?,
         sys_start: fetch("[SYSTEM_PROMPT]")?,
         sys_end: fetch("[/SYSTEM_PROMPT]")?,
+        think: fetch("[THINK]")?,
+        end_think: fetch("[/THINK]")?,
     })
 }
 
@@ -125,16 +132,48 @@ fn build_input_ids(
     img_placeholders: usize,
 ) -> Result<Vec<u32>> {
     // Minimal instruct-style template using tekken special tokens.
-    // <s>[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT][INST]{[IMG]?}{user}[/INST]
+    // <s>[SYSTEM_PROMPT]{pre}[THINK]{think}[/THINK]{post}[/SYSTEM_PROMPT][INST]{[IMG]*}[IMG_END]{user}[/INST]
     let mut ids: Vec<u32> = Vec::new();
     ids.push(sp.bos);
 
     // System prompt section
     ids.push(sp.sys_start);
-    let mut sys_ids = tok
-        .encode(system_prompt, false, false)
-        .map_err(|e| E::msg(format!("tekken encode system: {e}")))?;
-    ids.append(&mut sys_ids);
+    // Split the SYSTEM_PROMPT.txt into pre/think/post like the HF template
+    let (pre, think, post) = {
+        let start = system_prompt.find("[THINK]");
+        let end = system_prompt.find("[/THINK]");
+        match (start, end) {
+            (Some(i0), Some(i1)) if i1 >= i0 => {
+                let pre = &system_prompt[..i0];
+                let think = &system_prompt[i0 + "[THINK]".len()..i1];
+                let post = &system_prompt[i1 + "[/THINK]".len()..];
+                (pre, Some(think), post)
+            }
+            _ => (system_prompt, None, ""),
+        }
+    };
+    if !pre.is_empty() {
+        let mut pre_ids = tok
+            .encode(pre, false, false)
+            .map_err(|e| E::msg(format!("tekken encode sys-pre: {e}")))?;
+        ids.append(&mut pre_ids);
+    }
+    if let Some(t) = think {
+        ids.push(sp.think);
+        if !t.is_empty() {
+            let mut t_ids = tok
+                .encode(t, false, false)
+                .map_err(|e| E::msg(format!("tekken encode sys-think: {e}")))?;
+            ids.append(&mut t_ids);
+        }
+        ids.push(sp.end_think);
+    }
+    if !post.is_empty() {
+        let mut post_ids = tok
+            .encode(post, false, false)
+            .map_err(|e| E::msg(format!("tekken encode sys-post: {e}")))?;
+        ids.append(&mut post_ids);
+    }
     ids.push(sp.sys_end);
 
     // User instruction with optional [IMG] placeholders
@@ -142,6 +181,8 @@ fn build_input_ids(
     for _ in 0..img_placeholders {
         ids.push(sp.img);
     }
+    // HF template closes the image block before the user text
+    ids.push(sp.img_end);
     let mut user_ids = tok
         .encode(user_prompt, false, false)
         .map_err(|e| E::msg(format!("tekken encode user: {e}")))?;
@@ -177,21 +218,31 @@ fn main() -> Result<()> {
     println!("retrieved metadata and shards in {:?}", start.elapsed());
 
     // Load tokenizer and special ids
+    let t_tok = Instant::now();
     let tokenizer = Tekkenizer::from_file(&tekken_file).map_err(E::msg)?;
     let sp = load_special_ids(&tekken_file)?;
+    println!("timing: tokenizer+special_ids: {:?}", t_tok.elapsed());
 
     // Load system prompt
+    let t_sys = Instant::now();
     let system_prompt = fs::read_to_string(&system_prompt_file).context("read SYSTEM_PROMPT.txt")?;
+    println!("timing: read SYSTEM_PROMPT.txt: {:?}", t_sys.elapsed());
 
     // Device and dtype
     let device = candle_examples::device(args.cpu)?;
     let dtype = if device.supports_bf16() { DType::BF16 } else { DType::F32 };
 
     // Config and model
+    let t_cfg = Instant::now();
     let config: Mistral3Config =
         serde_json::from_slice(&fs::read(&config_file)?).context("parse config.json")?;
+    println!("timing: parse config: {:?}", t_cfg.elapsed());
+    let t_vb = Instant::now();
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
+    println!("timing: mmap weights: {:?}", t_vb.elapsed());
+    let t_model = Instant::now();
     let mut model = Mistral3::new(&config, vb)?;
+    println!("timing: build model: {:?}", t_model.elapsed());
 
     // Image preprocessing (Pixtral-style):
     // - Resize preserving aspect ratio so the longest edge is 1540
@@ -205,10 +256,20 @@ fn main() -> Result<()> {
     let s = config.spatial_merge_size.max(1);
     // Resize rounding to multiples of the downsample ratio (patch * s),
     // matching HF/HuggingFace processors that operate on the merged-patch grid.
+    let t_resize = Instant::now();
     let (new_h, new_w) = compute_pixtral_resize_dims(&args.image, IMAGE_RES, patch * s)?;
-    let image = load_image_pixtral(&args.image, new_h, new_w, &PIXTRAL_MEAN, &PIXTRAL_STD)?
+    println!("timing: compute_resize_dims: {:?}", t_resize.elapsed());
+    let t_img = Instant::now();
+    let img_loaded = load_image_pixtral(&args.image, new_h, new_w, &PIXTRAL_MEAN, &PIXTRAL_STD)?;
+    println!("timing: load_image+bicubic+normalize (cpu f32): {:?}", t_img.elapsed());
+    let t_cast = Instant::now();
+    let img_cast = img_loaded.to_dtype(dtype)?;
+    println!("timing: cast_to_model_dtype: {:?}", t_cast.elapsed());
+    let t_h2d = Instant::now();
+    let image = img_cast
         .to_device(&device)?
         .unsqueeze(0)?; // (1, C, H, W)
+    println!("timing: host_to_device+unsqueeze: {:?}", t_h2d.elapsed());
     let (_b, _c, h, w) = image.dims4()?;
     let image_sizes: Vec<(u32, u32)> = vec![(h as u32, w as u32)];
     let grid_h = h / patch;
@@ -241,7 +302,7 @@ fn main() -> Result<()> {
     let eff_grid_h = grid_h / s_u;
     let eff_grid_w = grid_w / s_u;
 
-    // Pixel stats on normalized image (float32)
+    // Pixel stats on normalized image (float32 copy for stats)
     let img_cpu = image.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?; // (1,3,H,W)
     let (_b1, _c1, hh, ww) = img_cpu.dims4()?;
     let mut per_channel = Vec::new();
@@ -273,6 +334,7 @@ fn main() -> Result<()> {
         }));
     }
     // Global stats
+    let t_stats = Instant::now();
     let g: Vec<f32> = img_cpu.flatten_all()?.to_vec1()?;
     let mut gmin = f32::INFINITY;
     let mut gmax = f32::NEG_INFINITY;
@@ -293,6 +355,16 @@ fn main() -> Result<()> {
         .i((0, 0, 0, 0..8))?
         .to_vec1::<f32>()
         .unwrap_or_else(|_| vec![]);
+    println!("timing: pixel_stats_cpu: {:?}", t_stats.elapsed());
+
+    // Derive dtype strings for debug
+    let vision_dtype_str = match image.dtype() {
+        DType::BF16 => "bf16",
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        _ => "unknown",
+    };
+    let text_dtype_str = if dtype == DType::BF16 { "bf16" } else { "f32" };
 
     let debug = json!({
         "image": {
@@ -317,7 +389,7 @@ fn main() -> Result<()> {
             "placeholders": num_image_tokens as i64,
         },
         "pixels": {
-            "dtype": "f32",
+            "dtype": vision_dtype_str,
             "shape": [1, 3, hh as i64, ww as i64],
             "per_channel": per_channel,
             "global": {"min": gmin, "max": gmax, "mean": gmean, "std": gstd, "sum": gsum, "sum_sq": gsum2},
@@ -333,8 +405,8 @@ fn main() -> Result<()> {
         "model": {
             "id": args.model_id,
             "device": if args.cpu { "cpu" } else { "cuda" },
-            "vision_dtype": "f32",
-            "text_dtype": if dtype == DType::BF16 { "bf16" } else { "f32" },
+            "vision_dtype": vision_dtype_str,
+            "text_dtype": text_dtype_str,
         }
     });
     println!("=== magistral_debug ===\n{}", serde_json::to_string_pretty(&debug)?);
@@ -359,6 +431,8 @@ fn main() -> Result<()> {
     let start_gen = std::time::Instant::now();
     println!("IMG placeholders: {} (merged grid {}x{})", num_image_tokens, grid_h / s, grid_w / s);
 
+    let mut t_decode_total = std::time::Duration::ZERO;
+    let mut t_prefill = std::time::Duration::ZERO;
     for step in 0..args.sample_len {
         let (inp, index_pos, pixel_opt, sizes_opt) = if step == 0 {
             (input_ids.clone(), 0usize, Some(&image), Some(image_sizes.as_slice()))
@@ -372,8 +446,10 @@ fn main() -> Result<()> {
                 None,
             )
         };
-
+        let t_fw = Instant::now();
         let logits = model.forward(&inp, pixel_opt, sizes_opt, &mut cache, index_pos, &config.vision_feature_layer)?;
+        let dt_fw = t_fw.elapsed();
+        if step == 0 { t_prefill = dt_fw; } else { t_decode_total += dt_fw; }
         // logits shape: [B, vocab] or [B, 1, vocab]
         let logits = if logits.dims().len() == 3 {
             logits.i((.., logits.dim(1)? - 1, ..))?
@@ -401,6 +477,37 @@ fn main() -> Result<()> {
         generated,
         generated as f64 / dt.as_secs_f64()
     );
+
+    // Emit a final timing JSON summary to help pinpoint bottlenecks.
+    #[allow(unused_mut)]
+    let mut gemm_bf16_fast = None;
+    #[cfg(feature = "cuda")]
+    {
+        gemm_bf16_fast = Some(candle::cuda::gemm_reduced_precision_bf16());
+    }
+    let timing_json = json!({
+        "timing": {
+            "tokenizer_ms": null, // printed above
+            "system_prompt_ms": null, // printed above
+            "parse_config_ms": null, // printed above
+            "mmap_weights_ms": null, // printed above
+            "build_model_ms": null, // printed above
+            "preproc": {
+                "compute_resize_ms": null,
+                "load_image_ms": null,
+                "cast_ms": null,
+                "h2d_ms": null,
+                "pixel_stats_ms": null
+            },
+            "prefill_ms": t_prefill.as_millis(),
+            "decode_total_ms": t_decode_total.as_millis(),
+            "decode_tokens": generated.saturating_sub(1)
+        },
+        "cuda": {
+            "gemm_bf16_fast": gemm_bf16_fast,
+        }
+    });
+    println!("=== magistral_timing ===\n{}", serde_json::to_string_pretty(&timing_json)?);
 
     Ok(())
 }

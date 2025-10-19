@@ -10,6 +10,7 @@ use crate::models::with_tracing::{linear_no_bias, Linear, RmsNorm};
 use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{Activation, VarBuilder};
 use std::sync::Arc;
+use std::time::Instant;
 
 fn default_num_attention_heads() -> usize {
     32
@@ -371,18 +372,47 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let t_total = Instant::now();
         let vb_m = vb.pp("model");
+        let t_emb = Instant::now();
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        let dt_emb = t_emb.elapsed();
+        let t_rot = Instant::now();
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
+        let dt_rot = t_rot.elapsed();
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
+        let mut dt_layers_ms: u128 = 0;
         for layer_idx in 0..cfg.num_hidden_layers {
+            let t_layer = Instant::now();
             let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
+            dt_layers_ms += t_layer.elapsed().as_millis();
+            if (layer_idx + 1) % 4 == 0 || layer_idx + 1 == cfg.num_hidden_layers {
+                eprintln!(
+                    "TIMING mistral:model_new layer_build_progress layer={} elapsed_ms={}",
+                    layer_idx + 1,
+                    dt_layers_ms
+                );
+            }
             layers.push(layer)
         }
+        let t_norm = Instant::now();
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+        let dt_norm = t_norm.elapsed();
+        let t_head = Instant::now();
         let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        let dt_head = t_head.elapsed();
+
+        eprintln!(
+            "TIMING mistral:model_new embed_tokens_ms={} rotary_ms={} layers_ms={} norm_ms={} lm_head_ms={} total_ms={}",
+            dt_emb.as_millis(),
+            dt_rot.as_millis(),
+            dt_layers_ms,
+            dt_norm.as_millis(),
+            dt_head.as_millis(),
+            t_total.elapsed().as_millis()
+        );
         Ok(Self {
             embed_tokens,
             layers,
