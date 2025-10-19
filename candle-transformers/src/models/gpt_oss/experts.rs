@@ -1,5 +1,5 @@
 use candle::{DType, Module, Result, Tensor, D};
-use candle_nn::{ops, Activation, Linear};
+use candle_nn::{ops, Linear};
 
 // Configurable constants
 const DEFAULT_TOP_K: usize = 4;
@@ -9,12 +9,14 @@ pub struct ExpertMlp {
     // Fused gate_up: outputs 2 * intermediate, split into gate and up
     pub gate_up: Linear,
     pub down: Linear,
-    pub act: Activation,
+    // GPT-OSS specific SwiGLU variant parameters
+    pub limit: f32,
+    pub alpha: f32,
 }
 
 impl ExpertMlp {
-    pub fn new(gate_up: Linear, down: Linear, act: Activation) -> Self {
-        Self { gate_up, down, act }
+    pub fn new(gate_up: Linear, down: Linear, limit: f32, alpha: f32) -> Self {
+        Self { gate_up, down, limit, alpha }
     }
 }
 
@@ -24,10 +26,25 @@ impl Module for ExpertMlp {
         let gu = xs.apply(&self.gate_up)?; // (n, 2*inter)
         let (_n, two_inter) = gu.dims2()?;
         let inter = two_inter / 2;
-        let gate = gu.narrow(D::Minus1, 0, inter)?; // (n, inter)
-        let up = gu.narrow(D::Minus1, inter, inter)?; // (n, inter)
-        let lhs = ops::silu(&gate)?; // (n, inter)
-        let fused = (lhs * up)?; // (n, inter)
+        let mut gate = gu.narrow(D::Minus1, 0, inter)?; // (n, inter)
+        let mut up = gu.narrow(D::Minus1, inter, inter)?; // (n, inter)
+
+        // Clamp per GPT-OSS spec: gate in (-inf, limit], up in [-limit, limit]
+        let limit_t = Tensor::new(self.limit, xs.device())?.to_dtype(xs.dtype())?;
+        let gate_lim = limit_t.broadcast_as(gate.shape().dims())?;
+        gate = gate.minimum(&gate_lim)?;
+        up = up.clamp(-self.limit, self.limit)?;
+
+        // GLU: gate * sigmoid(gate * alpha)
+        let alpha_t = Tensor::new(self.alpha, xs.device())?.to_dtype(xs.dtype())?;
+        let gate_alpha = gate.broadcast_mul(&alpha_t)?;
+        let sig = ops::sigmoid(&gate_alpha)?;
+        let glu = gate.broadcast_mul(&sig)?;
+
+        // Residual tweak: (up + 1) * glu
+        let one_t = Tensor::new(1.0f32, xs.device())?.to_dtype(xs.dtype())?;
+        let up_plus = up.broadcast_add(&one_t)?;
+        let fused = up_plus.broadcast_mul(&glu)?; // (n, inter)
         fused.apply(&self.down)
     }
 }
@@ -183,7 +200,7 @@ mod tests {
         for _ in 0..n_experts {
             let gate_up = make_linear(hidden, 2 * inter, &dev);
             let down = make_linear(inter, hidden, &dev);
-            experts.push(ExpertMlp::new(gate_up, down, Activation::Silu));
+            experts.push(ExpertMlp::new(gate_up, down, 7.0, 1.702));
         }
         // Router: hidden -> n_experts
         let router = make_linear(hidden, n_experts, &dev);

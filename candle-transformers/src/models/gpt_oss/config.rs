@@ -50,6 +50,10 @@ pub struct GptOssConfig {
     // Numerics / norms
     #[serde(default)]
     pub rms_norm_eps: Option<f64>,
+
+    // Feed-forward variant tuning
+    #[serde(default)]
+    pub swiglu_limit: Option<f32>,
 }
 
 impl GptOssConfig {

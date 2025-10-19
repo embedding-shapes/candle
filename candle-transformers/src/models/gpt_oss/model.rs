@@ -152,7 +152,10 @@ impl GptOssModel {
                             "down_proj",
                         )?,
                     };
-                    all.push(ExpertMlp::new(gate_up, down, candle_nn::Activation::Silu));
+                    // Use GPT-OSS clamped SwiGLU with residual tweak
+                    let limit = cfg.swiglu_limit.unwrap_or(7.0);
+                    let alpha = 1.702f32;
+                    all.push(ExpertMlp::new(gate_up, down, limit, alpha));
                 }
                 GptOssExperts::new(router.clone(), all, Some(cfg.num_experts_per_tok))
             };

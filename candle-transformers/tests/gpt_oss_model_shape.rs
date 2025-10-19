@@ -42,6 +42,7 @@ fn t19_minimal_forward_shape_dtype() -> Result<()> {
         layer_types: vec![candle_transformers::models::gpt_oss::GptOssLayerType::FullAttention],
         sliding_window: None,
         rms_norm_eps: Some(1e-5),
+        swiglu_limit: Some(7.0),
     };
 
     // Prepare weight tensors for the loader

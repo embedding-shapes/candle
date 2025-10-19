@@ -31,6 +31,7 @@ fn t20_missing_mxfp4_pair_reports_clear_error() -> Result<()> {
         layer_types: vec![candle_transformers::models::gpt_oss::GptOssLayerType::FullAttention],
         sliding_window: None,
         rms_norm_eps: Some(1e-5),
+        swiglu_limit: Some(7.0),
     };
 
     let mut tmap: HashMap<String, Tensor> = HashMap::new();
@@ -74,4 +75,3 @@ fn t20_missing_mxfp4_pair_reports_clear_error() -> Result<()> {
         "unexpected error message: {msg}");
     Ok(())
 }
-
