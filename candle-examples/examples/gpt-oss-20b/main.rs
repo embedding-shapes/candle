@@ -56,26 +56,32 @@ fn main() -> Result<()> {
         dtype = DType::BF16;
     }
 
+    // Debug: device + snapshot
+    if device.is_cuda() {
+        println!("Device set to use cuda:0");
+    } else {
+        println!("Device set to use {:?}", device);
+    }
+    println!("Snapshot: {}", snapshot_dir.display());
+
     // Conversation: one user message. Render via the model's chat_template.jinja and
     // encode with tokenizer.json from the same snapshot. This guarantees exact parity.
     let user_msg = Message::from_role_and_content(Role::User, args.prompt.clone());
+    println!(
+        "messages: [{}]",
+        format!("{{'role': 'user', 'content': '{}'}}", args.prompt.replace('\n', "\\n").replace('\'', "\\'"))
+    );
     let mut tokens: Vec<u32> = render_then_encode(&snapshot_dir, &[user_msg], true)
         .context("failed to render+encode with chat_template.jinja + tokenizer.json")?;
-
-    if std::env::var("CANDLE_DEBUG_TOKS").ok().as_deref() == Some("1") {
-        eprintln!("first 32 token ids: {:?}", &tokens.iter().take(32).collect::<Vec<_>>());
-        let ids_u32: Vec<u32> = tokens.iter().take(32).copied().collect();
-        let tok_path = snapshot_dir.join("tokenizer.json");
-        match tokenizers::Tokenizer::from_file(&tok_path) {
-            Ok(hf_tok) => {
-                // Keep special tokens to inspect structural tags when debugging.
-                match hf_tok.decode(&ids_u32, /*skip_special_tokens=*/ false) {
-                    Ok(s) => eprintln!("first 32 decode: {}", s),
-                    Err(_) => eprintln!("first 32 decode: <decode-error>"),
-                }
-            }
-            Err(_) => eprintln!("first 32 decode: <tokenizer-load-error>"),
-        }
+    println!("first 32 token ids: {:?}", &tokens.iter().take(32).copied().collect::<Vec<_>>());
+    let ids_u32: Vec<u32> = tokens.iter().take(32).copied().collect();
+    let tok_path = snapshot_dir.join("tokenizer.json");
+    match tokenizers::Tokenizer::from_file(&tok_path) {
+        Ok(hf_tok) => match hf_tok.decode(&ids_u32, /*skip_special_tokens=*/ false) {
+            Ok(s) => println!("first 32 decode: {}", s),
+            Err(_) => println!("first 32 decode: <decode-error>"),
+        },
+        Err(_) => println!("first 32 decode: <tokenizer-load-error>"),
     }
 
     // Load GPT-OSS config from the local snapshot.
@@ -83,12 +89,48 @@ fn main() -> Result<()> {
     let cfg_bytes = std::fs::read(&cfg_path)
         .with_context(|| format!("failed to read config: {}", cfg_path.display()))?;
     let cfg: GptOssConfig = serde_json::from_slice(&cfg_bytes).context("invalid config.json")?;
+    // Debug: print a compact config summary similar to Python
+    {
+        let rope_str = if let Some(r) = cfg.rope_scaling.as_ref() {
+            let ty = r.r#type.as_deref().unwrap_or("?");
+            let f = r.factor.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+            let bf = r.beta_fast.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+            let bs = r.beta_slow.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+            let orig = r
+                .original_max_position_embeddings
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            format!("{{'type': '{}', 'factor': {}, 'beta_fast': {}, 'beta_slow': {}, 'original_max_position_embeddings': {}}}", ty, f, bf, bs, orig)
+        } else {
+            "null".to_string()
+        };
+        println!(
+            "Config: hidden_size={} layers={} heads={} kv_heads={} head_dim={} max_pos={} rope={} sliding_window={:?}",
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim(),
+            cfg.max_position_embeddings,
+            rope_str,
+            cfg.sliding_window,
+        );
+    }
 
     // Resolve safetensors shard files from the local index.
     let model_files = candle_examples::hub_load_local_safetensors(&snapshot_dir, MODEL_INDEX_FILE)
         .with_context(|| format!("failed to read index {MODEL_INDEX_FILE} under {}", snapshot_dir.display()))?;
     if model_files.is_empty() {
         bail!("no safetensors files found under {}", snapshot_dir.display());
+    }
+    // Debug: shard summary (count and first few filenames)
+    {
+        let first: Vec<_> = model_files
+            .iter()
+            .take(3)
+            .map(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())
+            .collect();
+        println!("Shards: count={} first={:?}", model_files.len(), first);
     }
 
     // Map weights and instantiate the model.
@@ -115,6 +157,17 @@ fn main() -> Result<()> {
     // This includes <|return|> (200002), <|call|> (200012) and <|endoftext|> (199999 pad).
     // We do not stop on <|end|> (200007).
     let stop_ids = load_stop_token_ids(&snapshot_dir)?;
+    println!("stop token ids: {:?}", stop_ids);
+    if let Ok(hf_tok2) = tokenizers::Tokenizer::from_file(&tok_path) {
+        let bos = hf_tok2.token_to_id("<|startoftext|>").unwrap_or(u32::MAX);
+        let eos = hf_tok2.token_to_id("<|endoftext|>").unwrap_or(u32::MAX);
+        let ret = hf_tok2.token_to_id("<|return|>").unwrap_or(u32::MAX);
+        let call = hf_tok2.token_to_id("<|call|>").unwrap_or(u32::MAX);
+        println!(
+            "special ids: {{'<|startoftext|>': {}, '<|endoftext|>': {}, '<|return|>': {}, '<|call|>': {}}}",
+            bos, eos, ret, call
+        );
+    }
     let stop_tokens: std::collections::BTreeSet<u32> = stop_ids.into_iter().collect();
 
     // Decode loop using full forward with KV cache, RoPE (YARN), sinks and flash-attn.
@@ -151,7 +204,7 @@ fn main() -> Result<()> {
 
         let logits = model.forward(&t, context_index)?; // (1, context_size, vocab)
         let last = logits.i((0, context_size - 1))?; // (vocab)
-        if step == 0 && std::env::var("CANDLE_DEBUG_TOPK").ok().as_deref() == Some("1") {
+        if step == 0 {
             // Inspect the top-10 candidates for the first generated token
             let last_f32 = last.to_dtype(DType::F32)?;
             let probs = candle_nn::ops::softmax_last_dim(&last_f32)?;
@@ -161,16 +214,16 @@ fn main() -> Result<()> {
             let topn = 10usize.min(idx.len());
             let tok_path = snapshot_dir.join("tokenizer.json");
             if let Ok(tk) = tokenizers::Tokenizer::from_file(&tok_path) {
-                eprintln!("top-10 next-token candidates:");
+                println!("top-10 next-token candidates:");
                 for &i in &idx[..topn] {
                     let id = i as u32;
                     let s = tk.decode(&[id], /*skip_special_tokens=*/ false).unwrap_or_else(|_| "<dec-err>".to_string());
-                    eprintln!("  id={:6} p={:.4} tok={}", id, v[i], s);
+                    println!("  id={:6} p={:.4} tok={}", id, v[i], s);
                 }
                 if let Some(ch_id) = tk.token_to_id("<|channel|>") {
-                    eprintln!("  special '<|channel|>' id={} p={:.6}", ch_id, v[ch_id as usize]);
+                    println!("  special '<|channel|>' id={} p={:.6}", ch_id, v[ch_id as usize]);
                 } else {
-                    eprintln!("  special '<|channel|>' not present in tokenizer");
+                    println!("  special '<|channel|>' not present in tokenizer");
                 }
             }
         }
