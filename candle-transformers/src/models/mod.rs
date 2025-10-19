@@ -51,6 +51,7 @@ pub mod granite;
 pub mod granitemoehybrid;
 pub mod helium;
 pub mod hiera;
+pub mod gpt_oss;
 pub mod jina_bert;
 pub mod llama;
 pub mod llama2_c;
