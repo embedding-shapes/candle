@@ -9,6 +9,7 @@ use candle_nn::Linear;
 
 // Submodule(s)
 pub mod rotary;
+pub mod experts;
 
 // Constants/config
 const MXFP4_BLOCK_ELEMS: usize = 32; // k=32 elements per block on the last dim.
