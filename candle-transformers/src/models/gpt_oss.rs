@@ -1,8 +1,10 @@
 //! GPT-OSS specific helpers.
 //!
-//! This module implements the MXFP4 expert weight load-time detection and dequantization path.
-//! It detects paired `*.blocks` and `*.scales` tensors under a VarBuilder path and reconstructs
-//! a BF16 weight suitable for Candle's `Linear` layer. Other tensors remain BF16 as-is.
+//! This module implements:
+//! - MXFP4 expert weight load-time detection and dequantization path.
+//! - Attention utilities (eager/FA) with sinks renormalization, including windowed variants.
+//! - Minimal config parsing for `layer_types` and `sliding_window`, plus helpers to
+//!   select per-layer attention mode (full vs sliding/windowed).
 
 use candle::{DType, Result, Tensor, D};
 use candle_nn::Linear;
@@ -10,6 +12,62 @@ use candle_nn::Linear;
 // Submodule(s)
 pub mod rotary;
 pub mod experts;
+
+// ============================
+// Config and layer selection
+// ============================
+
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GptOssLayerType {
+    FullAttention,
+    SlidingAttention,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GptOssConfigMinimal {
+    pub num_hidden_layers: usize,
+    #[serde(default)]
+    pub layer_types: Vec<GptOssLayerType>,
+    pub max_position_embeddings: usize,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+}
+
+impl GptOssConfigMinimal {
+    pub fn effective_layer_types(&self) -> Vec<GptOssLayerType> {
+        if self.layer_types.is_empty() {
+            vec![GptOssLayerType::FullAttention; self.num_hidden_layers]
+        } else {
+            self.layer_types.clone()
+        }
+    }
+
+    pub fn sliding_window_size(&self) -> Option<usize> {
+        self.sliding_window
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttnMode {
+    Full,
+    Sliding { left: usize, right: usize },
+}
+
+/// Select attention mode for a given `layer_idx` from config.
+/// - Full: standard causal attention.
+/// - Sliding: windowed attention with left window = `sliding_window` and right window = 0.
+pub fn select_attn_mode_for_layer(cfg: &GptOssConfigMinimal, layer_idx: usize) -> AttnMode {
+    let layer_types = cfg.effective_layer_types();
+    let ty = layer_types
+        .get(layer_idx)
+        .cloned()
+        .unwrap_or(GptOssLayerType::FullAttention);
+    match (ty, cfg.sliding_window_size()) {
+        (GptOssLayerType::SlidingAttention, Some(w)) => AttnMode::Sliding { left: w, right: 0 },
+        _ => AttnMode::Full,
+    }
+}
 
 // Constants/config
 const MXFP4_BLOCK_ELEMS: usize = 32; // k=32 elements per block on the last dim.
