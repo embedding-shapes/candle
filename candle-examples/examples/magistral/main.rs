@@ -231,12 +231,30 @@ fn main() -> Result<()> {
     // Device and dtype
     let device = candle_examples::device(args.cpu)?;
     let dtype = if device.supports_bf16() { DType::BF16 } else { DType::F32 };
+    // Prefer BF16 reduced-precision GEMM on CUDA for faster matmuls.
+    #[cfg(feature = "cuda")]
+    {
+        candle::cuda::set_gemm_reduced_precision_bf16(true);
+        eprintln!(
+            "magistral: cuda gemm_bf16_fast now={}",
+            candle::cuda::gemm_reduced_precision_bf16()
+        );
+    }
 
     // Config and model
     let t_cfg = Instant::now();
-    let config: Mistral3Config =
+    let mut config: Mistral3Config =
         serde_json::from_slice(&fs::read(&config_file)?).context("parse config.json")?;
     println!("timing: parse config: {:?}", t_cfg.elapsed());
+    // Prefer Flash-Attention when compiled with the feature.
+    // This mirrors HF defaults and usually significantly speeds up attention on CUDA.
+    let use_flash = cfg!(feature = "flash-attn");
+    config.text_config.inner.use_flash_attn = use_flash;
+    if use_flash {
+        eprintln!("magistral: flash-attn enabled for text model");
+    } else {
+        eprintln!("magistral: flash-attn not compiled; using standard attention");
+    }
     let t_vb = Instant::now();
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
     println!("timing: mmap weights: {:?}", t_vb.elapsed());
