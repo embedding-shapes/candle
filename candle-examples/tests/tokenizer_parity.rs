@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gpt_oss_tokenizer::{render_then_encode, load_stop_token_ids, lookup_special_ids};
+use gpt_oss_tokenizer::{render_then_encode, load_stop_token_ids, lookup_special_ids, load_special_ids_from_map};
 use openai_harmony::chat::{Message, Role};
 
 const SNAPSHOT_DIR: &str = "~/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee";
@@ -71,5 +71,16 @@ fn t31_special_ids_match_generation_config() -> Result<()> {
     assert!(stops.contains(&ret), "<|return|> not in stop set");
     assert!(stops.contains(&call), "<|call|> not in stop set");
     assert!(stops.contains(&pad_tok), "pad not in stop set");
+    Ok(())
+}
+
+#[test]
+fn t32_special_tokens_map_validation() -> Result<()> {
+    let dir = p(SNAPSHOT_DIR);
+    // Map the BOS/EOS/PAD token strings from special_tokens_map.json and confirm expected ids.
+    let (bos, pad, eos) = load_special_ids_from_map(&dir)?;
+    assert_eq!(bos, 199998, "bos id mismatch vs expectation");
+    assert_eq!(pad, 199999, "pad id mismatch vs expectation");
+    assert_eq!(eos, 200002, "eos(<|return|>) id mismatch vs expectation");
     Ok(())
 }

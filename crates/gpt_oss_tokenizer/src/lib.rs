@@ -9,6 +9,7 @@ use tokenizers::Tokenizer;
 const CHAT_TEMPLATE_FILE: &str = "chat_template.jinja";
 const TOKENIZER_FILE: &str = "tokenizer.json";
 const GENERATION_CONFIG_FILE: &str = "generation_config.json";
+const SPECIAL_TOKENS_MAP_FILE: &str = "special_tokens_map.json";
 
 #[derive(Debug, Clone, Serialize)]
 struct JinjaMessage {
@@ -141,4 +142,43 @@ pub fn lookup_special_ids<P: AsRef<Path>>(snapshot_dir: P) -> Result<(u32, u32, 
     let ret = tokenizer.token_to_id("<|return|>").context("missing <|return|> id")?;
     let call = tokenizer.token_to_id("<|call|>").context("missing <|call|> id")?;
     Ok((bos, pad, ret, call))
+}
+
+/// Load special token ids as declared in special_tokens_map.json by mapping their string
+/// representations through the tokenizer.json. This validates that BOS/EOS/PAD are
+/// consistent between the map and the tokenizer ids.
+pub fn load_special_ids_from_map<P: AsRef<Path>>(snapshot_dir: P) -> Result<(u32, u32, u32)> {
+    #[derive(serde::Deserialize)]
+    struct MapCfg {
+        bos_token: String,
+        eos_token: serde_json::Value,
+        pad_token: String,
+    }
+    let base = snapshot_dir.as_ref();
+    let map_path = base.join(SPECIAL_TOKENS_MAP_FILE);
+    let tok_path = base.join(TOKENIZER_FILE);
+    let bytes = std::fs::read(&map_path)
+        .with_context(|| format!("failed to read {}", map_path.display()))?;
+    let cfg: MapCfg = serde_json::from_slice(&bytes).context("invalid special_tokens_map.json")?;
+    let tokenizer = Tokenizer::from_file(&tok_path)
+        .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
+
+    let bos = tokenizer
+        .token_to_id(&cfg.bos_token)
+        .with_context(|| format!("missing '{}' in tokenizer", cfg.bos_token))?;
+    let pad = tokenizer
+        .token_to_id(&cfg.pad_token)
+        .with_context(|| format!("missing '{}' in tokenizer", cfg.pad_token))?;
+    let eos = match cfg.eos_token {
+        serde_json::Value::String(s) => tokenizer
+            .token_to_id(&s)
+            .with_context(|| format!("missing '{}' in tokenizer", s))?,
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+            // HF sometimes stores multi-eos in generation_config, not in special_tokens_map.
+            // Here we only support string eos in the map for validation purposes.
+            anyhow::bail!("unsupported eos_token form in special_tokens_map.json, expected string")
+        }
+        _ => anyhow::bail!("invalid eos_token in special_tokens_map.json"),
+    };
+    Ok((bos, pad, eos))
 }
