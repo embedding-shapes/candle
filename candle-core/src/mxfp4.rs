@@ -5,7 +5,8 @@
 //! Layout assumptions (validated):
 //! - `blocks`: [rows, blocks, 16] where each 16-byte block packs 32 FP4 values
 //!   along the last dimension, two nibbles per byte (low then high).
-//! - `scales`: [rows, blocks] where each u8 is an E8M0 exponent; real scale is 2^(i8(exp)).
+//! - `scales`: [rows, blocks] where each u8 is an E8M0 exponent; real scale is 2^(u8 - 127),
+//!   and 0xFF is reserved (maps to NaN) per MX spec.
 //! - Final output shape is [rows, cols] with `cols = blocks * 32`.
 
 use crate::{bail, DType, Device, Result, Tensor};
@@ -75,11 +76,13 @@ fn decode_fp4_e2m1(nibble: u8) -> f32 {
     }
 }
 
-/// Convert an E8M0 scale byte to its f32 power-of-two value: 2^(i8(exp)).
+/// Convert an E8M0 scale byte to its f32 power-of-two value using biased exponent semantics.
+///
+/// - For code != 0xFF: scale = 2^(code - 127)
+/// - For code == 0xFF: scale = NaN (reserved code)
 #[inline]
 fn pow2_e8m0(scale_exp: u8) -> f32 {
-    let e = scale_exp as i8 as i32;
-    (2f32).powi(e)
+    if scale_exp == 0xFF { f32::NAN } else { (2f32).powi((scale_exp as i32) - 127) }
 }
 
 /// Dequantize MXFP4 packed weights on CPU into a contiguous BF16 tensor with shape `[rows, cols]`.
@@ -235,5 +238,25 @@ mod tests {
         assert_eq!(decode_fp4_e2m1(0b1101), -3.0);
         assert_eq!(decode_fp4_e2m1(0b1110), -4.0);
         assert_eq!(decode_fp4_e2m1(0b1111), -6.0);
+    }
+
+    #[test]
+    fn e8m0_scale_decode_key_cases() {
+        // MX spec: biased exponent with bias 127, 0xFF reserved
+        let cases: &[(u8, f32, bool)] = &[
+            (0u8, 2f32.powi(-127), false),
+            (127u8, 1.0, false),
+            (128u8, 2.0, false),
+            (254u8, 2f32.powi(127), false),
+            (255u8, f32::NAN, true),
+        ];
+        for &(code, expect, is_nan) in cases {
+            let got = pow2_e8m0(code);
+            if is_nan {
+                assert!(got.is_nan(), "code={code}: expected NaN, got {got}");
+            } else {
+                assert_eq!(got, expect, "code={code}: mismatch {got} vs {expect}");
+            }
+        }
     }
 }

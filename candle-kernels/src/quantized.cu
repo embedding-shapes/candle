@@ -2516,7 +2516,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 // MXFP4 (FP4 E2M1 + E8M0 scale) fused dequantize to BF16
 // Input layout:
 //  - blocks: [rows, nblocks, 16] (two FP4 per byte => 32 values per block)
-//  - scales: [rows, nblocks] (u8 E8M0 exponent, signed)
+//  - scales: [rows, nblocks] (u8 E8M0 biased exponent; scale = 2^(u8-127), 0xFF reserved/NaN)
 // Output layout:
 //  - out: [rows, cols] where cols = nblocks * 32 (BF16)
 // Grid config suggestion: dim3 grid(rows, nblocks), dim3 block(32)
@@ -2540,9 +2540,11 @@ static __device__ __forceinline__ float decode_fp4_e2m1_device(uint8_t n) {
 }
 
 static __device__ __forceinline__ float pow2_e8m0_device(uint8_t bexp) {
-    // Signed 8-bit exponent: scale = 2^(int8)
-    const int8_t e = *(reinterpret_cast<int8_t*>(&bexp));
-    // Use exp2f for efficiency and accuracy on device
+    // Biased 8-bit exponent: scale = 2^(u8 - 127); 0xFF reserved => NaN
+    if (bexp == 0xFFu) {
+        return __int_as_float(0x7FC00000); // quiet NaN
+    }
+    const int e = (int)bexp - 127;
     return exp2f((float)e);
 }
 

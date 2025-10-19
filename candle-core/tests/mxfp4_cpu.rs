@@ -57,7 +57,9 @@ fn quantize_block_e2m1(values: &[f32]) -> (u8, [u8; 16]) {
         }
     }
 
-    (best_exp as u8, best_packed)
+    // MXFP4 E8M0 uses biased-u8 exponent with bias 127 and reserves 0xFF.
+    // Our candidate range is clamped to [-32, 31], so adding 127 never yields 0xFF.
+    ((best_exp as i32 + 127) as u8, best_packed)
 }
 
 #[inline]
@@ -173,7 +175,7 @@ fn t4_layout_last_dim_blocking_non_mult_64() -> Result<()> {
     let cols = 96usize;
     let nblocks = cols / K_BLOCK; // 3
 
-    // Build scales all zero => scale=1.0
+    // Build scales all zero => scale = 2^(-127)
     let scales = vec![0u8; rows * nblocks];
     // Build blocks so that each position has a known nibble code pattern.
     let mut blocks = vec![0u8; rows * nblocks * 16];
@@ -211,7 +213,8 @@ fn t4_layout_last_dim_blocking_non_mult_64() -> Result<()> {
     let mut expected: Vec<bf16> = vec![bf16::ZERO; rows * cols];
     for r in 0..rows {
         for b in 0..nblocks {
-            let scale = 1.0f32; // scales=0 => 2^0
+            // scales=0 => 2^(-127)
+            let scale = (2f32).powi(-127);
             for j in 0..16 {
                 let off = (r * nblocks + b) * 16 + j;
                 let byte = blocks[off];

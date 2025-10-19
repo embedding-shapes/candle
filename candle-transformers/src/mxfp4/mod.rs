@@ -43,13 +43,13 @@ pub fn decode_fp4_e2m1_nibble(code: u8) -> f32 {
     FP4_E2M1_TO_F32[(code & 0x0F) as usize]
 }
 
-/// Map an E8M0 8-bit signed exponent code to a power-of-two scale in f32.
-/// Semantics: interpret `code` as i8, return 2^(code).
+/// Map an E8M0 8-bit biased exponent code to a power-of-two scale in f32.
+/// Semantics per MX spec:
+/// - return 2^(code - 127) for code in [0x00..=0xFE]
+/// - return NaN for code == 0xFF (reserved)
 #[inline]
 pub fn e8m0_to_pow2(code: u8) -> f32 {
-    let exp = (code as i8) as i32;
-    // This is exact for powers of two representable in f32, producing subnormals when needed.
-    2f32.powi(exp)
+    if code == 0xFF { f32::NAN } else { 2f32.powi((code as i32) - 127) }
 }
 
 /// Decode a 32-value block from 16 bytes (packed two nibbles per byte) and one E8M0 scale.
@@ -133,29 +133,12 @@ mod tests {
     }
 
     #[test]
-    fn t2_e8m0_scale_decode_all_codes() {
-        // Verify mapping for all 256 codes to 2^(i8(code)).
-        for code in 0u8..=255u8 {
-            let exp_i8 = (code as i8) as i32;
-            let exp = 2f32.powi(exp_i8);
-            let got = e8m0_to_pow2(code);
-
-            // Both should be exactly equal as they use the same computation.
-            if exp.is_infinite() {
-                // Should not occur for i8 range, but keep check consistent
-                assert!(got.is_infinite());
-            } else {
-                assert_eq!(got.to_bits(), exp.to_bits(), "code {code}: pow2 mismatch");
-            }
-        }
-
-        // Edge checks
-        assert_eq!(e8m0_to_pow2(0x00), 1.0);
-        // 0x7F = 127 -> 2^127 (finite in f32)
-        assert!(e8m0_to_pow2(0x7F).is_finite());
-        // 0x80 = -128 -> 2^-128: ensure equality to reference powi computation
-        assert_eq!(e8m0_to_pow2(0x80).to_bits(), 2f32.powi(-128).to_bits());
-        // 0xFF = -1 -> 0.5
-        assert_eq!(e8m0_to_pow2(0xFF), 0.5);
+    fn t2_e8m0_scale_decode_key_cases() {
+        // Key mandated mappings for MX E8M0
+        assert_eq!(e8m0_to_pow2(0), 2f32.powi(-127));
+        assert_eq!(e8m0_to_pow2(127), 1.0);
+        assert_eq!(e8m0_to_pow2(128), 2.0);
+        assert_eq!(e8m0_to_pow2(254), 2f32.powi(127));
+        assert!(e8m0_to_pow2(255).is_nan());
     }
 }

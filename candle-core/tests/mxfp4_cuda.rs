@@ -71,7 +71,8 @@ fn quantize_block_e2m1(values: &[f32]) -> (u8, [u8; 16]) {
         }
         if sse < best_err { best_err = sse; best_exp = exp; best_packed = packed; }
     }
-    (best_exp as u8, best_packed)
+    // MXFP4 E8M0 uses biased-u8 exponent with bias 127; avoid 0xFF reserved.
+    ((best_exp as i32 + 127) as u8, best_packed)
 }
 
 #[test]
