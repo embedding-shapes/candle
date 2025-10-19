@@ -143,7 +143,10 @@ pub fn load_linear_maybe_mxfp4(
         let scales = vb_u8.get((out_dim, nblocks), &scales_name)?;
 
         // Dequantize to BF16 on the appropriate device (CPU or CUDA).
-        let weight = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
+        let mut weight = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
+        if !weight.device().same_device(vb.device()) {
+            weight = weight.to_device(vb.device())?;
+        }
 
         // Optionally load bias (kept BF16 as-is). Support dot and underscore naming.
         let bias_t = if bias {
@@ -213,10 +216,29 @@ pub fn load_expert_linear_mxfp4_grouped(
     let vb_u8 = vb.to_dtype(DType::U8);
     let blocks_g = vb_u8.get((n_experts, out_dim, nblocks, MXFP4_BLOCK_BYTES), &blocks_name)?; // (E, out, nb, 16)
     let scales_g = vb_u8.get((n_experts, out_dim, nblocks), &scales_name)?; // (E, out, nb)
+    if matches!(std::env::var("CANDLE_DEBUG_MXFP4_SHAPES").ok().as_deref(), Some("1") | Some("true") | Some("TRUE")) {
+        if expert_idx == 0 {
+            eprintln!(
+                "[MXFP4] {}: blocks {:?}, scales {:?} (expect (E={}, out={}, nb={}, 16); (E={}, out={}, nb={}))",
+                base,
+                blocks_g.dims(),
+                scales_g.dims(),
+                n_experts,
+                out_dim,
+                nblocks,
+                n_experts,
+                out_dim,
+                nblocks
+            );
+        }
+    }
     let blocks = blocks_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb, 16)
     let scales = scales_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb)
 
-    let weight = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
+    let mut weight = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
+    if !weight.device().same_device(vb.device()) {
+        weight = weight.to_device(vb.device())?;
+    }
 
     // Optional grouped bias under e.g. "experts.gate_up_proj_bias" (shape [E, out]).
     let bias_t = if bias {

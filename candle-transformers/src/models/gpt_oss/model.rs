@@ -272,7 +272,12 @@ impl GptOssModel {
                 i,
             );
 
-            let sinks = Some(&layer.attn.sinks);
+            // Allow disabling sinks renormalization for ablation via env var.
+            let sinks = if matches!(std::env::var("CANDLE_DISABLE_SINKS").ok().as_deref(), Some("1") | Some("true") | Some("TRUE")) {
+                None
+            } else {
+                Some(&layer.attn.sinks)
+            };
             let y = {
                 #[cfg(feature = "flash-attn")]
                 {

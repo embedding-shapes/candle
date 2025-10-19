@@ -41,7 +41,8 @@ pub struct GptOssExperts {
 
 impl GptOssExperts {
     pub fn new(router: Linear, experts: Vec<ExpertMlp>, num_experts_per_tok: Option<usize>) -> Self {
-        let k = num_experts_per_tok.unwrap_or(DEFAULT_TOP_K);
+        let k_env = std::env::var("CANDLE_MOE_TOPK").ok().and_then(|s| s.parse::<usize>().ok());
+        let k = k_env.or(num_experts_per_tok).unwrap_or(DEFAULT_TOP_K);
         Self { router, experts, num_experts_per_tok: k }
     }
 

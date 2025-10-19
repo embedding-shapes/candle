@@ -146,9 +146,35 @@ fn main() -> Result<()> {
     }
 
     // Decode and print using Harmony’s tokenizer (raw view with specials).
-    let decoded_full = tok
-        .decode_utf8(tokens.iter().copied())
-        .unwrap_or_else(|_| String::from("<decode-error>"));
+    let decoded_full = match tok.decode_utf8(tokens.iter().copied()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Harmony decode failed: {} — falling back to tokenizer.json", e);
+            // Fallback: decode via tokenizer.json in the snapshot
+            let tok_path = snapshot_dir.join("tokenizer.json");
+            match tokenizers::Tokenizer::from_file(&tok_path) {
+                Ok(hf_tok) => match hf_tok.decode(&tokens, true) {
+                    Ok(s) => s,
+                    Err(e2) => {
+                        eprintln!(
+                            "HF tokenizer decode failed as well: {} (path: {})",
+                            e2,
+                            tok_path.display()
+                        );
+                        String::from("<decode-error>")
+                    }
+                },
+                Err(e1) => {
+                    eprintln!(
+                        "Failed to load tokenizer.json at {}: {}",
+                        tok_path.display(),
+                        e1
+                    );
+                    String::from("<decode-error>")
+                }
+            }
+        }
+    };
     println!("{}", decoded_full);
 
     // Lightweight parsing from the decoded string: extract assistant final channel content.
