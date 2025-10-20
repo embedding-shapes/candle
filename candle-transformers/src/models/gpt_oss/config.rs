@@ -6,8 +6,13 @@ use super::GptOssLayerType;
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct RopeScalingConfig {
-    #[serde(default)]
+    // Accept either `type` or `rope_type` without conflicting aliasing.
+    // If both are present, either field may be set; callers should not rely on this value
+    // beyond presence detection for YARN.
+    #[serde(default, alias = "type")]
     pub r#type: Option<String>, // typically "yarn"
+    #[serde(default)]
+    pub rope_type: Option<String>, // also observed in HF configs
     #[serde(default)]
     pub factor: Option<f32>,
     #[serde(default)]
