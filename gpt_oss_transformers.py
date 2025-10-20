@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from typing import List, Dict, Any
 
+import argparse
+import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tokenizers import Tokenizer as HFTokenizer
@@ -105,6 +107,9 @@ def extract_final_assistant_text_from_decoded(decoded: str) -> str | None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dump-layer-states", action="store_true", help="Dump per-layer last-token states to layers_step0_last.npy and exit")
+    args = parser.parse_args()
     # Messages (Harmony-style content). Keep identical to Rust example.
     messages: List[Dict[str, Any]] = [
         {"role": "user", "content": "Explain what MXFP4 quantization is"},
@@ -257,6 +262,54 @@ def main() -> None:
                 printed["post_attn_resid"] = True
 
         attn0.register_forward_hook(_attn_hook)
+
+    if args.dump_layer_states:
+        # Dump h0 + (pre_attn_norm, post_attn_resid, post_mlp_resid) per layer for last prompt token.
+        with torch.no_grad():
+            input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
+            L = model.config.num_hidden_layers
+            H = model.config.hidden_size
+
+            pre_attn_norm: list[torch.Tensor] = []
+            post_attn_resid: list[torch.Tensor] = []
+
+            # Hook collectors per layer
+            hooks = []
+            for i in range(L):
+                ln = model.model.layers[i].input_layernorm  # type: ignore[attr-defined]
+
+                def _mk_ln_hook():
+                    idx = len(pre_attn_norm)
+                    def _ln_hook(_m, _inp, out):
+                        y = out  # (b, t, h)
+                        pre_attn_norm.append(y[0, -1, :].detach().float().cpu())
+                    return _ln_hook
+                hooks.append(ln.register_forward_hook(_mk_ln_hook()))
+
+                post_ln = model.model.layers[i].post_attention_layernorm  # type: ignore[attr-defined]
+
+                def _mk_pre_hook():
+                    def _pre(_m, inputs):
+                        hs = inputs[0]
+                        post_attn_resid.append(hs[0, -1, :].detach().float().cpu())
+                        return None
+                    return _pre
+                hooks.append(post_ln.register_forward_pre_hook(_mk_pre_hook()))
+
+            out = model(input_ids=input_tensor, output_hidden_states=True, return_dict=True)
+            hs = out.hidden_states  # tuple(len = L+1)
+            assert len(hs) == L + 1
+            h0 = hs[0][0, -1, :].detach().float().cpu()
+            post_mlp = [hs[i + 1][0, -1, :].detach().float().cpu() for i in range(L)]
+
+            # Assemble rows: [h0] + triples per layer
+            rows = [h0] + [x for i in range(L) for x in (pre_attn_norm[i], post_attn_resid[i], post_mlp[i])]
+            arr = torch.stack(rows, dim=0).numpy()  # (1+3L, H) float32 on cpu
+            np.save("layers_step0_last.npy", arr)
+            for h in hooks:
+                h.remove()
+            print(json.dumps({"dump": "layers_step0_last.npy", "rows": int(arr.shape[0]), "hidden": int(arr.shape[1])}))
+            return
 
     # Top-10 next-token candidates at step 0
     with torch.no_grad():
