@@ -52,6 +52,8 @@ impl GptOssRopeConfig {
 pub struct GptOssRotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    // YARN attention scaling factor to apply once at the softmax scale site.
+    attn_factor: f32,
 }
 
 impl GptOssRotaryEmbedding {
@@ -103,14 +105,13 @@ impl GptOssRotaryEmbedding {
             .reshape((cfg.max_position_embeddings, 1))?; // (T,1)
         let freqs = t.matmul(&inv_freq)?; // (T, dim/2)
 
-        // HF reference applies YARN attention scaling directly to the cos/sin tables.
-        // This results in q/k being scaled by `mscale`, and the attention logits
-        // scaled by `mscale^2`. Compute the default YARN mscale from `factor`.
-        let mscale = yarn_get_mscale(cfg.factor);
-        let sin = (freqs.sin()? * mscale as f64)?.to_dtype(dtype)?;
-        let cos = (freqs.cos()? * mscale as f64)?.to_dtype(dtype)?;
+        // Compute attention-factor (mscale) per YARN. We do NOT scale cos/sin by this factor;
+        // instead we apply it once to the softmax scaling (1/sqrt(d) * mscale) to match HF.
+        let attn_factor = yarn_get_mscale(cfg.factor);
+        let sin = freqs.sin()?.to_dtype(dtype)?;
+        let cos = freqs.cos()?.to_dtype(dtype)?;
 
-        Ok(Self { sin, cos })
+        Ok(Self { sin, cos, attn_factor })
     }
 
     pub fn apply_rotary_emb_qk(
@@ -134,6 +135,8 @@ impl GptOssRotaryEmbedding {
     pub fn sin_table(&self) -> &Tensor {
         &self.sin
     }
+
+    pub fn attention_factor(&self) -> f32 { self.attn_factor }
 }
 
 fn yarn_find_correction_dim(num_rot: f32, dim: usize, base: f32, max_position_embeddings: usize) -> f32 {

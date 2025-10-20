@@ -3,7 +3,7 @@ use super::experts::{ExpertMlp, GptOssExperts};
 use super::{load_expert_linear_mxfp4_grouped, load_linear_maybe_mxfp4, select_attn_mode_for_layer, AttnMode};
 use crate::models::with_tracing::{linear, Embedding, RmsNorm};
 use crate::models::gpt_oss::rotary::{GptOssRopeConfig, GptOssRotaryEmbedding};
-use candle::{DType, Device, Module, Result, Tensor, IndexOp};
+use candle::{DType, Device, Module, Result, Tensor, IndexOp, D};
 use candle_nn::VarBuilder;
 
 // Constants
@@ -224,14 +224,11 @@ impl GptOssModel {
         let head_dim = self.cfg.head_dim();
         let n_q = self.cfg.num_attention_heads;
         let n_kv = self.cfg.num_key_value_heads;
-        // Attention softmax scaling: match HF reference behavior for GPT-OSS/YARN.
-        // The Python implementation applies any YARN scaling via the rotary cos/sin path
-        // (attention_scaling returned by ROPE_INIT_FUNCTIONS), which for the GPT-OSS
-        // "yarn" variant is effectively 1.0. Therefore, we must NOT multiply the
-        // softmax scale by an additional mscale^2 here, as that would over-scale
-        // attention logits and cause parity mismatches.
-        // Keep the standard 1/sqrt(head_dim) scale only.
-        let softmax_scale = 1.0f32 / (head_dim as f32).sqrt();
+        // Attention softmax scaling: apply YARN attention factor exactly once.
+        // HF uses a scaling factor returned by ROPE_INIT_FUNCTIONS (attention_factor)
+        // multiplied with the standard 1/sqrt(d_k) at the attention logits site.
+        // We mirror that here by querying the YARN attn_factor from the rotary embedding.
+        let softmax_scale = self.rope.attention_factor() * (1.0f32 / (head_dim as f32).sqrt());
         
 
         let dump_l1 = matches!(std::env::var(ENV_DUMP_L1).ok().as_deref(), Some("1") | Some("true") | Some("TRUE"));
@@ -347,10 +344,30 @@ impl GptOssModel {
             xs = (xs + mlp_out)?;
         }
 
-        // Final norm and lm head (norm in f32, then cast back)
+        // Final norm and lm head. Use f32 accumulation for the projection to
+        // match HF reference numerics: compute logits = (bt,h) @ W.T in f32,
+        // then keep the output in f32 for downstream sampling/masking.
         let xs = self.norm.forward(&xs)?; // (b,t,h)
-        let xs2 = xs.reshape(((), hidden))?;
-        let logits = xs2.apply(&self.lm_head)?.reshape((b, t, self.cfg.vocab_size))?;
+        let xs2 = xs.reshape(((), hidden))?; // (bt,h)
+        let xs2_f = xs2.to_dtype(DType::F32)?;
+        // Perform matmul in f32 while keeping the stored weights in their current dtype;
+        // the kernel will promote as needed without duplicating the full weight in f32.
+        let w = self.lm_head.weight(); // (vocab,h)
+        let vocab = self.cfg.vocab_size;
+        // Chunk over the vocab dimension to avoid materializing W in f32 entirely.
+        let chunk = 8192usize;
+        let mut parts: Vec<Tensor> = Vec::new();
+        let mut start = 0usize;
+        while start < vocab {
+            let len = (vocab - start).min(chunk);
+            let w_chunk = w.narrow(0, start, len)?; // (len,h)
+            let w_chunk_f = w_chunk.to_dtype(DType::F32)?; // (len,h)
+            let logits_chunk = xs2_f.matmul(&w_chunk_f.t()?)?; // (bt,len)
+            parts.push(logits_chunk);
+            start += len;
+        }
+        let logits_bt_v = Tensor::cat(&parts.iter().collect::<Vec<_>>(), D::Minus1)?; // (bt,vocab)
+        let logits = logits_bt_v.reshape((b, t, vocab))?; // (b,t,vocab)
         Ok(logits)
     }
 }
