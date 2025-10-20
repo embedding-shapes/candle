@@ -112,11 +112,18 @@ pub mod experts {
             let gu = gu.to_dtype(DType::F32)?;
             let (_n, two_inter) = gu.dims2()?;
             let inter = two_inter / 2;
-            let mut gate = gu.narrow(D::Minus1, 0, inter)?;
-            let mut up = gu.narrow(D::Minus1, inter, inter)?;
 
-            // Symmetric clamp per golden reference: both gate and up are clamped to [-limit, +limit].
-            gate = gate.clamp(-self.limit, self.limit)?;
+            // Python uses interleaved layout: gate_up[..., ::2], gate_up[..., 1::2]
+            // Extract even indices for gate, odd indices for up
+            let gate_indices: Vec<u32> = (0..inter).map(|i| (i * 2) as u32).collect();
+            let up_indices: Vec<u32> = (0..inter).map(|i| (i * 2 + 1) as u32).collect();
+            let gate_idx_t = Tensor::new(gate_indices.as_slice(), gu.device())?;
+            let up_idx_t = Tensor::new(up_indices.as_slice(), gu.device())?;
+            let mut gate = gu.index_select(&gate_idx_t, D::Minus1)?;
+            let mut up = gu.index_select(&up_idx_t, D::Minus1)?;
+
+            // Asymmetric clamp: gate has only max, up has both min and max
+            gate = gate.clamp(f32::NEG_INFINITY, self.limit)?;
             up = up.clamp(-self.limit, self.limit)?;
 
             let alpha_t = Tensor::new(self.alpha, xs.device())?.to_dtype(DType::F32)?;
@@ -597,9 +604,6 @@ pub mod model {
 
         pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
             let mut xs = self.embed.forward(input_ids)?;
-            // Match golden reference: scale token embeddings by sqrt(hidden_size)
-            let (_b, _t, hidden) = xs.dims3()?;
-            xs = (xs * (hidden as f64).sqrt())?;
             let (b, t, hidden) = xs.dims3()?;
             let head_dim = self.cfg.head_dim();
             let n_q = self.cfg.num_attention_heads;
@@ -619,6 +623,10 @@ pub mod model {
                 std::env::var(ENV_DUMP_L1).ok().as_deref(),
                 Some("1") | Some("true") | Some("TRUE")
             );
+            if dump_l1 {
+                let xs_pre = xs.i((0, t - 1))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                eprintln!("[L1] xs (before layer 0) last [:8]: {:?}", &xs_pre[..8]);
+            }
             for (i, layer) in self.layers.iter_mut().enumerate() {
                 let x_norm = layer.input_layernorm.forward(&xs)?;
                 if dump_l1 && i == 0 {
@@ -636,6 +644,14 @@ pub mod model {
                 let q = x_norm.apply(&layer.attn.q_proj)?;
                 let k = x_norm.apply(&layer.attn.k_proj)?;
                 let v = x_norm.apply(&layer.attn.v_proj)?;
+                if dump_l1 && i == 0 {
+                    let q_last = q.i((0, t - 1))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                    let k_last = k.i((0, t - 1))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                    let v_last = v.i((0, t - 1))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                    eprintln!("[L1] q_proj last [:8]: {:?}", &q_last[..8]);
+                    eprintln!("[L1] k_proj last [:8]: {:?}", &k_last[..8]);
+                    eprintln!("[L1] v_proj last [:8]: {:?}", &v_last[..8]);
+                }
 
                 let q = q.reshape((b, t, n_q, head_dim))?;
                 let k = k.reshape((b, t, n_kv, head_dim))?;
@@ -709,6 +725,10 @@ pub mod model {
 
                 let y = y.reshape((b, t, n_q * head_dim))?;
                 let y = y.apply(&layer.attn.o_proj)?;
+                if dump_l1 && i == 0 {
+                    let y_last = y.i((0, t - 1))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                    eprintln!("[L1] o_proj last [:8]: {:?}", &y_last[..8]);
+                }
                 xs = (xs + y)?;
                 if dump_l1 && i == 0 {
                     let last = xs.i((0, t - 1))?.to_dtype(DType::F32)?;
@@ -723,8 +743,21 @@ pub mod model {
                 }
 
                 let x_norm2 = layer.post_attention_layernorm.forward(&xs)?;
+                if dump_l1 && i == 0 {
+                    let norm2_last = x_norm2.i((0, t - 1))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                    eprintln!("[L1] post-attn-norm last [:8]: {:?}", &norm2_last[..8]);
+                }
                 let mlp_out = layer.experts.forward(&x_norm2)?;
+                if dump_l1 && i == 0 {
+                    let mlp_last = mlp_out.i((0, t - 1))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                    eprintln!("[L1] mlp_out last [:8]: {:?}", &mlp_last[..8]);
+                }
                 xs = (xs + mlp_out)?;
+                if dump_l1 && i == 0 {
+                    let last = xs.i((0, t - 1))?.to_dtype(DType::F32)?;
+                    let v = last.to_vec1::<f32>()?;
+                    eprintln!("[L1] end-of-layer-0 last-token [:8]: {:?}", &v[..8]);
+                }
             }
 
             let xs = self.norm.forward(&xs)?;
@@ -757,9 +790,6 @@ pub mod model {
             seqlen_offset: usize,
         ) -> Result<Tensor> {
             let mut xs = self.embed.forward(input_ids)?; // (b, t, h)
-            // Keep debug path consistent with main forward: apply embedding scaling
-            let (_b, _t, hidden) = xs.dims3()?;
-            xs = (xs * (hidden as f64).sqrt())?;
             let (b, t, _hidden) = xs.dims3()?;
             let head_dim = self.cfg.head_dim();
             let n_q = self.cfg.num_attention_heads;
@@ -875,9 +905,6 @@ pub mod model {
             seqlen_offset: usize,
         ) -> Result<Tensor> {
             let mut xs = self.embed.forward(input_ids)?; // (b, t, h)
-            // Apply same embedding scaling as forward for exact parity
-            let (_b, _t, hidden) = xs.dims3()?;
-            xs = (xs * (hidden as f64).sqrt())?;
             let (b, t, _hidden) = xs.dims3()?;
             let head_dim = self.cfg.head_dim();
             let n_q = self.cfg.num_attention_heads;
@@ -1005,11 +1032,7 @@ pub mod model {
             f32,    // softmax_scale
             super::AttnMode,
         )> {
-            let xs = {
-                let xs0 = self.embed.forward(input_ids)?; // (b,t,h)
-                let (_b, _t, hidden) = xs0.dims3()?;
-                (xs0 * (hidden as f64).sqrt())?
-            };
+            let xs = self.embed.forward(input_ids)?; // (b,t,h)
             let (b, t, _h) = xs.dims3()?;
             let head_dim = self.cfg.head_dim();
             let n_q = self.cfg.num_attention_heads;
@@ -1090,11 +1113,7 @@ pub mod model {
         /// and return the last-token vector both before and after the o_proj.
         /// Returns (pre_o_proj: (n_q*head_dim), post_o_proj: (hidden)) as f32 on CPU.
         pub fn debug_l0_attn_last_token(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<(Tensor, Tensor)> {
-            let xs0 = {
-                let tmp = self.embed.forward(input_ids)?; // (b,t,h)
-                let (_b, _t, hidden) = tmp.dims3()?;
-                (tmp * (hidden as f64).sqrt())?
-            };
+            let xs0 = self.embed.forward(input_ids)?; // (b,t,h)
             let (b, t, _h) = xs0.dims3()?;
             let head_dim = self.cfg.head_dim();
             let n_q = self.cfg.num_attention_heads;
@@ -1610,22 +1629,33 @@ pub fn eager_attn_with_sinks(
         logits
     };
 
-    let att = candle_nn::ops::softmax_last_dim(&logits)?; // (b,h,q,k)
-    let o_bhqd = att.matmul(&v_bhkd.contiguous()?)?; // (b,h,q,d)
-    let mut o_bqhd = o_bhqd.transpose(1, 2)?; // (b,q,h,d)
+    // Apply sinks renormalization if provided - match HF reference exactly.
+    let o_bqhd = if let Some(sinks_t) = sinks {
+        // Concatenate sinks to logits: combined_logits = cat([attn_weights, sinks], dim=-1)
+        // sinks_t shape: (h), reshape to (1, h, 1, 1) and broadcast to (b, h, q, 1)
+        let sinks_f32 = sinks_t.to_dtype(DType::F32)?;
+        let sinks_bhq1 = sinks_f32
+            .reshape((1, h, 1, 1))?
+            .broadcast_as((b, h, qlen, 1))?; // (b, h, q, 1)
+        let combined_logits = Tensor::cat(&[&logits, &sinks_bhq1], D::Minus1)?; // (b, h, q, k+1)
 
-    // Apply sinks renormalization if provided.
-    if let Some(sinks_t) = sinks {
-        // lse along keys
-        let lse = logits.log_sum_exp(D::Minus1)?; // (b,h,q)
-        let scale = sinks_scale_from_lse(&lse, sinks_t)?; // (b,h,q)
-        let scale = scale.transpose(1, 2)?.unsqueeze(D::Minus1)?; // (b,q,h,1)
-        let (_, qlen, h, d) = o_bqhd.dims4()?;
-        let scale = scale.broadcast_as((b, qlen, h, d))?; // match (b,q,h,d)
-        o_bqhd = (o_bqhd.to_dtype(DType::F32)? * &scale)?.to_dtype(in_dtype)?;
+        // Max normalization: combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        let max_vals = combined_logits.max_keepdim(D::Minus1)?;
+        let combined_logits = combined_logits.broadcast_sub(&max_vals)?;
+
+        // Softmax on combined
+        let probs = candle_nn::ops::softmax_last_dim(&combined_logits)?; // (b, h, q, k+1)
+
+        // Drop the sink probability: scores = probs[..., :-1]
+        let scores = probs.narrow(D::Minus1, 0, klen)?; // (b, h, q, k)
+
+        let o_bhqd = scores.matmul(&v_bhkd.contiguous()?)?; // (b, h, q, d)
+        o_bhqd.transpose(1, 2)?.to_dtype(in_dtype)? // (b, q, h, d)
     } else {
-        o_bqhd = o_bqhd.to_dtype(in_dtype)?;
-    }
+        let att = candle_nn::ops::softmax_last_dim(&logits)?; // (b, h, q, k)
+        let o_bhqd = att.matmul(&v_bhkd.contiguous()?)?; // (b, h, q, d)
+        o_bhqd.transpose(1, 2)?.to_dtype(in_dtype)? // (b, q, h, d)
+    };
 
     Ok(o_bqhd)
 }
@@ -1678,20 +1708,32 @@ pub fn eager_attn_windowed_with_sinks(
         }
     };
 
-    let att = candle_nn::ops::softmax_last_dim(&logits)?;
-    let o_bhqd = att.matmul(&v_bhkd.contiguous()?)?;
-    let mut o_bqhd = o_bhqd.transpose(1, 2)?;
+    // Apply sinks renormalization if provided - match HF reference exactly.
+    let o_bqhd = if let Some(sinks_t) = sinks {
+        // Concatenate sinks to logits: combined_logits = cat([attn_weights, sinks], dim=-1)
+        let sinks_f32 = sinks_t.to_dtype(DType::F32)?;
+        let sinks_bhq1 = sinks_f32
+            .reshape((1, h, 1, 1))?
+            .broadcast_as((b, h, qlen, 1))?; // (b, h, q, 1)
+        let combined_logits = Tensor::cat(&[&logits, &sinks_bhq1], D::Minus1)?; // (b, h, q, k+1)
 
-    if let Some(sinks_t) = sinks {
-        let lse = logits.log_sum_exp(D::Minus1)?; // (b,h,q)
-        let scale = sinks_scale_from_lse(&lse, sinks_t)?; // (b,h,q)
-        let scale = scale.transpose(1, 2)?.unsqueeze(D::Minus1)?; // (b,q,h,1)
-        let (_, qlen, h, d) = o_bqhd.dims4()?;
-        let scale = scale.broadcast_as((b, qlen, h, d))?;
-        o_bqhd = (o_bqhd.to_dtype(DType::F32)? * &scale)?.to_dtype(in_dtype)?;
+        // Max normalization
+        let max_vals = combined_logits.max_keepdim(D::Minus1)?;
+        let combined_logits = combined_logits.broadcast_sub(&max_vals)?;
+
+        // Softmax on combined
+        let probs = candle_nn::ops::softmax_last_dim(&combined_logits)?; // (b, h, q, k+1)
+
+        // Drop the sink probability
+        let scores = probs.narrow(D::Minus1, 0, klen)?; // (b, h, q, k)
+
+        let o_bhqd = scores.matmul(&v_bhkd.contiguous()?)?; // (b, h, q, d)
+        o_bhqd.transpose(1, 2)?.to_dtype(in_dtype)? // (b, q, h, d)
     } else {
-        o_bqhd = o_bqhd.to_dtype(in_dtype)?;
-    }
+        let att = candle_nn::ops::softmax_last_dim(&logits)?;
+        let o_bhqd = att.matmul(&v_bhkd.contiguous()?)?;
+        o_bhqd.transpose(1, 2)?.to_dtype(in_dtype)?
+    };
 
     Ok(o_bqhd)
 }

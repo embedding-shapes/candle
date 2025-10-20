@@ -1,7 +1,7 @@
 use anyhow::{bail, Context as _, Result};
 use clap::Parser;
 
-use candle::{DType, IndexOp, Tensor};
+use candle::{DType, IndexOp, Module, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::gpt_oss::config::GptOssConfig;
@@ -149,6 +149,15 @@ fn main() -> Result<()> {
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, &device)? };
     let mut model = GptOssModel::load(vb, &cfg).context("failed to load GPT-OSS model weights")?;
 
+    // Debug: check lm_head weights
+    {
+        let w = model.lm_head.weight();
+        let row0 = w.i(0)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        let row_ch = w.i(200005)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        eprintln!("lm_head[0, :8] = {:?}", &row0[..8]);
+        eprintln!("lm_head[200005, :8] = {:?}", &row_ch[..8]);
+    }
+
     // Load tokenizer for decoding and inspection.
     let tok_path = snapshot_dir.join("tokenizer.json");
     let hf_tok = tokenizers::Tokenizer::from_file(&tok_path)
@@ -232,8 +241,16 @@ fn main() -> Result<()> {
         let logits = model.forward(&t, context_index)?; // (1, context_size, vocab)
         let last = logits.i((0, context_size - 1))?; // (vocab)
         if step == 0 {
+            // Debug: check hidden states at various points
+            // Get hidden right before lm_head (after final norm)
+            let hidden_post_norm = model.forward_last_hidden_post_norm(&t, context_index)?;
+            let hn_vec = hidden_post_norm.to_vec1::<f32>()?;
+            eprintln!("  Hidden (after final norm) last token [:8]: {:?}", &hn_vec[..8]);
+        }
+        if step == 0 {
             // Inspect the top-10 candidates for the first generated token
             let last_f32 = last.to_dtype(DType::F32)?;
+            let logits_vec = last_f32.to_vec1::<f32>()?;
             let probs = candle_nn::ops::softmax_last_dim(&last_f32)?;
             let v = probs.to_vec1::<f32>()?;
             let mut idx: Vec<usize> = (0..v.len()).collect();
@@ -241,6 +258,9 @@ fn main() -> Result<()> {
             let topn = 10usize.min(idx.len());
             let tok_path = snapshot_dir.join("tokenizer.json");
             if let Ok(tk) = tokenizers::Tokenizer::from_file(&tok_path) {
+                if let Some(ch_id) = tk.token_to_id("<|channel|>") {
+                    println!("  RAW: '<|channel|>' id={} logit={:.6}", ch_id, logits_vec[ch_id as usize]);
+                }
                 println!("top-10 next-token candidates:");
                 for &i in &idx[..topn] {
                     let id = i as u32;
