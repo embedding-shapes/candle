@@ -49,8 +49,10 @@ fn yarn_reference_cos_sin(
     // Per-position frequencies
     let t = Tensor::new(pos as f32, dev)?.reshape((1, 1))?; // (1,1)
     let freqs = t.matmul(&inv_freq)?; // (1,dim/2)
-    let sin = freqs.sin()?.to_dtype(DType::F32)?; // no amplitude scaling here
-    let cos = freqs.cos()?.to_dtype(DType::F32)?;
+    // Apply HF-style YARN attention scaling directly to tables.
+    let mscale = if factor <= 1.0 { 1.0 } else { 0.1 * factor.ln() + 1.0 };
+    let sin = (freqs.sin()? * mscale as f64)?.to_dtype(DType::F32)?;
+    let cos = (freqs.cos()? * mscale as f64)?.to_dtype(DType::F32)?;
     Ok((cos, sin))
 }
 
