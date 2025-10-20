@@ -2580,6 +2580,21 @@ extern "C" __global__ void dequant_mxfp4_to_bf16(
     out[out_index] = __float2bfloat16(v);
 }
 
+// Simple MXFP4 unpack utility: split each input byte into high/low 4-bit nibbles.
+// This is used for micro-verification of nibble order and downstream mapping.
+extern "C" __global__ void mxfp4_unpack(
+    const uint8_t* __restrict__ in, // [n]
+    uint8_t* __restrict__ hi,       // [n]
+    uint8_t* __restrict__ lo,       // [n]
+    const int n                     // number of bytes
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const uint8_t v = in[idx];
+    hi[idx] = v >> 4;
+    lo[idx] = v & 0x0f;
+}
+
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 
