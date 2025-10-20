@@ -3,11 +3,13 @@ use super::experts::{ExpertMlp, GptOssExperts};
 use super::{load_expert_linear_mxfp4_grouped, load_linear_maybe_mxfp4, select_attn_mode_for_layer, AttnMode};
 use crate::models::with_tracing::{linear, Embedding, RmsNorm};
 use crate::models::gpt_oss::rotary::{GptOssRopeConfig, GptOssRotaryEmbedding};
-use candle::{DType, Device, Module, Result, Tensor};
+use candle::{DType, Device, Module, Result, Tensor, IndexOp};
 use candle_nn::VarBuilder;
 
 // Constants
 const DEFAULT_RMS_EPS: f64 = 1e-5;
+const ENV_KEEP_RMS_FP32: &str = "CANDLE_RMS_FP32"; // truthy => compute RMSNorm in f32 then cast back
+const ENV_DUMP_L1: &str = "CANDLE_DUMP_L1"; // truthy => dump first-layer debug vectors
 
 #[derive(Debug, Clone)]
 pub struct GptOssAttentionWeights {
@@ -46,12 +48,17 @@ impl GptOssModel {
         let dev = vb.device().clone();
         let head_dim = cfg.head_dim();
         let hidden = cfg.hidden_size;
+        // Toggle for safe f32 compute in RMSNorm to mirror HF _keep_in_fp32_modules.
+        let keep_rms_in_fp32 = match std::env::var(ENV_KEEP_RMS_FP32).ok().as_deref() {
+            Some("0") | Some("false") | Some("FALSE") => false,
+            _ => true,
+        };
 
         // Embedding and pre/post norms
         let embed = Embedding::new(cfg.vocab_size, hidden, vb_bf16.pp("model.embed_tokens"))?;
         let norm = {
             let eps = cfg.rms_norm_eps.unwrap_or(DEFAULT_RMS_EPS);
-            RmsNorm::new(hidden, eps, vb_bf16.pp("model.norm"))?
+            RmsNorm::new_with_mode(hidden, eps, vb_bf16.pp("model.norm"), keep_rms_in_fp32)?
         };
         
         // Rotary (YARN) configuration
@@ -159,10 +166,10 @@ impl GptOssModel {
                 }
                 GptOssExperts::new(router.clone(), all, Some(cfg.num_experts_per_tok))
             };
-            // Per-layer norms
+            // Per-layer norms (optionally keep compute in f32 for stability)
             let eps = cfg.rms_norm_eps.unwrap_or(DEFAULT_RMS_EPS);
-            let input_layernorm = RmsNorm::new(hidden, eps, vb_bf16.pp(&format!("model.layers.{i}.input_layernorm")))?;
-            let post_attention_layernorm = RmsNorm::new(hidden, eps, vb_bf16.pp(&format!("model.layers.{i}.post_attention_layernorm")))?;
+            let input_layernorm = RmsNorm::new_with_mode(hidden, eps, vb_bf16.pp(&format!("model.layers.{i}.input_layernorm")), keep_rms_in_fp32)?;
+            let post_attention_layernorm = RmsNorm::new_with_mode(hidden, eps, vb_bf16.pp(&format!("model.layers.{i}.post_attention_layernorm")), keep_rms_in_fp32)?;
 
             layers.push(GptOssLayerWeights { attn, input_layernorm, post_attention_layernorm, router, experts });
         }
@@ -217,24 +224,32 @@ impl GptOssModel {
         let head_dim = self.cfg.head_dim();
         let n_q = self.cfg.num_attention_heads;
         let n_kv = self.cfg.num_key_value_heads;
-        // Apply YARN attention scaling in the score path. We follow the variant where
-        // sin/cos tables are unscaled and only the attention softmax scale is multiplied
-        // by mscale^2. Do not also scale sin/cos to avoid double-application.
-        let yarn_mscale = {
-            let factor = self
-                .cfg
-                .rope_scaling
-                .as_ref()
-                .and_then(|r| r.factor)
-                .unwrap_or(1.0);
-            crate::models::gpt_oss::rotary::yarn_get_mscale(factor)
-        };
-        let softmax_scale = (1.0f32 / (head_dim as f32).sqrt()) * (yarn_mscale * yarn_mscale);
+        // Attention softmax scaling: match HF reference behavior for GPT-OSS/YARN.
+        // The Python implementation applies any YARN scaling via the rotary cos/sin path
+        // (attention_scaling returned by ROPE_INIT_FUNCTIONS), which for the GPT-OSS
+        // "yarn" variant is effectively 1.0. Therefore, we must NOT multiply the
+        // softmax scale by an additional mscale^2 here, as that would over-scale
+        // attention logits and cause parity mismatches.
+        // Keep the standard 1/sqrt(head_dim) scale only.
+        let softmax_scale = 1.0f32 / (head_dim as f32).sqrt();
         
 
+        let dump_l1 = matches!(std::env::var(ENV_DUMP_L1).ok().as_deref(), Some("1") | Some("true") | Some("TRUE"));
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            // Pre-attention norm
+            // Pre-attention norm (compute in f32 for stability, then cast back)
             let x_norm = layer.input_layernorm.forward(&xs)?; // (b,t,h)
+            if dump_l1 && i == 0 {
+                // Dump the last-token vector (post-norm) for debugging parity.
+                let last = x_norm.i((0, t - 1))?.to_dtype(DType::F32)?; // (h)
+                let v = last.to_vec1::<f32>()?;
+                let take = v.iter().take(8).copied().collect::<Vec<_>>();
+                let mean = v.iter().copied().sum::<f32>() / (v.len() as f32);
+                let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / (v.len() as f32);
+                eprintln!(
+                    "[L1] post-norm last-token: len={} first8={:?} mean={:.6} std={:.6}",
+                    v.len(), take, mean, var.sqrt()
+                );
+            }
 
             // Projections
             let q = x_norm.apply(&layer.attn.q_proj)?; // (b,t,n_q*hd)
@@ -314,6 +329,17 @@ impl GptOssModel {
             let y = y.reshape((b, t, n_q * head_dim))?;
             let y = y.apply(&layer.attn.o_proj)?; // (b,t,h)
             xs = (xs + y)?;
+            if dump_l1 && i == 0 {
+                let last = xs.i((0, t - 1))?.to_dtype(DType::F32)?; // (h)
+                let v = last.to_vec1::<f32>()?;
+                let take = v.iter().take(8).copied().collect::<Vec<_>>();
+                let mean = v.iter().copied().sum::<f32>() / (v.len() as f32);
+                let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / (v.len() as f32);
+                eprintln!(
+                    "[L1] post-attn-residual last-token: len={} first8={:?} mean={:.6} std={:.6}",
+                    v.len(), take, mean, var.sqrt()
+                );
+            }
 
             // Post-attention norm + MoE MLP
             let x_norm2 = layer.post_attention_layernorm.forward(&xs)?; // (b,t,h)
@@ -321,7 +347,7 @@ impl GptOssModel {
             xs = (xs + mlp_out)?;
         }
 
-        // Final norm and lm head
+        // Final norm and lm head (norm in f32, then cast back)
         let xs = self.norm.forward(&xs)?; // (b,t,h)
         let xs2 = xs.reshape(((), hidden))?;
         let logits = xs2.apply(&self.lm_head)?.reshape((b, t, self.cfg.vocab_size))?;
