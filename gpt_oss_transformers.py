@@ -16,6 +16,7 @@ SNAPSHOT_DIR = Path(
 MODEL_INDEX_FILE = "model.safetensors.index.json"
 MAX_NEW_TOKENS = 200
 TEMPERATURE = 1.0
+ENV_DUMP_L1 = "CANDLE_DUMP_L1"  # truthy => dump first-layer debug vectors (parity with Rust)
 
 
 def load_local_safetensors(snapshot: Path) -> List[Path]:
@@ -115,6 +116,7 @@ def main() -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
     print(f"Device set to use {device}")
+    print(f"dtype: {'bf16' if dtype == torch.bfloat16 else 'f16'}")
 
     # Print snapshot + shards summary
     print(f"Snapshot: {SNAPSHOT_DIR}")
@@ -168,6 +170,15 @@ def main() -> None:
     except Exception:
         first32_dec = "<decode-error>"
     print(f"first 32 decode: {first32_dec}")
+    # Full prompt tokens and decode for strict parity with Rust
+    print(f"prompt token ids: {input_ids}")
+    try:
+        full_dec = tk_fast.decode(input_ids, skip_special_tokens=False)
+    except Exception:
+        full_dec = "<decode-error>"
+    tail_check = "<|start|>assistant<|channel|>final<|message|>"
+    print(f"prompt tail contains '{tail_check}': {tail_check in full_dec}")
+    print(f"prompt decode: {full_dec}")
 
     # Stop tokens
     stop_ids = load_stop_token_ids(SNAPSHOT_DIR)
@@ -180,6 +191,72 @@ def main() -> None:
         str(SNAPSHOT_DIR), torch_dtype=dtype, device_map={"": 0}, local_files_only=True
     )
     model.eval()
+
+    # Optional: synchronized first-layer debug hooks (post-norm and post-attn-residual)
+    def _truthy_env(name: str) -> bool:
+        v = os.environ.get(name)
+        return v is not None and v.lower() in ("1", "true", "yes")
+
+    if _truthy_env(ENV_DUMP_L1):
+        printed = {"post_norm": False, "post_attn_resid": False}
+        residual_holder: dict[str, torch.Tensor] = {}
+
+        def _print_vec(tag: str, vec: torch.Tensor) -> None:
+            v = vec.detach().float().cpu().numpy().tolist()
+            first8 = v[:8]
+            if len(v) == 0:
+                mean = 0.0
+                std = 0.0
+            else:
+                m = sum(v) / float(len(v))
+                var = sum((x - m) * (x - m) for x in v) / float(len(v))
+                mean, std = m, var ** 0.5
+            print(
+                f"[L1] {tag}: len={len(v)} first8={first8} mean={mean:.6f} std={std:.6f}"
+            )
+
+        # Hook: post-norm vector from the first layer's input_layernorm
+        ln0 = model.model.layers[0].input_layernorm  # type: ignore[attr-defined]
+
+        def _ln_hook(_m, _inp, out):
+            if printed["post_norm"]:
+                return
+            try:
+                y = out  # (b, t, h)
+                last = y[0, -1, :]
+                _print_vec("post-norm last-token", last)
+            finally:
+                printed["post_norm"] = True
+
+        ln0.register_forward_hook(_ln_hook)
+
+        # Pre-hook on the first decoder layer to capture residual before attention
+        layer0 = model.model.layers[0]  # type: ignore[attr-defined]
+
+        def _layer_pre(_m, inputs):
+            # inputs: (hidden_states, ...)
+            hs = inputs[0]
+            residual_holder["resid"] = hs.detach()
+
+        layer0.register_forward_pre_hook(_layer_pre)
+
+        # Hook on the first layer's self-attention to capture attention output (after o_proj)
+        attn0 = model.model.layers[0].self_attn  # type: ignore[attr-defined]
+
+        def _attn_hook(_m, _inp, out):
+            if printed["post_attn_resid"]:
+                return
+            try:
+                attn_out = out[0] if isinstance(out, (tuple, list)) else out  # (b, t, h)
+                resid = residual_holder.get("resid")
+                if resid is None:
+                    return
+                vec = (resid + attn_out)[0, -1, :]
+                _print_vec("post-attn-residual last-token", vec)
+            finally:
+                printed["post_attn_resid"] = True
+
+        attn0.register_forward_hook(_attn_hook)
 
     # Top-10 next-token candidates at step 0
     with torch.no_grad():

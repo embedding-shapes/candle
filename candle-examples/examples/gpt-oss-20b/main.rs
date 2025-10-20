@@ -56,12 +56,13 @@ fn main() -> Result<()> {
         dtype = DType::BF16;
     }
 
-    // Debug: device + snapshot
+    // Debug: device + dtype + snapshot
     if device.is_cuda() {
         println!("Device set to use cuda:0");
     } else {
         println!("Device set to use {:?}", device);
     }
+    println!("dtype: {}", match dtype { DType::BF16 => "bf16", DType::F16 => "f16", _ => "other" });
     println!("Snapshot: {}", snapshot_dir.display());
 
     // Conversation: one user message. Render via the model's chat_template.jinja and
