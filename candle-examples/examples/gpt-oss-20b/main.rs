@@ -73,15 +73,25 @@ fn main() -> Result<()> {
     );
     let mut tokens: Vec<u32> = render_then_encode(&snapshot_dir, &[user_msg], true)
         .context("failed to render+encode with chat_template.jinja + tokenizer.json")?;
+    // Dump both the first 32 and the full set of prompt tokens for exact parity inspection.
     println!("first 32 token ids: {:?}", &tokens.iter().take(32).copied().collect::<Vec<_>>());
+    println!("prompt token ids: {:?}", &tokens);
     let ids_u32: Vec<u32> = tokens.iter().take(32).copied().collect();
     let tok_path = snapshot_dir.join("tokenizer.json");
+    // Decode and verify the tail of the prompt includes the assistant header markers.
     match tokenizers::Tokenizer::from_file(&tok_path) {
         Ok(hf_tok) => match hf_tok.decode(&ids_u32, /*skip_special_tokens=*/ false) {
             Ok(s) => println!("first 32 decode: {}", s),
             Err(_) => println!("first 32 decode: <decode-error>"),
         },
         Err(_) => println!("first 32 decode: <tokenizer-load-error>"),
+    }
+    if let Ok(hf_tok_full) = tokenizers::Tokenizer::from_file(&tok_path) {
+        if let Ok(full_dec) = hf_tok_full.decode(&tokens, /*skip_special_tokens=*/ false) {
+            let tail_check = "<|start|>assistant<|channel|>final<|message|>";
+            let has_tail = full_dec.contains(tail_check);
+            println!("prompt tail contains '{}': {}", tail_check, has_tail);
+        }
     }
 
     // Load GPT-OSS config from the local snapshot.
