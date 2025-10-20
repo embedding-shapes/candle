@@ -15,6 +15,28 @@ fn expand_tilde(p: &str) -> std::io::Result<std::path::PathBuf> {
     }
 }
 
+fn hub_load_local_safetensors<P: AsRef<std::path::Path>>(
+    path: P,
+    json_file: &str,
+) -> candle::Result<Vec<std::path::PathBuf>> {
+    let path = path.as_ref();
+    let jsfile = std::fs::File::open(path.join(json_file))?;
+    let json: serde_json::Value = serde_json::from_reader(&jsfile).map_err(candle::Error::wrap)?;
+    let weight_map = match json.get("weight_map") {
+        None => candle::bail!("no weight map in {json_file:?}"),
+        Some(serde_json::Value::Object(map)) => map,
+        Some(_) => candle::bail!("weight map in {json_file:?} is not a map"),
+    };
+    let mut safetensors_files = std::collections::HashSet::new();
+    for value in weight_map.values() {
+        if let Some(file) = value.as_str() {
+            safetensors_files.insert(file);
+        }
+    }
+    let safetensors_files: Vec<_> = safetensors_files.into_iter().map(|v| path.join(v)).collect();
+    Ok(safetensors_files)
+}
+
 #[test]
 fn gpt_oss_embedding_rows_match_lm_head() -> Result<(), Box<dyn std::error::Error>> {
     let snap = expand_tilde(SNAPSHOT_DIR)?;
@@ -27,7 +49,7 @@ fn gpt_oss_embedding_rows_match_lm_head() -> Result<(), Box<dyn std::error::Erro
     // Load config for shapes and verify loading succeeds with those shapes.
     let cfg: GptOssConfig = serde_json::from_slice(&std::fs::read(snap.join("config.json"))?)?;
 
-    let model_files = candle_examples::hub_load_local_safetensors(&snap, INDEX_FILE)?;
+    let model_files = hub_load_local_safetensors(&snap, INDEX_FILE)?;
     if model_files.is_empty() {
         eprintln!("no shards — skipping");
         return Ok(());
@@ -43,4 +65,3 @@ fn gpt_oss_embedding_rows_match_lm_head() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(lm.dtype(), DType::BF16);
     Ok(())
 }
-
