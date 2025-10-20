@@ -159,15 +159,14 @@ pub fn hub_load_local_safetensors<P: AsRef<std::path::Path>>(
         Some(serde_json::Value::Object(map)) => map,
         Some(_) => candle::bail!("weight map in {json_file:?} is not a map"),
     };
-    let mut safetensors_files = std::collections::HashSet::new();
-    for value in weight_map.values() {
-        if let Some(file) = value.as_str() {
-            safetensors_files.insert(file);
-        }
+    // Collect shard filenames deterministically in sorted order to avoid
+    // non‑reproducible file ordering from HashSet iteration. The union
+    // loader merges per‑file headers and “last wins” semantics can depend
+    // on input order when there are collisions, so keep ordering stable.
+    let mut uniq: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for v in weight_map.values() {
+        if let Some(s) = v.as_str() { uniq.insert(s); }
     }
-    let safetensors_files: Vec<_> = safetensors_files
-        .into_iter()
-        .map(|v| path.join(v))
-        .collect();
+    let safetensors_files: Vec<_> = uniq.into_iter().map(|v| path.join(v)).collect();
     Ok(safetensors_files)
 }

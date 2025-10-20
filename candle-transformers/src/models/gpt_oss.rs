@@ -747,6 +747,535 @@ pub mod model {
             let logits = logits_bt_v.reshape((b, t, vocab))?;
             Ok(logits)
         }
+
+        /// Runs the full forward pass up to (and including) the final RMSNorm and
+        /// returns the last-token hidden vector (post-norm, pre-lm_head) as f32.
+        /// Shape: (hidden_size)
+        pub fn forward_last_hidden_post_norm(
+            &mut self,
+            input_ids: &Tensor,
+            seqlen_offset: usize,
+        ) -> Result<Tensor> {
+            let mut xs = self.embed.forward(input_ids)?; // (b, t, h)
+            let (b, t, _hidden) = xs.dims3()?;
+            let head_dim = self.cfg.head_dim();
+            let n_q = self.cfg.num_attention_heads;
+            let n_kv = self.cfg.num_key_value_heads;
+            let softmax_scale = {
+                let base = 1.0f32 / (head_dim as f32).sqrt();
+                match std::env::var("CANDLE_YARN_MODE").ok().as_deref() {
+                    Some("softmax") => self.rope.attention_factor() * base,
+                    _ => base,
+                }
+            };
+
+            for (i, layer) in self.layers.iter_mut().enumerate() {
+                let x_norm = layer.input_layernorm.forward(&xs)?;
+
+                let q = x_norm.apply(&layer.attn.q_proj)?;
+                let k = x_norm.apply(&layer.attn.k_proj)?;
+                let v = x_norm.apply(&layer.attn.v_proj)?;
+
+                let q = q.reshape((b, t, n_q, head_dim))?;
+                let k = k.reshape((b, t, n_kv, head_dim))?;
+                let v = v.reshape((b, t, n_kv, head_dim))?;
+
+                let q_bhtd = q.transpose(1, 2)?;
+                let k_bhtd = k.transpose(1, 2)?;
+                let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+                let q = q_bhtd.transpose(1, 2)?;
+                let k_step = k_bhtd;
+                let v_step = v.transpose(1, 2)?;
+
+                // Append to KV cache and build repeated K/V for multi-query attention.
+                let (k_all, v_all) = self.kv_caches[i].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
+                let n_rep = n_q / n_kv;
+                let k_rep = crate::utils::repeat_kv(k_all.clone(), n_rep)?;
+                let v_rep = crate::utils::repeat_kv(v_all.clone(), n_rep)?;
+                let k_btkhd = k_rep.transpose(1, 2)?;
+                let v_btkhd = v_rep.transpose(1, 2)?;
+
+                let attn_mode = super::select_attn_mode_for_layer(
+                    &super::GptOssConfigMinimal {
+                        num_hidden_layers: self.cfg.num_hidden_layers,
+                        layer_types: self.cfg.effective_layer_types(),
+                        max_position_embeddings: self.cfg.max_position_embeddings,
+                        sliding_window: self.cfg.sliding_window,
+                    },
+                    i,
+                );
+
+                let sinks = if matches!(
+                    std::env::var("CANDLE_DISABLE_SINKS").ok().as_deref(),
+                    Some("1") | Some("true") | Some("TRUE")
+                ) {
+                    None
+                } else {
+                    Some(&layer.attn.sinks)
+                };
+
+                #[cfg(feature = "flash-attn")]
+                let y = {
+                    let use_fa = !matches!(
+                        std::env::var("CANDLE_DISABLE_FLASH").ok().as_deref(),
+                        Some("1") | Some("true") | Some("TRUE")
+                    );
+                    if use_fa {
+                        match attn_mode {
+                            super::AttnMode::Full => super::flash_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                            super::AttnMode::Sliding { left, right } => super::flash_attn_windowed_with_sinks(
+                                &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
+                            )?,
+                        }
+                    } else {
+                        match attn_mode {
+                            super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                            super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(
+                                &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
+                            )?,
+                        }
+                    }
+                };
+                #[cfg(not(feature = "flash-attn"))]
+                let y = {
+                    match attn_mode {
+                        super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                        super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(
+                            &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
+                        )?,
+                    }
+                };
+
+                let y = y.reshape((b, t, n_q * head_dim))?;
+                let y = y.apply(&layer.attn.o_proj)?;
+                xs = (xs + y)?;
+
+                let x_norm2 = layer.post_attention_layernorm.forward(&xs)?;
+                let mlp_out = layer.experts.forward(&x_norm2)?;
+                xs = (xs + mlp_out)?;
+            }
+
+            let xs = self.norm.forward(&xs)?; // (b, t, h)
+            let last = xs.i((0, t - 1))?; // (h)
+            let last_f32 = last.to_dtype(candle::DType::F32)?;
+            Ok(last_f32)
+        }
+
+        /// Collects the per-layer last-token states used for bisection at step 0.
+        /// Returns a tensor of shape (1 + 3*L, H) float32 on CPU with rows:
+        ///  [h0,
+        ///   pre_attn_norm(l0), post_attn_resid(l0), post_mlp_resid(l0),
+        ///   ... repeated for each layer ...]
+        pub fn debug_collect_layer_states_last_token(
+            &mut self,
+            input_ids: &Tensor,
+            seqlen_offset: usize,
+        ) -> Result<Tensor> {
+            let mut xs = self.embed.forward(input_ids)?; // (b, t, h)
+            let (b, t, _hidden) = xs.dims3()?;
+            let head_dim = self.cfg.head_dim();
+            let n_q = self.cfg.num_attention_heads;
+            let n_kv = self.cfg.num_key_value_heads;
+            let softmax_scale = {
+                let base = 1.0f32 / (head_dim as f32).sqrt();
+                match std::env::var("CANDLE_YARN_MODE").ok().as_deref() {
+                    Some("softmax") => self.rope.attention_factor() * base,
+                    _ => base,
+                }
+            };
+
+            let mut rows: Vec<Tensor> = Vec::with_capacity(1 + 3 * self.cfg.num_hidden_layers);
+            // h0
+            rows.push(xs.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?);
+
+            for (i, layer) in self.layers.iter_mut().enumerate() {
+                // pre_attn_norm
+                let x_norm = layer.input_layernorm.forward(&xs)?;
+                rows.push(x_norm.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?);
+
+                // attention
+                let q = x_norm.apply(&layer.attn.q_proj)?;
+                let k = x_norm.apply(&layer.attn.k_proj)?;
+                let v = x_norm.apply(&layer.attn.v_proj)?;
+                let q = q.reshape((b, t, n_q, head_dim))?;
+                let k = k.reshape((b, t, n_kv, head_dim))?;
+                let v = v.reshape((b, t, n_kv, head_dim))?;
+                let q_bhtd = q.transpose(1, 2)?;
+                let k_bhtd = k.transpose(1, 2)?;
+                let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+                let q = q_bhtd.transpose(1, 2)?;
+                let k_step = k_bhtd;
+                let v_step = v.transpose(1, 2)?;
+                let (k_all, v_all) = self.kv_caches[i].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
+                let n_rep = n_q / n_kv;
+                let k_rep = crate::utils::repeat_kv(k_all.clone(), n_rep)?;
+                let v_rep = crate::utils::repeat_kv(v_all.clone(), n_rep)?;
+                let k_btkhd = k_rep.transpose(1, 2)?;
+                let v_btkhd = v_rep.transpose(1, 2)?;
+                let attn_mode = super::select_attn_mode_for_layer(
+                    &super::GptOssConfigMinimal {
+                        num_hidden_layers: self.cfg.num_hidden_layers,
+                        layer_types: self.cfg.effective_layer_types(),
+                        max_position_embeddings: self.cfg.max_position_embeddings,
+                        sliding_window: self.cfg.sliding_window,
+                    },
+                    i,
+                );
+                let sinks = if matches!(
+                    std::env::var("CANDLE_DISABLE_SINKS").ok().as_deref(),
+                    Some("1") | Some("true") | Some("TRUE")
+                ) { None } else { Some(&layer.attn.sinks) };
+                #[cfg(feature = "flash-attn")]
+                let y = {
+                    let use_fa = !matches!(
+                        std::env::var("CANDLE_DISABLE_FLASH").ok().as_deref(),
+                        Some("1") | Some("true") | Some("TRUE")
+                    );
+                    if use_fa {
+                        match attn_mode {
+                            super::AttnMode::Full => super::flash_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                            super::AttnMode::Sliding { left, right } => super::flash_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                        }
+                    } else {
+                        match attn_mode {
+                            super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                            super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                        }
+                    }
+                };
+                #[cfg(not(feature = "flash-attn"))]
+                let y = {
+                    match attn_mode {
+                        super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                        super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                    }
+                };
+                let y = y.reshape((b, t, n_q * head_dim))?;
+                let y = y.apply(&layer.attn.o_proj)?;
+                xs = (xs + y)?;
+
+                // post_attn_resid
+                rows.push(xs.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?);
+
+                // MLP
+                let x_norm2 = layer.post_attention_layernorm.forward(&xs)?;
+                let mlp_out = layer.experts.forward(&x_norm2)?;
+                xs = (xs + mlp_out)?;
+
+                // post_mlp_resid
+                rows.push(xs.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?);
+            }
+
+            // Stack rows along a new leading dimension -> (1+3L, H)
+            let rows: Vec<&Tensor> = rows.iter().collect();
+            let out = Tensor::stack(&rows, 0)?;
+            Ok(out)
+        }
+
+        /// Debug helper for layer-0 attention: returns last-token Q/K/V after projections
+        /// and Q/K after RoPE application (all as f32 on CPU) along with the softmax
+        /// scale actually used and the selected attention mode parameters.
+        /// Shapes:
+        ///   - q_pre: (n_q, head_dim)
+        ///   - k_pre: (n_kv, head_dim)
+        ///   - v_pre: (n_kv, head_dim)
+        ///   - q_rope: (n_q, head_dim)
+        ///   - k_rope: (n_kv, head_dim)
+        pub fn debug_l0_qkv_last_token(
+            &mut self,
+            input_ids: &Tensor,
+            seqlen_offset: usize,
+        ) -> Result<(
+            Tensor, // q_pre
+            Tensor, // k_pre
+            Tensor, // v_pre
+            Tensor, // q_rope
+            Tensor, // k_rope
+            f32,    // softmax_scale
+            super::AttnMode,
+        )> {
+            let xs = self.embed.forward(input_ids)?; // (b,t,h)
+            let (b, t, _h) = xs.dims3()?;
+            let head_dim = self.cfg.head_dim();
+            let n_q = self.cfg.num_attention_heads;
+            let n_kv = self.cfg.num_key_value_heads;
+
+            // Compute softmax scale according to YaRN placement.
+            let softmax_scale = {
+                let base = 1.0f32 / (head_dim as f32).sqrt();
+                match std::env::var("CANDLE_YARN_MODE").ok().as_deref() {
+                    Some("softmax") => self.rope.attention_factor() * base,
+                    _ => base,
+                }
+            };
+
+            let layer = &mut self.layers[0];
+            let x_norm = layer.input_layernorm.forward(&xs)?; // (b,t,h)
+
+            let q_lin = x_norm.apply(&layer.attn.q_proj)?; // (b,t,n_q*hd)
+            let k_lin = x_norm.apply(&layer.attn.k_proj)?; // (b,t,n_kv*hd)
+            let v_lin = x_norm.apply(&layer.attn.v_proj)?; // (b,t,n_kv*hd)
+
+            let q = q_lin.reshape((b, t, n_q, head_dim))?;
+            let k = k_lin.reshape((b, t, n_kv, head_dim))?;
+            let v = v_lin.reshape((b, t, n_kv, head_dim))?;
+
+            // Last token slices pre-RoPE, shape (b, n_h, d)
+            let q_last_bhd = q.i((0..b, t - 1, 0..n_q, 0..head_dim))?;
+            let k_last_bhd = k.i((0..b, t - 1, 0..n_kv, 0..head_dim))?;
+            let v_last_bhd = v.i((0..b, t - 1, 0..n_kv, 0..head_dim))?;
+
+            // Transpose to (b, h, t, d) to apply RoPE as in the forward
+            let q_bhtd = q.transpose(1, 2)?;
+            let k_bhtd = k.transpose(1, 2)?;
+            let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+
+            // Grab last token after RoPE: (b,h,d)
+            let q_rope_last_bhd = q_bhtd.i((0..b, 0..n_q, t - 1, 0..head_dim))?;
+            let k_rope_last_bhd = k_bhtd.i((0..b, 0..n_kv, t - 1, 0..head_dim))?;
+
+            // Squeeze batch dimension and move to CPU f32 for easy inspection.
+            let to_cpu_f32 = |t: Tensor| -> Result<Tensor> {
+                t.squeeze(0)?.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)
+            };
+            let q_pre = to_cpu_f32(q_last_bhd)?; // (n_q, d)
+            let k_pre = to_cpu_f32(k_last_bhd)?; // (n_kv, d)
+            let v_pre = to_cpu_f32(v_last_bhd)?; // (n_kv, d)
+            let q_rope = to_cpu_f32(q_rope_last_bhd)?; // (n_q, d)
+            let k_rope = to_cpu_f32(k_rope_last_bhd)?; // (n_kv, d)
+
+            let attn_mode = super::select_attn_mode_for_layer(
+                &super::GptOssConfigMinimal {
+                    num_hidden_layers: self.cfg.num_hidden_layers,
+                    layer_types: self.cfg.effective_layer_types(),
+                    max_position_embeddings: self.cfg.max_position_embeddings,
+                    sliding_window: self.cfg.sliding_window,
+                },
+                0,
+            );
+
+            Ok((q_pre, k_pre, v_pre, q_rope, k_rope, softmax_scale, attn_mode))
+        }
+
+        /// Debug: return the sinks vector for layer 0 as f32 on CPU.
+        pub fn debug_l0_sinks(&self) -> Result<Tensor> {
+            let s = &self.layers[0].attn.sinks;
+            s.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)
+        }
+
+        /// Debug: return (q,k,v) projection weights for layer 0 as f32 on CPU.
+        pub fn debug_l0_qkv_weights(&self) -> Result<(Tensor, Tensor, Tensor)> {
+            let q = self.layers[0].attn.q_proj.weight().to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
+            let k = self.layers[0].attn.k_proj.weight().to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
+            let v = self.layers[0].attn.v_proj.weight().to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
+            Ok((q, k, v))
+        }
+
+        /// Debug: compute attention output at layer 0 for the whole sequence
+        /// and return the last-token vector both before and after the o_proj.
+        /// Returns (pre_o_proj: (n_q*head_dim), post_o_proj: (hidden)) as f32 on CPU.
+        pub fn debug_l0_attn_last_token(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<(Tensor, Tensor)> {
+            let xs0 = self.embed.forward(input_ids)?; // (b,t,h)
+            let (b, t, _h) = xs0.dims3()?;
+            let head_dim = self.cfg.head_dim();
+            let n_q = self.cfg.num_attention_heads;
+            let n_kv = self.cfg.num_key_value_heads;
+            let softmax_scale = {
+                let base = 1.0f32 / (head_dim as f32).sqrt();
+                match std::env::var("CANDLE_YARN_MODE").ok().as_deref() {
+                    Some("softmax") => self.rope.attention_factor() * base,
+                    _ => base,
+                }
+            };
+            let layer = &mut self.layers[0];
+            let x_norm = layer.input_layernorm.forward(&xs0)?;
+            let q = x_norm.apply(&layer.attn.q_proj)?;
+            let k = x_norm.apply(&layer.attn.k_proj)?;
+            let v = x_norm.apply(&layer.attn.v_proj)?;
+            let q = q.reshape((b, t, n_q, head_dim))?;
+            let k = k.reshape((b, t, n_kv, head_dim))?;
+            let v = v.reshape((b, t, n_kv, head_dim))?;
+            let q_bhtd = q.transpose(1, 2)?;
+            let k_bhtd = k.transpose(1, 2)?;
+            let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+            let q = q_bhtd.transpose(1, 2)?;
+            let k_step = k_bhtd;
+            let v_step = v.transpose(1, 2)?;
+            let (k_all, v_all) = self.kv_caches[0].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
+            let n_rep = n_q / n_kv;
+            let k_rep = crate::utils::repeat_kv(k_all.clone(), n_rep)?;
+            let v_rep = crate::utils::repeat_kv(v_all.clone(), n_rep)?;
+            let k_btkhd = k_rep.transpose(1, 2)?;
+            let v_btkhd = v_rep.transpose(1, 2)?;
+            let attn_mode = super::select_attn_mode_for_layer(
+                &super::GptOssConfigMinimal {
+                    num_hidden_layers: self.cfg.num_hidden_layers,
+                    layer_types: self.cfg.effective_layer_types(),
+                    max_position_embeddings: self.cfg.max_position_embeddings,
+                    sliding_window: self.cfg.sliding_window,
+                },
+                0,
+            );
+            let sinks = Some(&layer.attn.sinks);
+            #[cfg(feature = "flash-attn")]
+            let y = {
+                let use_fa = !matches!(
+                    std::env::var("CANDLE_DISABLE_FLASH").ok().as_deref(),
+                    Some("1") | Some("true") | Some("TRUE")
+                );
+                if use_fa {
+                    match attn_mode {
+                        super::AttnMode::Full => super::flash_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                        super::AttnMode::Sliding { left, right } => super::flash_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                    }
+                } else {
+                    match attn_mode {
+                        super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                        super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                    }
+                }
+            };
+            #[cfg(not(feature = "flash-attn"))]
+            let y = {
+                match attn_mode {
+                    super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
+                    super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                }
+            };
+            let y_pre = y.reshape((b, t, n_q * head_dim))?; // before o_proj
+            let y_post = y_pre.apply(&layer.attn.o_proj)?;
+            let y_pre_last = y_pre.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
+            let y_post_last = y_post.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
+            Ok((y_pre_last, y_post_last))
+        }
+
+        /// Debug helper: returns attention logits row and effective softmax weights (with sinks
+        /// renormalization applied) for the last token at layer 0 for the first `heads` heads.
+        /// Shapes returned are (heads, klen). Dtype is f32 on CPU for determinism.
+        pub fn debug_l0_attn_last_token_logits_weights(
+            &mut self,
+            input_ids: &Tensor,
+            seqlen_offset: usize,
+            heads: usize,
+        ) -> Result<(Tensor, Tensor)> {
+            let xs0 = self.embed.forward(input_ids)?; // (b,t,h)
+            let (b, t, _h) = xs0.dims3()?;
+            let head_dim = self.cfg.head_dim();
+            let n_q = self.cfg.num_attention_heads;
+            let n_kv = self.cfg.num_key_value_heads;
+            let softmax_scale = {
+                let base = 1.0f32 / (head_dim as f32).sqrt();
+                match std::env::var("CANDLE_YARN_MODE").ok().as_deref() {
+                    Some("softmax") => self.rope.attention_factor() * base,
+                    _ => base,
+                }
+            };
+            let layer = &mut self.layers[0];
+
+            // QKV + RoPE (matches main forward path)
+            let x_norm = layer.input_layernorm.forward(&xs0)?;
+            let q = x_norm.apply(&layer.attn.q_proj)?;
+            let k = x_norm.apply(&layer.attn.k_proj)?;
+            let v = x_norm.apply(&layer.attn.v_proj)?;
+            let q = q.reshape((b, t, n_q, head_dim))?;
+            let k = k.reshape((b, t, n_kv, head_dim))?;
+            let v = v.reshape((b, t, n_kv, head_dim))?;
+            let q_bhtd = q.transpose(1, 2)?; // (b,hq,t,d)
+            let k_bhtd = k.transpose(1, 2)?; // (b,hkv,t,d)
+            let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+            let q_bt_hqd = q_bhtd.transpose(1, 2)?; // (b,t,hq,d)
+            let k_step = k_bhtd; // (b,hkv,t,d)
+            let v_step = v.transpose(1, 2)?; // (b,hkv,t,d)
+
+            // KV cache append and GQA replication
+            let (k_all, _v_all) = self.kv_caches[0].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
+            let n_rep = n_q / n_kv;
+            let k_rep = crate::utils::repeat_kv(k_all.clone(), n_rep)?; // (b,hq,t,d)
+            // No need to replicate V for logits/weights dump
+            let k_btkhd = k_rep.transpose(1, 2)?; // (b,t,hq,d)
+
+            // Determine attention mode for mask semantics.
+            let attn_mode = super::select_attn_mode_for_layer(
+                &super::GptOssConfigMinimal {
+                    num_hidden_layers: self.cfg.num_hidden_layers,
+                    layer_types: self.cfg.effective_layer_types(),
+                    max_position_embeddings: self.cfg.max_position_embeddings,
+                    sliding_window: self.cfg.sliding_window,
+                },
+                0,
+            );
+
+            // Build logits = (b,h,q,k)
+            let q_bhqd = q_bt_hqd.to_dtype(DType::F32)?.transpose(1, 2)?; // (b,hq,q,d)
+            let k_bhkd = k_btkhd.to_dtype(DType::F32)?.transpose(1, 2)?; // (b,hq,k,d)
+            // v_bhkd only needed when reconstructing attn_output; not required for logits/weights dump
+            let mut logits = (q_bhqd.contiguous()?.matmul(&k_bhkd.t()?.contiguous()?)? * softmax_scale as f64)?; // (b,h,q,k)
+
+            // Apply mask (causal or sliding)
+            let (_, qlen, _, _) = q_bt_hqd.dims4()?;
+            let (_, klen, _, _) = k_btkhd.dims4()?;
+            logits = match attn_mode {
+                super::AttnMode::Full => {
+                    if qlen > 1 {
+                        let mask: Vec<u8> = (0..qlen)
+                            .flat_map(|i| (0..klen).map(move |j| u8::from(j > i)))
+                            .collect();
+                        let mask = Tensor::from_slice(&mask, (qlen, klen), logits.device())?;
+                        super::masked_fill(&logits, &mask.broadcast_as((b, n_q, qlen, klen))?, f32::NEG_INFINITY)?
+                    } else {
+                        logits
+                    }
+                }
+                super::AttnMode::Sliding { left, right } => {
+                    let left = left;
+                    let right = right;
+                    let mask: Vec<u8> = (0..qlen)
+                        .flat_map(|i| (0..klen).map(move |j| {
+                            let i = i as isize;
+                            let j = j as isize;
+                            let l = left as isize;
+                            let r = right as isize;
+                            let allow = (j > i - l) && (j <= i + r);
+                            u8::from(!allow)
+                        }))
+                        .collect();
+                    let mask = Tensor::from_slice(&mask, (qlen, klen), logits.device())?;
+                    super::masked_fill(&logits, &mask.broadcast_as((b, n_q, qlen, klen))?, f32::NEG_INFINITY)?
+                }
+            };
+
+            // Softmax weights over keys, then apply sinks renormalization to match HF semantics
+            let att = candle_nn::ops::softmax_last_dim(&logits)?; // (b,h,q,k)
+
+            // Compute scale per (b,h,q) using the same formula as forward
+            let sinks = if matches!(
+                std::env::var("CANDLE_DISABLE_SINKS").ok().as_deref(),
+                Some("1") | Some("true") | Some("TRUE")
+            ) {
+                None
+            } else {
+                Some(&layer.attn.sinks)
+            };
+
+            let scores = if let Some(sinks_t) = sinks {
+                let lse = logits.log_sum_exp(D::Minus1)?; // (b,h,q)
+                let scale = super::sinks_scale_from_lse(&lse, sinks_t)?; // (b,h,q)
+                let scale = scale.unsqueeze(D::Minus1)?; // (b,h,q,1)
+                att.to_dtype(DType::F32)?.broadcast_mul(&scale)?
+            } else {
+                att.to_dtype(DType::F32)?
+            }; // (b,h,q,k)
+
+            // Slice last-token rows for the first `heads` heads.
+            let dump_h = heads.min(n_q);
+            let logits_last = logits.i((0, 0..dump_h, qlen - 1))?; // (dump_h, klen)
+            let scores_last = scores.i((0, 0..dump_h, qlen - 1))?; // (dump_h, klen)
+
+            // Move to CPU f32 for deterministic printing/comparison.
+            let logits_last = logits_last.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
+            let scores_last = scores_last.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
+            Ok((logits_last, scores_last))
+        }
     }
 }
 

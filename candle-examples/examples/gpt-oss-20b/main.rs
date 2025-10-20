@@ -262,7 +262,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|_| String::new());
         let allow_syms = allowed_specials_for_next(&decoded_so_far);
         let mut allowed_ids: std::collections::BTreeSet<u32> = Default::default();
-        for s in allow_syms {
+        for s in allow_syms.iter() {
             if let Some(id) = hf_tok.token_to_id(s) { allowed_ids.insert(id); }
         }
         // Compute the set of disallowed special ids this step.
@@ -271,10 +271,23 @@ fn main() -> Result<()> {
             .copied()
             .filter(|id| !allowed_ids.contains(id))
             .collect();
+        // Harmony grammar: immediately after "<|start|>assistant" we must emit "<|channel|>",
+        // and immediately after "<|channel|>" we must emit "<|message|>". At those two
+        // boundary steps, disable all non-special tokens so sampling can only choose the
+        // required special token. After "<|message|>", do not force specials; free text
+        // is allowed (terminators remain allowed but not forced).
+        let must_force_special = allow_syms.contains("<|channel|>") || allow_syms.contains("<|message|>");
         let next = sampler.sample_f(&last, |prs: &mut [f32]| {
             for id in &to_mask {
                 let idx = *id as usize;
                 if idx < prs.len() { prs[idx] = 0.0; }
+            }
+            if must_force_special {
+                // Zero out all non-special tokens and any specials not explicitly allowed.
+                // Retain only the allowed special ids in `allowed_ids`.
+                for (i, p) in prs.iter_mut().enumerate() {
+                    if !allowed_ids.contains(&(i as u32)) { *p = 0.0; }
+                }
             }
         })?;
         tokens.push(next);

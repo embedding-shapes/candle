@@ -109,6 +109,8 @@ def extract_final_assistant_text_from_decoded(decoded: str) -> str | None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dump-layer-states", action="store_true", help="Dump per-layer last-token states to layers_step0_last.npy and exit")
+    parser.add_argument("--dump-final-hidden", action="store_true", help="Print JSON with last-token vectors: post_mlp_last and post_norm_last, then exit")
+    parser.add_argument("--dump-l0-qkv", action="store_true", help="Print JSON with layer-0 last-token Q/K/V (pre and post-RoPE) plus softmax scale and sinks")
     args = parser.parse_args()
     # Messages (Harmony-style content). Keep identical to Rust example.
     messages: List[Dict[str, Any]] = [
@@ -310,6 +312,146 @@ def main() -> None:
                 h.remove()
             print(json.dumps({"dump": "layers_step0_last.npy", "rows": int(arr.shape[0]), "hidden": int(arr.shape[1])}))
             return
+
+    if args.dump_final_hidden:
+        with torch.no_grad():
+            input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
+            out = model(input_ids=input_tensor, output_hidden_states=True, return_dict=True)
+            hs_last = out.hidden_states[-1]  # (1, T, H)
+            post_mlp_last = hs_last[0, -1, :].detach().float().cpu().numpy().tolist()
+            # Apply the final RMSNorm to match Candle's post-norm hidden pre-lm_head
+            post_norm_last = model.model.norm(hs_last)[0, -1, :].detach().float().cpu().numpy().tolist()  # type: ignore[attr-defined]
+            out_obj = {
+                "prompt": messages[0]["content"],
+                "dtype": "bf16" if dtype == torch.bfloat16 else "f16",
+                "device": str(device),
+                "post_mlp_last": post_mlp_last,
+                "post_norm_last": post_norm_last,
+            }
+            print(json.dumps(out_obj))
+        return
+
+    if args.dump_l0_qkv:
+        with torch.no_grad():
+            # Tokenize and embed once to replicate Candle's taps.
+            input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
+            hs0 = model.get_input_embeddings()(input_tensor)  # (1,T,H)
+            L0 = model.model.layers[0]  # type: ignore[attr-defined]
+            attn0 = L0.self_attn
+
+            H = model.config.hidden_size
+            n_q = model.config.num_attention_heads
+            n_kv = model.config.num_key_value_heads
+            hd = getattr(model.config, "head_dim", H // n_q)
+
+            # position ids and cos/sin
+            past_seen_tokens = 0
+            cache_position = torch.arange(past_seen_tokens, past_seen_tokens + hs0.shape[1], device=hs0.device)
+            position_ids = cache_position.unsqueeze(0)
+            cos, sin = model.model.rotary_emb(hs0, position_ids)  # type: ignore[attr-defined]
+
+            # Compute input layernorm then linear projections (matches forward path).
+            x_norm = L0.input_layernorm(hs0)
+            q_lin = torch.nn.functional.linear(x_norm, attn0.q_proj.weight, attn0.q_proj.bias)
+            k_lin = torch.nn.functional.linear(x_norm, attn0.k_proj.weight, attn0.k_proj.bias)
+            v_lin = torch.nn.functional.linear(x_norm, attn0.v_proj.weight, attn0.v_proj.bias)
+
+            q = q_lin.view(1, -1, n_q, hd)  # (1,T,Hq,D)
+            k = k_lin.view(1, -1, n_kv, hd)
+            v = v_lin.view(1, -1, n_kv, hd)
+
+            # Last-token slices pre-RoPE: (Hq,D), (Hkv,D)
+            q_pre = q[0, -1].detach().float().cpu()
+            k_pre = k[0, -1].detach().float().cpu()
+            v_pre = v[0, -1].detach().float().cpu()
+
+            # Post-RoPE: need (B,H,T,D) layout, apply_rotary_pos_emb, then take last token.
+            q_bhtd = q.transpose(1, 2)
+            k_bhtd = k.transpose(1, 2)
+            v_bhtd = v.transpose(1, 2)
+            from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
+
+            q_rope_bhtd, k_rope_bhtd = apply_rotary_pos_emb(q_bhtd, k_bhtd, cos, sin)
+            q_rope = q_rope_bhtd[0, :, -1, :].detach().float().cpu()
+            k_rope = k_rope_bhtd[0, :, -1, :].detach().float().cpu()
+
+            # Softmax scale and attn mode
+            softmax_scale = float(hd ** -0.5)
+            attn_type = model.config.layer_types[0] if hasattr(model.config, "layer_types") else "full_attention"
+
+            # Compute attention output for the whole sequence and take last token, pre/post o_proj
+            # Shapes to match eager_attention_forward semantics
+            from transformers.models.gpt_oss.modeling_gpt_oss import repeat_kv
+            key_states = repeat_kv(k_bhtd, attn0.num_key_value_groups)
+            value_states = repeat_kv(v_bhtd, attn0.num_key_value_groups)
+            attn_weights = torch.matmul(q_bhtd, key_states.transpose(2, 3)) * softmax_scale
+            # Build attention mask from config utilities
+            from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+            cache_position = torch.arange(0, hs0.shape[1], device=hs0.device)
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(config=model.config, input_embeds=hs0, attention_mask=None, cache_position=cache_position, past_key_values=None),
+                "sliding_attention": create_sliding_window_causal_mask(config=model.config, input_embeds=hs0, attention_mask=None, cache_position=cache_position, past_key_values=None),
+            }
+            amask = causal_mask_mapping[attn_type][:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + amask
+            sinks = attn0.sinks.reshape(1, -1, 1, 1).expand(q_bhtd.shape[0], -1, q_bhtd.shape[-2], -1)
+            combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+            combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+            probs = torch.nn.functional.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+            scores = probs[..., :-1]
+            attn_output = torch.matmul(scores, value_states)  # (B, Hq, T, D)
+            attn_output_bthd = attn_output.transpose(1, 2).contiguous() # (B, T, Hq, D)
+            y_pre_full = attn_output_bthd.reshape(1, -1, n_q * hd)
+            y_pre_last = y_pre_full[0, -1, :].detach().float().cpu().numpy().tolist()
+            y_post_full = torch.nn.functional.linear(y_pre_full, attn0.o_proj.weight, attn0.o_proj.bias)
+            y_post_last = y_post_full[0, -1, :].detach().float().cpu().numpy().tolist()
+
+            # Weight sample for sanity (first row, first-8 cols)
+            q_w_samp = attn0.q_proj.weight.detach().float().cpu()[0, :8].numpy().tolist()
+
+            # Extract last-token attention logits/weights for head 0 (and head 1 if present)
+            logits_last_h0 = attn_weights[0, 0, -1, :].detach().float().cpu().numpy().tolist()
+            scores_last_h0 = scores[0, 0, -1, :].detach().float().cpu().numpy().tolist()
+            logits_last_h1 = (
+                attn_weights[0, 1, -1, :].detach().float().cpu().numpy().tolist() if n_q > 1 else None
+            )
+            scores_last_h1 = (
+                scores[0, 1, -1, :].detach().float().cpu().numpy().tolist() if n_q > 1 else None
+            )
+
+            # For head-0 diagnostics: dump key/value sequences across time
+            k_all_h0 = key_states[0, 0, :, :].detach().float().cpu().numpy().reshape(-1).tolist()
+            v_all_h0 = value_states[0, 0, :, :].detach().float().cpu().numpy().reshape(-1).tolist()
+
+            out_obj = {
+                "q_pre": q_pre.reshape(-1).numpy().tolist(),
+                "k_pre": k_pre.reshape(-1).numpy().tolist(),
+                "v_pre": v_pre.reshape(-1).numpy().tolist(),
+                "q_rope": q_rope.reshape(-1).numpy().tolist(),
+                "k_rope": k_rope.reshape(-1).numpy().tolist(),
+                "attn_pre_last": y_pre_last,
+                "attn_post_last": y_post_last,
+                "attn_logits_last_h0": logits_last_h0,
+                "attn_scores_last_h0": scores_last_h0,
+                "attn_logits_last_h1": logits_last_h1,
+                "attn_scores_last_h1": scores_last_h1,
+                "k_all_h0": k_all_h0,
+                "v_all_h0": v_all_h0,
+                "shapes": {
+                    "q_pre": [int(q_pre.shape[0]), int(q_pre.shape[1])],
+                    "k_pre": [int(k_pre.shape[0]), int(k_pre.shape[1])],
+                    "v_pre": [int(v_pre.shape[0]), int(v_pre.shape[1])],
+                },
+                "softmax_scale": softmax_scale,
+                "attn_type": attn_type,
+                "sliding_window": int(model.config.sliding_window) if getattr(model.config, "sliding_window", None) is not None else None,
+                "sinks": L0.self_attn.sinks.detach().float().cpu().numpy().tolist(),
+                "q_w_samp": q_w_samp,
+            }
+            # Also return the pre-attn norm last-token first8 for context
+            out_obj["l0_pre_norm_first8"] = x_norm[0, -1, :8].detach().float().cpu().numpy().tolist()
+            print(json.dumps(out_obj))
+        return
 
     # Top-10 next-token candidates at step 0
     with torch.no_grad():
