@@ -60,11 +60,17 @@ pub enum AttnMode {
 /// - Full: standard causal attention.
 /// - Sliding: windowed attention with left window = `sliding_window` and right window = 0.
 pub fn select_attn_mode_for_layer(cfg: &GptOssConfigMinimal, layer_idx: usize) -> AttnMode {
-    let _ = (cfg, layer_idx);
-    // Match HF eager attention behavior: do not apply sliding-window masking during inference
-    // for GPT-OSS. The reference implementation's eager path ignores the sliding window in
-    // `eager_attention_forward`, so we align by using full causal attention here.
-    AttnMode::Full
+    // Respect the per-layer attention type declared in config. When a sliding window is
+    // configured and the layer is marked `SlidingAttention`, use a windowed causal mask
+    // with `left = sliding_window` and `right = 0`. Otherwise, run full causal attention.
+    let types = cfg.effective_layer_types();
+    match types.get(layer_idx) {
+        Some(GptOssLayerType::SlidingAttention) => match cfg.sliding_window_size() {
+            Some(w) if w > 0 => AttnMode::Sliding { left: w, right: 0 },
+            _ => AttnMode::Full,
+        },
+        _ => AttnMode::Full,
+    }
 }
 
 // Constants/config

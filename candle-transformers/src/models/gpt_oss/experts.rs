@@ -23,7 +23,9 @@ impl ExpertMlp {
 impl Module for ExpertMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         // xs: (n, hidden)
-        let gu = xs.apply(&self.gate_up)?; // (n, 2*inter)
+        // Perform the non-linear part in f32 for numerical stability/parity.
+        let gu = xs.apply(&self.gate_up)?; // (n, 2*inter) in xs.dtype()
+        let gu = gu.to_dtype(DType::F32)?;
         let (n, two_inter) = gu.dims2()?;
         let inter = two_inter / 2;
         // Split fused gate_up into (gate, up) using interleaved layout as in HF:
@@ -34,21 +36,22 @@ impl Module for ExpertMlp {
         let mut up = gu_pairs.narrow(D::Minus1, 1, 1)?.squeeze(D::Minus1)?; // (n, inter)
 
         // Clamp per GPT-OSS spec: gate in (-inf, limit], up in [-limit, limit]
-        let limit_t = Tensor::new(self.limit, xs.device())?.to_dtype(xs.dtype())?;
+        let limit_t = Tensor::new(self.limit, xs.device())?.to_dtype(DType::F32)?;
         let gate_lim = limit_t.broadcast_as(gate.shape().dims())?;
         gate = gate.minimum(&gate_lim)?;
         up = up.clamp(-self.limit, self.limit)?;
 
         // GLU: gate * sigmoid(gate * alpha)
-        let alpha_t = Tensor::new(self.alpha, xs.device())?.to_dtype(xs.dtype())?;
+        let alpha_t = Tensor::new(self.alpha, xs.device())?.to_dtype(DType::F32)?;
         let gate_alpha = gate.broadcast_mul(&alpha_t)?;
         let sig = ops::sigmoid(&gate_alpha)?;
         let glu = gate.broadcast_mul(&sig)?;
 
         // Residual tweak: (up + 1) * glu
-        let one_t = Tensor::new(1.0f32, xs.device())?.to_dtype(xs.dtype())?;
+        let one_t = Tensor::new(1.0f32, xs.device())?.to_dtype(DType::F32)?;
         let up_plus = up.broadcast_add(&one_t)?;
-        let fused = up_plus.broadcast_mul(&glu)?; // (n, inter)
+        let fused = up_plus.broadcast_mul(&glu)?; // (n, inter) f32
+        let fused = fused.to_dtype(xs.dtype())?;
         fused.apply(&self.down)
     }
 }

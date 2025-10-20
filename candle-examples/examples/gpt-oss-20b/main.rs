@@ -91,6 +91,7 @@ fn main() -> Result<()> {
             let tail_check = "<|start|>assistant<|channel|>final<|message|>";
             let has_tail = full_dec.contains(tail_check);
             println!("prompt tail contains '{}': {}", tail_check, has_tail);
+            println!("prompt decode: {}", full_dec);
         }
     }
 
