@@ -114,7 +114,7 @@ def main() -> None:
     args = parser.parse_args()
     # Messages (Harmony-style content). Keep identical to Rust example.
     messages: List[Dict[str, Any]] = [
-        {"role": "user", "content": "Explain what MXFP4 quantization is"},
+        {"role": "user", "content": "What is the capital of France?"},
     ]
 
     # Device + dtype
