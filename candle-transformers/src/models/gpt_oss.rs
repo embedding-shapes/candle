@@ -383,7 +383,9 @@ pub fn eager_attn_windowed_with_sinks(
                         let j = j as isize;
                         let l = left as isize;
                         let r = right as isize;
-                        let allow = (j >= i - l) && (j <= i + r);
+                        // Match HF sliding_window_overlay semantics: kv_idx > q_idx - sliding_window
+                        // Combined with causal, the allowed band is (i - left, i + right] (left-exclusive, right-inclusive)
+                        let allow = (j > i - l) && (j <= i + r);
                         u8::from(!allow)
                     })
                 })
