@@ -486,7 +486,8 @@ pub mod model {
                 };
                 let attn = GptOssAttentionWeights { q_proj, k_proj, v_proj, o_proj, sinks };
 
-                let router = candle_nn::linear_no_bias(hidden, cfg.num_local_experts, l_vb.pp("mlp.gate"))?;
+                // HF/GPT-OSS uses `mlp.router` with a bias for the MoE router.
+                let router = candle_nn::linear(hidden, cfg.num_local_experts, l_vb.pp("mlp.router"))?;
                 let experts = {
                     let mlp_vb = l_vb.pp("mlp");
                     let inter = cfg.intermediate_size;
