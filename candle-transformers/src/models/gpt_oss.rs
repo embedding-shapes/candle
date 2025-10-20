@@ -294,8 +294,21 @@ pub mod rotary {
             let freqs = t.matmul(&inv_freq)?;
 
             let attn_factor = yarn_get_mscale(cfg.factor);
-            let sin = freqs.sin()?.to_dtype(dtype)?;
-            let cos = freqs.cos()?.to_dtype(dtype)?;
+            let mut sin = freqs.sin()?.to_dtype(dtype)?;
+            let mut cos = freqs.cos()?.to_dtype(dtype)?;
+
+            // Test toggle: place YaRN scaling either on cos/sin (Mode A) or on softmax (Mode B).
+            // - CANDLE_YARN_MODE=cos     => multiply cos/sin by attn_factor (HF placement)
+            // - CANDLE_YARN_MODE=softmax => leave cos/sin unchanged (current behavior)
+            match std::env::var("CANDLE_YARN_MODE").ok().as_deref() {
+                Some("softmax") => { /* leave tables unscaled to emulate old behavior */ }
+                _ => {
+                    // Default (fixed): place mscale onto cos/sin tables.
+                    let scale = Tensor::new(attn_factor, dev)?.to_dtype(dtype)?;
+                    sin = sin.broadcast_mul(&scale)?;
+                    cos = cos.broadcast_mul(&scale)?;
+                }
+            }
 
             Ok(Self { sin, cos, attn_factor })
         }
@@ -591,7 +604,16 @@ pub mod model {
             let head_dim = self.cfg.head_dim();
             let n_q = self.cfg.num_attention_heads;
             let n_kv = self.cfg.num_key_value_heads;
-            let softmax_scale = self.rope.attention_factor() * (1.0f32 / (head_dim as f32).sqrt());
+            // Test toggle for YaRN scaling placement:
+            // - CANDLE_YARN_MODE=cos     => use standard 1/sqrt(d) softmax scale (HF placement on cos/sin)
+            // - CANDLE_YARN_MODE=softmax => include attention_factor in softmax scale (current behavior)
+            let softmax_scale = {
+                let base = 1.0f32 / (head_dim as f32).sqrt();
+                match std::env::var("CANDLE_YARN_MODE").ok().as_deref() {
+                    Some("softmax") => self.rope.attention_factor() * base,
+                    _ => base,
+                }
+            };
 
             let dump_l1 = matches!(
                 std::env::var(ENV_DUMP_L1).ok().as_deref(),
