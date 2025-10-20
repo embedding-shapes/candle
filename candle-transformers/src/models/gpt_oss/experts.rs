@@ -26,14 +26,12 @@ impl Module for ExpertMlp {
         // Perform the non-linear part in f32 for numerical stability/parity.
         let gu = xs.apply(&self.gate_up)?; // (n, 2*inter) in xs.dtype()
         let gu = gu.to_dtype(DType::F32)?;
-        let (n, two_inter) = gu.dims2()?;
+        let (_n, two_inter) = gu.dims2()?;
         let inter = two_inter / 2;
-        // Split fused gate_up into (gate, up) using interleaved layout as in HF:
-        // gate = gu[..., 0::2], up = gu[..., 1::2]. We achieve this by reshaping to
-        // (n, inter, 2) then slicing the last dim.
-        let gu_pairs = gu.reshape((n, inter, 2))?; // (n, inter, 2) where [:, :, 0]=gate, [:, :, 1]=up
-        let mut gate = gu_pairs.narrow(D::Minus1, 0, 1)?.squeeze(D::Minus1)?; // (n, inter)
-        let mut up = gu_pairs.narrow(D::Minus1, 1, 1)?.squeeze(D::Minus1)?; // (n, inter)
+        // Split fused gate_up into (gate, up) using contiguous halves as in GPT-OSS:
+        // gate = gu[..., :inter], up = gu[..., inter:]
+        let mut gate = gu.narrow(D::Minus1, 0, inter)?; // (n, inter)
+        let mut up = gu.narrow(D::Minus1, inter, inter)?; // (n, inter)
 
         // Clamp per GPT-OSS spec: gate in (-inf, limit], up in [-limit, limit]
         let limit_t = Tensor::new(self.limit, xs.device())?.to_dtype(DType::F32)?;
