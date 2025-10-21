@@ -2983,7 +2983,155 @@ static __device__ __forceinline__ void vec_dot_mxfp4_bf16_mmq(
     }
 }
 
-// Main MMQ kernel - optimized version using get_int_from_table_16
+// Main MMQ kernel - tiled matrix multiplication for MXFP4
+// Uses shared memory tiling and cooperative loading for maximum performance
+// This is a __device__ function meant to be called from within a __global__ kernel
+template <int mmq_x, int mmq_y>
+static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
+    const __nv_bfloat16* __restrict__ act,    // [rows, in_dim]
+    const uint8_t* __restrict__ blocks,       // [out_dim, nblocks, 16]
+    const uint8_t* __restrict__ scales,       // [out_dim, nblocks]
+    __nv_bfloat16* __restrict__ out,          // [rows, out_dim]
+    const int rows,
+    const int out_dim,
+    const int nblocks,
+    const int in_dim,
+    const int act_row_stride,
+    const int out_row_stride
+) {
+    constexpr int nwarps = MMQ_NWARPS;
+    constexpr int blocks_per_iter = MMQ_ITER_K / 32;  // 8 blocks = 256 elements
+
+    // Shared memory for weights (INT8 + scales)
+    // Layout: [mmq_y][2*MMQ_TILE_NE_K+1] for INT8 weights (65 stride for bank conflict avoidance)
+    __shared__ int weight_qs_shared[mmq_y * (2 * MMQ_TILE_NE_K + 1)];
+    __shared__ float weight_scales_shared[mmq_y * blocks_per_iter];
+
+    // Thread block computes output tile [row, row+mmq_y) × [col, col+mmq_x)
+    const int row_base = blockIdx.x * mmq_y;
+    const int col_base = blockIdx.y * mmq_x;
+
+    // Accumulator: each thread handles multiple outputs
+    // Size: (mmq_y/warp_size) × (mmq_x/nwarps)
+    // Use max(1, ...) to avoid zero-sized arrays
+    constexpr int acc_rows = (mmq_y >= WARP_SIZE) ? (mmq_y / WARP_SIZE) : 1;
+    constexpr int acc_cols = mmq_x / nwarps;
+    float acc[acc_rows][acc_cols];
+
+    // Initialize accumulator to zero
+    #pragma unroll
+    for (int i = 0; i < acc_rows; ++i) {
+        #pragma unroll
+        for (int j = 0; j < acc_cols; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    // Outer loop over K dimension in tiles of MMQ_ITER_K elements
+    for (int k_block = 0; k_block < nblocks; k_block += blocks_per_iter) {
+        const int blocks_this_iter = min(blocks_per_iter, nblocks - k_block);
+
+        // Cooperatively load mmq_y rows of weights into shared memory
+        // Each thread block loads blocks_per_iter blocks (256 elements)
+        load_tiles_mxfp4_fast<mmq_x, mmq_y>(
+            blocks, scales,
+            weight_qs_shared, weight_scales_shared,
+            col_base,           // row_offset in weight matrix
+            k_block,            // block_offset in K dimension
+            nblocks,            // total blocks per row
+            min(mmq_y, out_dim - col_base)  // num_rows_to_load
+        );
+
+        __syncthreads();
+
+        // Compute partial dot products using loaded weights
+        // Each thread processes its assigned outputs based on threadIdx
+        #pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
+            const int j_local = j0 + threadIdx.y;
+
+            if (j_local >= mmq_x || col_base + j_local >= out_dim) {
+                continue;
+            }
+
+            #pragma unroll
+            for (int i0 = 0; i0 < mmq_y; i0 += WARP_SIZE) {
+                const int i_local = i0 + threadIdx.x;
+
+                if (i_local >= mmq_y || row_base + i_local >= rows) {
+                    continue;
+                }
+
+                // Pointer to activations for this row
+                const __nv_bfloat16* act_row = act + (row_base + i_local) * act_row_stride;
+
+                // Accumulator index in the acc array
+                // Handle case when mmq_y < WARP_SIZE
+                const int acc_idx_i = (mmq_y >= WARP_SIZE) ? (i0 / WARP_SIZE) : 0;
+                const int acc_idx_j = j0 / nwarps;
+
+                // Process blocks_per_iter blocks (typically 8 blocks = 256 elements)
+                #pragma unroll
+                for (int b = 0; b < blocks_per_iter; ++b) {
+                    if (b >= blocks_this_iter) break;
+
+                    // Get weight data from shared memory
+                    const int weight_row = j_local;
+                    const float scale = weight_scales_shared[weight_row * blocks_per_iter + b];
+                    const int shared_offset = weight_row * (2 * MMQ_TILE_NE_K + 1) + b * 32;
+                    const int8_t* weight_int8 = (const int8_t*)&weight_qs_shared[shared_offset];
+
+                    // Get activation data
+                    const int k_offset = (k_block + b) * 32;
+                    const __nv_bfloat16* act_block = act_row + k_offset;
+
+                    // Compute dot product for one block (32 elements)
+                    float block_dot = 0.0f;
+                    #pragma unroll
+                    for (int k = 0; k < 32; ++k) {
+                        const float w = (float)weight_int8[k];
+                        const float a = __bfloat162float(act_block[k]);
+                        block_dot += w * a;
+                    }
+
+                    acc[acc_idx_i][acc_idx_j] += scale * block_dot;
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write results to global memory with thread-to-output mapping
+    #pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
+        const int j_local = j0 + threadIdx.y;
+        const int col = col_base + j_local;
+
+        if (col >= out_dim) {
+            return;
+        }
+
+        #pragma unroll
+        for (int i0 = 0; i0 < mmq_y; i0 += WARP_SIZE) {
+            const int i_local = i0 + threadIdx.x;
+            const int row = row_base + i_local;
+
+            if (row >= rows) {
+                continue;
+            }
+
+            const int acc_idx_i = (mmq_y >= WARP_SIZE) ? (i0 / WARP_SIZE) : 0;
+            const int acc_idx_j = j0 / nwarps;
+
+            out[row * out_row_stride + col] = __float2bfloat16(acc[acc_idx_i][acc_idx_j]);
+        }
+    }
+}
+
+// Instantiate the MMQ kernel with default parameters for Candle's API
+// This provides a drop-in replacement with the same signature as matmul_mxfp4_bf16
+// Grid should be configured as: grid=((rows+mmq_y-1)/mmq_y, (out_dim+mmq_x-1)/mmq_x), block=(32, nwarps)
 extern "C" __global__ void matmul_mxfp4_bf16_mmq(
     const __nv_bfloat16* __restrict__ act,    // [rows, in_dim]
     const uint8_t* __restrict__ blocks,       // [out_dim, nblocks, 16]
@@ -2996,80 +3144,13 @@ extern "C" __global__ void matmul_mxfp4_bf16_mmq(
     const int act_row_stride,
     const int out_row_stride
 ) {
-    // Key optimizations:
-    // 1. Use get_int_from_table_16 for efficient FP4→INT8 lookup (8 values at once)
-    // 2. Process 8 blocks at a time for better ILP
-    // 3. Unroll loops aggressively for compiler optimization
-    // 4. Use INT8 weights to reduce memory bandwidth
-
-    const int row = blockIdx.x;
-    const int col = blockIdx.y * blockDim.x + threadIdx.x;
-
-    if (row >= rows || col >= out_dim) {
-        return;
-    }
-
-    const __nv_bfloat16* act_ptr = act + row * act_row_stride;
-    const uint8_t* blocks_ptr = blocks + col * nblocks * 16;
-    const uint8_t* scales_ptr = scales + col * nblocks;
-
-    float sum = 0.0f;
-
-    // Process 8 blocks at a time (256 elements total) for better ILP
-    #pragma unroll 1
-    for (int kb = 0; kb < nblocks; kb += 8) {
-        float sum_8blocks = 0.0f;
-
-        #pragma unroll
-        for (int b = 0; b < 8 && (kb + b) < nblocks; ++b) {
-            const int block_idx = kb + b;
-            const uint8_t* block_ptr = blocks_ptr + block_idx * 16;
-            const float scale = pow2_e8m0_device(scales_ptr[block_idx]) * 0.5f;
-            const __nv_bfloat16* act_block_ptr = act_ptr + block_idx * 32;
-
-            float block_sum = 0.0f;
-
-            // Process 32 elements - unroll fully for maximum performance
-            #pragma unroll
-            for (int i = 0; i < 32; i += 8) {
-                // Load 4 bytes containing 8 FP4 nibbles
-                const uint8_t byte0 = block_ptr[(i >> 1) + 0];
-                const uint8_t byte1 = block_ptr[(i >> 1) + 1];
-                const uint8_t byte2 = block_ptr[(i >> 1) + 2];
-                const uint8_t byte3 = block_ptr[(i >> 1) + 3];
-
-                // Extract nibbles and lookup INT8 values
-                const int8_t w0 = kvalues_mxfp4[byte0 & 0x0f];
-                const int8_t w1 = kvalues_mxfp4[byte0 >> 4];
-                const int8_t w2 = kvalues_mxfp4[byte1 & 0x0f];
-                const int8_t w3 = kvalues_mxfp4[byte1 >> 4];
-                const int8_t w4 = kvalues_mxfp4[byte2 & 0x0f];
-                const int8_t w5 = kvalues_mxfp4[byte2 >> 4];
-                const int8_t w6 = kvalues_mxfp4[byte3 & 0x0f];
-                const int8_t w7 = kvalues_mxfp4[byte3 >> 4];
-
-                // Load activations
-                const float a0 = __bfloat162float(act_block_ptr[i + 0]);
-                const float a1 = __bfloat162float(act_block_ptr[i + 1]);
-                const float a2 = __bfloat162float(act_block_ptr[i + 2]);
-                const float a3 = __bfloat162float(act_block_ptr[i + 3]);
-                const float a4 = __bfloat162float(act_block_ptr[i + 4]);
-                const float a5 = __bfloat162float(act_block_ptr[i + 5]);
-                const float a6 = __bfloat162float(act_block_ptr[i + 6]);
-                const float a7 = __bfloat162float(act_block_ptr[i + 7]);
-
-                // Compute dot product
-                block_sum += (float)w0 * a0 + (float)w1 * a1 + (float)w2 * a2 + (float)w3 * a3 +
-                            (float)w4 * a4 + (float)w5 * a5 + (float)w6 * a6 + (float)w7 * a7;
-            }
-
-            sum_8blocks += scale * block_sum;
-        }
-
-        sum += sum_8blocks;
-    }
-
-    out[row * out_row_stride + col] = __float2bfloat16(sum);
+    // Use minimal tile size for testing: mmq_x=64, mmq_y=2
+    // For production, increase to mmq_y=64 or 128
+    matmul_mxfp4_bf16_mmq_tiled<64, 2>(
+        act, blocks, scales, out,
+        rows, out_dim, nblocks, in_dim,
+        act_row_stride, out_row_stride
+    );
 }
 
 extern "C" __global__ void matmul_mxfp4_bf16(
