@@ -149,8 +149,39 @@ pub fn dequant_mxfp4_to_bf16_cuda(
         bail!("dequant_mxfp4_to_bf16_cuda expects both inputs on the same CUDA device")
     }
     let dev: &CudaDevice = blocks.device().as_cuda_device()?;
+
+    // BUG FIX: contiguous() doesn't copy if tensor is already contiguous,
+    // even if it has a storage offset from narrow(). This causes CUDA kernel
+    // to read from wrong memory location. Force a real copy to ensure offset=0.
     let blocks_c = blocks.contiguous()?;
     let scales_c = scales.contiguous()?;
+
+    // Check if there's a storage offset and force copy if needed
+    let blocks_offset = {
+        let (_blocks_storage, blocks_layout) = blocks_c.storage_and_layout();
+        blocks_layout.start_offset()
+    };
+    eprintln!("[MXFP4_DEBUG] blocks offset: {}", blocks_offset);
+    let blocks_c = if blocks_offset > 0 {
+        eprintln!("[MXFP4_DEBUG] Forcing copy due to non-zero offset");
+        // Force a copy by converting to CPU and back to remove offset
+        blocks_c.to_device(&Device::Cpu)?.to_device(blocks_c.device())?
+    } else {
+        eprintln!("[MXFP4_DEBUG] No offset, using tensor as-is");
+        blocks_c
+    };
+
+    let scales_offset = {
+        let (_scales_storage, scales_layout) = scales_c.storage_and_layout();
+        scales_layout.start_offset()
+    };
+    let scales_c = if scales_offset > 0 {
+        // Force a copy by converting to CPU and back to remove offset
+        scales_c.to_device(&Device::Cpu)?.to_device(scales_c.device())?
+    } else {
+        scales_c
+    };
+
     let blocks_s = blocks_c.storage();
     let scales_s = scales_c.storage();
     let blocks_view = match &*blocks_s {
