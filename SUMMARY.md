@@ -152,3 +152,41 @@ The divergence starts at **Layer-0 MLP output**. Since router logits and MLP inp
 - Or weight loading/layout for expert MLP weights
 
 Need to create focused tests comparing Rust vs Python for single expert forward pass with known inputs.
+
+## ROOT CAUSE IDENTIFIED (2025-10-21)
+
+### MXFP4 Weight Layout Mismatch
+
+**Python** (transformers/integrations/mxfp4.py):
+- Line 394: Reshapes blocks from `[E, out, nb, 16]` to `[E, out, -1]`
+- Line 403: **Transposes blocks** before swizzling: `blocks.transpose(-2, -1)`
+- Line 408: Sets final weight shape to `[E, in, out]` (for gate_up_proj)
+- Matmul: `input @ weight` (NO transpose during forward)
+- Result: Weights stored in `[in_features, out_features]` layout
+
+**Rust** (candle-transformers/src/models/gpt_oss.rs):
+- Line 1686: Dequantizes blocks directly with shape `[out_dim, in_dim]`
+- NO transpose of blocks before or after dequantization
+- candle_nn::Linear (line 49-70 of linear.rs): Does `input @ weight.T`
+- Result: Weights stored in `[out_features, in_features]` layout
+
+### The Problem
+
+Simply transposing after dequantization causes a **double-transpose issue**:
+1. Rust dequants to `[out, in]` then transposes to `[in, out]`
+2. Candle Linear transposes back: `weight.T` → `[out, in]`
+3. This causes shape mismatch: trying to do `[batch, in] @ [out, in]` which is invalid
+
+The error: `shape mismatch in matmul, lhs: [10, 2880], rhs: [5760, 2880]`
+- lhs is input: `[batch=10, in=2880]`
+- rhs is weight after Linear's transpose: `[out=5760, in=2880]` (wrong!)
+
+### Required Fix
+
+One of these approaches is needed:
+
+1. **Change MXFP4 dequantization** to actually transpose/reshape blocks before dequant to match Python's `blocks.transpose(-2, -1)` operation, OR
+2. **Create a "pre-transposed" Linear variant** that doesn't apply `.T` during forward, for use with MXFP4 weights, OR
+3. **Change how blocks are interpreted** during dequantization to produce `[in, out]` layout by modifying the dequant_mxfp4_to_bf16 function's block iteration order
+
+The fix requires deeper changes to either the MXFP4 dequantization process or the Linear layer behavior - not just a simple transpose after loading.
