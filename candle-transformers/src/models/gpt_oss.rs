@@ -291,32 +291,56 @@ pub mod experts {
                 }
             }
 
+            let counts: Vec<usize> = token_ids.iter().map(|ids| ids.len()).collect();
+            let total_assignments: usize = counts.iter().sum();
+
+            let mut flat_ids = Vec::with_capacity(total_assignments);
+            let mut flat_wts = Vec::with_capacity(total_assignments);
+            for e_idx in 0..n_experts {
+                flat_ids.extend_from_slice(&token_ids[e_idx]);
+                flat_wts.extend_from_slice(&token_wts[e_idx]);
+            }
+
+            let ids_all = if total_assignments == 0 {
+                Tensor::zeros((0,), DType::U32, xs2.device())?
+            } else {
+                Tensor::from_vec(flat_ids, total_assignments, xs2.device())?
+            };
+
+            let weights_all = if total_assignments == 0 {
+                Tensor::zeros((0, 1), xs2.dtype(), xs2.device())?
+            } else {
+                Tensor::from_vec(flat_wts, total_assignments, xs2.device())?
+                    .to_dtype(xs2.dtype())?
+                    .reshape((total_assignments, 1))?
+            };
+
+            let mut offset = 0usize;
             let dump_l1 = std::env::var("CANDLE_DUMP_L1").ok().as_deref() == Some("1");
 
             let mut ys = xs2.zeros_like()?;
             for (e_idx, expert) in self.experts.iter().enumerate() {
-                let ids = &token_ids[e_idx];
-                if ids.is_empty() {
+                let count = counts[e_idx];
+                if count == 0 {
                     continue;
                 }
-                let ids_t = Tensor::new(ids.as_slice(), xs2.device())?;
-                let wts_t = Tensor::new(token_wts[e_idx].as_slice(), xs2.device())?
-                    .reshape(((), 1))?
-                    .to_dtype(xs2.dtype())?;
+
+                let ids_t = ids_all.narrow(0, offset, count)?;
+                let wts_t = weights_all.narrow(0, offset, count)?;
                 let x_sel = xs2.index_select(&ids_t, 0)?;
                 if dump_l1 {
                     eprintln!(
                         "[L1 MLP] Expert {}: {} tokens, weights: {:?}",
                         e_idx,
-                        ids.len(),
+                        count,
                         &token_wts[e_idx]
                     );
                 }
                 let y_sel = expert.forward(&x_sel)?;
-                if dump_l1 && ids.contains(&((probs_host.len() - 1) as u32)) {
+                if dump_l1 && token_ids[e_idx].contains(&((probs_host.len() - 1) as u32)) {
                     let y_sel_f32 = y_sel.to_dtype(DType::F32)?;
                     let y_sel_vec = y_sel_f32.to_vec2::<f32>()?;
-                    let last_in_batch = ids
+                    let last_in_batch = token_ids[e_idx]
                         .iter()
                         .position(|&id| id == ((probs_host.len() - 1) as u32))
                         .unwrap();
@@ -327,10 +351,10 @@ pub mod experts {
                     );
                 }
                 let y_sel = y_sel.broadcast_mul(&wts_t)?;
-                if dump_l1 && ids.contains(&((probs_host.len() - 1) as u32)) {
+                if dump_l1 && token_ids[e_idx].contains(&((probs_host.len() - 1) as u32)) {
                     let y_sel_f32 = y_sel.to_dtype(DType::F32)?;
                     let y_sel_vec = y_sel_f32.to_vec2::<f32>()?;
-                    let last_in_batch = ids
+                    let last_in_batch = token_ids[e_idx]
                         .iter()
                         .position(|&id| id == ((probs_host.len() - 1) as u32))
                         .unwrap();
@@ -343,6 +367,7 @@ pub mod experts {
                     );
                 }
                 ys = ys.index_add(&ids_t, &y_sel, 0)?;
+                offset += count;
             }
             let result = ys.reshape((b, t, h))?;
             if dump_l1 {
