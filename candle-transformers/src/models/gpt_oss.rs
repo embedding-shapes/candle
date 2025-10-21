@@ -598,48 +598,77 @@ pub mod model {
                 let experts = {
                     let mlp_vb = l_vb.pp("mlp");
                     let inter = cfg.intermediate_size;
-                    let mut all: Vec<ExpertMlp> = Vec::with_capacity(cfg.num_local_experts);
-                    for e in 0..cfg.num_local_experts {
-                        let gate_up = match super::load_expert_linear_mxfp4_grouped(
-                            hidden,
-                            2 * inter,
-                            true,
-                            mlp_vb.clone(),
-                            "experts.gate_up_proj",
-                            e,
-                            cfg.num_local_experts,
-                        ) {
-                            Ok(l) => l,
-                            Err(_) => super::load_linear_maybe_mxfp4(
+                    let limit = cfg.swiglu_limit.unwrap_or(7.0);
+                    let alpha = 1.702f32;
+
+                    // Try batched loading (much faster: one dequant kernel instead of E)
+                    let gate_up_all = super::load_all_experts_linear_mxfp4_grouped(
+                        hidden,
+                        2 * inter,
+                        true,
+                        mlp_vb.clone(),
+                        "experts.gate_up_proj",
+                        cfg.num_local_experts,
+                    );
+                    let down_all = super::load_all_experts_linear_mxfp4_grouped(
+                        inter,
+                        hidden,
+                        true,
+                        mlp_vb.clone(),
+                        "experts.down_proj",
+                        cfg.num_local_experts,
+                    );
+
+                    let all: Vec<ExpertMlp> = if let (Ok(gate_ups), Ok(downs)) = (gate_up_all, down_all) {
+                        // Batched load succeeded - zip into ExpertMlp structs
+                        gate_ups.into_iter()
+                            .zip(downs.into_iter())
+                            .map(|(gate_up, down)| ExpertMlp::new(gate_up, down, limit, alpha))
+                            .collect()
+                    } else {
+                        // Batched load failed - fall back to per-expert loading
+                        let mut all: Vec<ExpertMlp> = Vec::with_capacity(cfg.num_local_experts);
+                        for e in 0..cfg.num_local_experts {
+                            let gate_up = match super::load_expert_linear_mxfp4_grouped(
                                 hidden,
                                 2 * inter,
                                 true,
-                                mlp_vb.pp(&format!("experts.{e}")),
-                                "gate_up_proj",
-                            )?,
-                        };
-                        let down = match super::load_expert_linear_mxfp4_grouped(
-                            inter,
-                            hidden,
-                            true,
-                            mlp_vb.clone(),
-                            "experts.down_proj",
-                            e,
-                            cfg.num_local_experts,
-                        ) {
-                            Ok(l) => l,
-                            Err(_) => super::load_linear_maybe_mxfp4(
+                                mlp_vb.clone(),
+                                "experts.gate_up_proj",
+                                e,
+                                cfg.num_local_experts,
+                            ) {
+                                Ok(l) => l,
+                                Err(_) => super::load_linear_maybe_mxfp4(
+                                    hidden,
+                                    2 * inter,
+                                    true,
+                                    mlp_vb.pp(&format!("experts.{e}")),
+                                    "gate_up_proj",
+                                )?,
+                            };
+                            let down = match super::load_expert_linear_mxfp4_grouped(
                                 inter,
                                 hidden,
                                 true,
-                                mlp_vb.pp(&format!("experts.{e}")),
-                                "down_proj",
-                            )?,
-                        };
-                        let limit = cfg.swiglu_limit.unwrap_or(7.0);
-                        let alpha = 1.702f32;
-                        all.push(ExpertMlp::new(gate_up, down, limit, alpha));
-                    }
+                                mlp_vb.clone(),
+                                "experts.down_proj",
+                                e,
+                                cfg.num_local_experts,
+                            ) {
+                                Ok(l) => l,
+                                Err(_) => super::load_linear_maybe_mxfp4(
+                                    inter,
+                                    hidden,
+                                    true,
+                                    mlp_vb.pp(&format!("experts.{e}")),
+                                    "down_proj",
+                                )?,
+                            };
+                            all.push(ExpertMlp::new(gate_up, down, limit, alpha));
+                        }
+                        all
+                    };
                     GptOssExperts::new(router.clone(), all, Some(cfg.num_experts_per_tok))
                 };
                 let eps = cfg.rms_norm_eps.unwrap_or(DEFAULT_RMS_EPS);
@@ -1688,6 +1717,89 @@ pub fn load_expert_linear_mxfp4_grouped(
     }
 
     Ok(Linear::new(weight, bias_t))
+}
+
+/// Load ALL experts' Linear layers at once from grouped MXFP4 tensors, dequantizing in a single
+/// batched operation. This is much faster than calling `load_expert_linear_mxfp4_grouped` E times
+/// because it resolves names once and launches the dequantization kernel once instead of E times.
+///
+/// Returns a Vec of Linear layers, one per expert.
+pub fn load_all_experts_linear_mxfp4_grouped(
+    in_dim: usize,
+    out_dim: usize,
+    bias: bool,
+    vb: candle_nn::VarBuilder,
+    base: &str,
+    n_experts: usize,
+) -> Result<Vec<Linear>> {
+    // Resolve paired grouped names ONCE (not E times)
+    let blocks_dot = format!("{base}_blocks");
+    let scales_dot = format!("{base}_scales");
+    let has_us = vb.contains_tensor(&blocks_dot) && vb.contains_tensor(&scales_dot);
+    let (blocks_name, scales_name) = if has_us {
+        (blocks_dot, scales_dot)
+    } else {
+        let blocks_alt = format!("{base}.blocks");
+        let scales_alt = format!("{base}.scales");
+        if vb.contains_tensor(&blocks_alt) && vb.contains_tensor(&scales_alt) {
+            (blocks_alt, scales_alt)
+        } else {
+            candle::bail!("grouped MXFP4 tensors not found for base '{base}'")
+        }
+    };
+
+    if in_dim % MXFP4_BLOCK_ELEMS != 0 {
+        candle::bail!(
+            "MXFP4 grouped weight '{base}': in_dim must be multiple of {MXFP4_BLOCK_ELEMS}, got {in_dim}"
+        )
+    }
+    let nblocks = in_dim / MXFP4_BLOCK_ELEMS;
+
+    // Load U8 grouped tensors ONCE
+    let vb_u8 = vb.to_dtype(DType::U8);
+    let blocks_g = vb_u8.get((n_experts, out_dim, nblocks, MXFP4_BLOCK_BYTES), &blocks_name)?; // (E, out, nb, 16)
+    let scales_g = vb_u8.get((n_experts, out_dim, nblocks), &scales_name)?; // (E, out, nb)
+
+    // Reshape to flatten expert dimension: (E, out, nb, 16) -> (E*out, nb, 16)
+    let blocks_flat = blocks_g.reshape((n_experts * out_dim, nblocks, MXFP4_BLOCK_BYTES))?;
+    let scales_flat = scales_g.reshape((n_experts * out_dim, nblocks))?;
+
+    // Dequantize ALL experts in ONE kernel launch: produces (E*out, in)
+    let mut weights_all = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks_flat, &scales_flat, [n_experts * out_dim, in_dim])?;
+
+    if !weights_all.device().same_device(vb.device()) {
+        weights_all = weights_all.to_device(vb.device())?;
+    }
+
+    // Load optional grouped bias ONCE if present
+    let bias_all = if bias {
+        let bias_us = format!("{base}_bias");
+        let bias_dot = format!("{base}.bias");
+        let vb_bf16 = vb.to_dtype(DType::BF16);
+        if vb.contains_tensor(&bias_us) {
+            Some(vb_bf16.get((n_experts, out_dim), &bias_us)?)
+        } else if vb.contains_tensor(&bias_dot) {
+            Some(vb_bf16.get((n_experts, out_dim), &bias_dot)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Slice into per-expert Linear layers
+    let mut experts = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        let weight = weights_all.narrow(0, e * out_dim, out_dim)?;
+        let bias_t = if let Some(ref b) = bias_all {
+            Some(b.narrow(0, e, 1)?.squeeze(0)?)
+        } else {
+            None
+        };
+        experts.push(Linear::new(weight, bias_t));
+    }
+
+    Ok(experts)
 }
 
 // ============================

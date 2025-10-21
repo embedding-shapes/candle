@@ -5,17 +5,29 @@
 ## Current Status (2025-10-21)
 
 - ✅ **CUDA MXFP4 dequantization offset bug fixed**. The GPU path now respects storage start offsets, so views produced by `narrow()` read the correct expert weights. CPU and CUDA dequant outputs match bit-for-bit on real checkpoint shards.
-- ⚠️ **End-to-end inference still diverges**. The Rust example prints duplicated system/user headers and garbled assistant text, whereas Python emits the expected `<|channel|>analysis` and `<|channel|>final` responses. Further investigation is required beyond Layer-0 MLP.
+- ✅ **Harmony protocol forcing bug fixed**. Removed incorrect special token masking/forcing logic that was skipping channel names. The model now naturally follows the Harmony protocol as trained.
+- ✅ **End-to-end parity achieved**. Both Python and Rust implementations generate coherent Harmony-formatted responses with identical structure: `<|channel|>` → channel name → `<|message|>` → content → `<|return|>`.
+- ✅ **Loading performance optimized**. Batched MXFP4 dequantization reduces kernel launches from E per layer to 1 per projection (8x reduction for 8 experts).
 
 ## What Changed This Session
 
-1. Added offset-aware handling inside `candle-core/src/mxfp4.rs::dequant_mxfp4_to_bf16_cuda`.
-   - After materializing contiguous tensors, we now read `start_offset()` from the layout and slice the underlying `CudaSlice` before passing it to the CUDA kernel.
-   - This avoids the previous CPU round-trip hack and preserves performance while guaranteeing correct pointer math.
-2. Re-ran the targeted regression test `mxfp4_real_weights_bug` with real GPT-OSS expert data. The test now passes and prints that GPU matches expected values.
-3. Replayed parity checks:
-   - `uv run python gpt_oss_transformers.py` (baseline) produces coherent reply: `<|channel|>analysis` + `<|channel|>final` with answer “Paris”.
-   - `cargo run --release --features cuda,flash-attn --example gpt-oss-20b -- --prompt "What is the capital of France?"` still shows duplicated system messages and truncated assistant output even though next-token logits now align (top candidate `<|channel|>` with p≈1.0).
+1. **Fixed Harmony protocol forcing bug**:
+   - Removed all special token masking/forcing logic (lines 166-179, 277-311 in main.rs)
+   - The forcing was a workaround from when MXFP4 bugs caused incorrect logits
+   - Now that logits are correct, we just sample with temperature and check stop tokens (matching Python)
+   - Model naturally follows Harmony protocol: `<|channel|>` → "analysis"/"final" → `<|message|>` → content
+
+2. **Optimized MXFP4 expert loading**:
+   - Added `load_all_experts_linear_mxfp4_grouped()` to batch-dequantize all experts at once
+   - Resolves MXFP4 tensor names once per layer instead of per expert (avoids 16 lookups per layer)
+   - Flattens expert dimension and dequantizes as single [E*out_dim, in_dim] tensor instead of E separate calls
+   - Reduces from 16 kernel launches per MoE layer to 2 (one for gate_up_proj, one for down_proj)
+   - Maintains fallback to per-expert loading for non-grouped weights
+
+3. **Removed dead code**:
+   - Deleted unused `dequant_mxfp4_with_float4()` function and float4 imports
+   - Removed unused `Module` import and `allowed_specials_for_next` import from main.rs
+   - Clean compilation with zero warnings
 
 ## Evidence Collected
 
