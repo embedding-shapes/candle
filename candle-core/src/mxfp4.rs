@@ -150,48 +150,28 @@ pub fn dequant_mxfp4_to_bf16_cuda(
     }
     let dev: &CudaDevice = blocks.device().as_cuda_device()?;
 
-    // BUG FIX: contiguous() doesn't copy if tensor is already contiguous,
-    // even if it has a storage offset from narrow(). This causes CUDA kernel
-    // to read from wrong memory location. Force a real copy to ensure offset=0.
+    // Materialize contiguous views (preserve any layout offset from prior narrow())
     let blocks_c = blocks.contiguous()?;
     let scales_c = scales.contiguous()?;
 
-    // Check if there's a storage offset and force copy if needed
-    let blocks_offset = {
-        let (_blocks_storage, blocks_layout) = blocks_c.storage_and_layout();
-        blocks_layout.start_offset()
-    };
-    eprintln!("[MXFP4_DEBUG] blocks offset: {}", blocks_offset);
-    let blocks_c = if blocks_offset > 0 {
-        eprintln!("[MXFP4_DEBUG] Forcing copy due to non-zero offset");
-        // Force a copy by converting to CPU and back to remove offset
-        blocks_c.to_device(&Device::Cpu)?.to_device(blocks_c.device())?
-    } else {
-        eprintln!("[MXFP4_DEBUG] No offset, using tensor as-is");
-        blocks_c
-    };
+    let (blocks_storage, blocks_layout) = blocks_c.storage_and_layout();
+    let (scales_storage, scales_layout) = scales_c.storage_and_layout();
+    let blocks_offset = blocks_layout.start_offset();
+    let scales_offset = scales_layout.start_offset();
 
-    let scales_offset = {
-        let (_scales_storage, scales_layout) = scales_c.storage_and_layout();
-        scales_layout.start_offset()
-    };
-    let scales_c = if scales_offset > 0 {
-        // Force a copy by converting to CPU and back to remove offset
-        scales_c.to_device(&Device::Cpu)?.to_device(scales_c.device())?
-    } else {
-        scales_c
-    };
-
-    let blocks_s = blocks_c.storage();
-    let scales_s = scales_c.storage();
-    let blocks_view = match &*blocks_s {
+    let blocks_view_base = match &*blocks_storage {
         Storage::Cuda(s) => s.as_cuda_slice::<u8>()?,
         _ => bail!("expected CUDA storage for blocks"),
     };
-    let scales_view = match &*scales_s {
+    let scales_view_base = match &*scales_storage {
         Storage::Cuda(s) => s.as_cuda_slice::<u8>()?,
         _ => bail!("expected CUDA storage for scales"),
     };
+    // Respect the logical tensor offset so the kernel reads the intended sub-range.
+    let blocks_view = blocks_view_base.slice(blocks_offset..);
+    let scales_view = scales_view_base.slice(scales_offset..);
+    let blocks_arg = &blocks_view;
+    let scales_arg = &scales_view;
 
     // Allocate output BF16 on device.
     let elem_count = rows * cols;
@@ -205,8 +185,8 @@ pub fn dequant_mxfp4_to_bf16_cuda(
         shared_mem_bytes: 0,
     };
     let mut builder = func.builder();
-    builder.arg(blocks_view);
-    builder.arg(scales_view);
+    builder.arg(blocks_arg);
+    builder.arg(scales_arg);
     builder.arg(&mut out_slice);
     crate::builder_arg!(builder, rows as i32, nblocks as i32, cols as i32);
     unsafe { builder.launch(cfg) }.w()?;
