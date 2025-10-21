@@ -2548,6 +2548,11 @@ static __device__ __forceinline__ float pow2_e8m0_device(uint8_t bexp) {
     return exp2f((float)e);
 }
 
+__device__ __constant__ int8_t MXFP4_FP4_LUT[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12,
+    0, -1, -2, -3, -4, -6, -8, -12
+};
+
 extern "C" __global__ void dequant_mxfp4_to_bf16(
     const uint8_t* __restrict__ blocks, // [rows, nblocks, 16]
     const uint8_t* __restrict__ scales, // [rows, nblocks]
@@ -2593,6 +2598,54 @@ extern "C" __global__ void mxfp4_unpack(
     const uint8_t v = in[idx];
     hi[idx] = v >> 4;
     lo[idx] = v & 0x0f;
+}
+
+extern "C" __global__ void matmul_mxfp4_bf16(
+    const __nv_bfloat16* __restrict__ act,    // [rows, in_dim]
+    const uint8_t* __restrict__ blocks,       // [out_dim, nblocks, 16]
+    const uint8_t* __restrict__ scales,       // [out_dim, nblocks]
+    __nv_bfloat16* __restrict__ out,          // [rows, out_dim]
+    const int rows,
+    const int out_dim,
+    const int nblocks,
+    const int in_dim,
+    const int act_row_stride,
+    const int out_row_stride
+) {
+    GGML_UNUSED(in_dim);
+    const int row = blockIdx.x;
+    const int col = blockIdx.y;
+    const int lane = threadIdx.x; // assume 32 threads per block
+
+    if (row >= rows || col >= out_dim || lane >= 32) {
+        return;
+    }
+
+    const int elems_per_block = 32;
+    const int bytes_per_block = 16;
+    const int block_base = col * nblocks * bytes_per_block;
+    const int scale_base = col * nblocks;
+    const __nv_bfloat16* act_row = act + (size_t)row * (size_t)act_row_stride;
+    const uint8_t* block_row = blocks + block_base;
+    const uint8_t* scale_row = scales + scale_base;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < nblocks; ++b) {
+        const uint8_t packed = block_row[b * bytes_per_block + (lane >> 1)];
+        const uint8_t nibble = (lane & 1) ? (packed >> 4) : (packed & 0x0f);
+        const float decoded = 0.5f * (float)MXFP4_FP4_LUT[nibble];
+        const float scale = pow2_e8m0_device(scale_row[b]);
+        const int act_idx = b * elems_per_block + lane;
+        const float act_val = __bfloat162float(act_row[act_idx]);
+        acc += act_val * (decoded * scale);
+    }
+
+    acc = warp_reduce_sum(acc);
+
+    if (lane == 0) {
+        out[(size_t)row * (size_t)out_row_stride + col] = __float2bfloat16(acc);
+    }
 }
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(

@@ -1,9 +1,12 @@
 #![cfg(feature = "cuda")]
 
-use candle_core::{mxfp4::{dequant_mxfp4_to_bf16, dequant_mxfp4_to_bf16_cpu}, Device, Result, Tensor};
+use candle_core::{
+    mxfp4::{dequant_mxfp4_to_bf16, dequant_mxfp4_to_bf16_cpu},
+    Device, Result, Tensor,
+};
 use half::bf16;
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::time::Instant;
 
 const K_BLOCK: usize = 32;
@@ -39,26 +42,40 @@ fn decode_fp4_e2m1(n: u8) -> f32 {
     let e = (n >> 1) & 0x3;
     let m = n & 0x1;
     let sign = if s == 1 { -1.0 } else { 1.0 };
-    if e == 0 { sign * (m as f32) * 0.5 } else { let frac = 1.0 + (m as f32) * 0.5; let exp = (e as i32) - 1; sign * (2f32).powi(exp) * frac }
+    if e == 0 {
+        sign * (m as f32) * 0.5
+    } else {
+        let frac = 1.0 + (m as f32) * 0.5;
+        let exp = (e as i32) - 1;
+        sign * (2f32).powi(exp) * frac
+    }
 }
 
 fn quantize_block_e2m1(values: &[f32]) -> (u8, [u8; 16]) {
     assert_eq!(values.len(), K_BLOCK);
-    if values.iter().all(|&v| v == 0.0) { return (0u8, [0u8; 16]); }
+    if values.iter().all(|&v| v == 0.0) {
+        return (0u8, [0u8; 16]);
+    }
     let mut best_exp: i8 = 0;
     let mut best_err = f64::INFINITY;
     let mut best_packed = [0u8; 16];
-    let max_abs = values.iter().map(|v| v.abs()).fold(0f32, |a,b| a.max(b));
-    let mut center = if max_abs > 0.0 { (max_abs / 6.0).log2().floor() as i32 } else { 0 };
+    let max_abs = values.iter().map(|v| v.abs()).fold(0f32, |a, b| a.max(b));
+    let mut center = if max_abs > 0.0 {
+        (max_abs / 6.0).log2().floor() as i32
+    } else {
+        0
+    };
     center = center.clamp(-32, 31);
-    let candidates: Vec<i8> = ((center - 8)..=(center + 8)).map(|e| e.clamp(-32, 31) as i8).collect();
+    let candidates: Vec<i8> = ((center - 8)..=(center + 8))
+        .map(|e| e.clamp(-32, 31) as i8)
+        .collect();
     for exp in candidates {
         let scale = (2f32).powi(exp as i32);
         let mut packed = [0u8; 16];
         let mut sse = 0f64;
         for j in 0..16 {
-            let i0 = 2*j;
-            let i1 = i0+1;
+            let i0 = 2 * j;
+            let i1 = i0 + 1;
             let q0 = values[i0] / scale;
             let q1 = values[i1] / scale;
             let c0 = encode_fp4_e2m1(q0);
@@ -69,7 +86,11 @@ fn quantize_block_e2m1(values: &[f32]) -> (u8, [u8; 16]) {
             sse += (values[i1] as f64 - v1 as f64).powi(2);
             packed[j] = (c1 << 4) | (c0 & 0x0f);
         }
-        if sse < best_err { best_err = sse; best_exp = exp; best_packed = packed; }
+        if sse < best_err {
+            best_err = sse;
+            best_exp = exp;
+            best_packed = packed;
+        }
     }
     // MXFP4 E8M0 uses biased-u8 exponent with bias 127; avoid 0xFF reserved.
     ((best_exp as i32 + 127) as u8, best_packed)
@@ -83,7 +104,9 @@ fn t5_cpu_gpu_parity_small() -> Result<()> {
     // Synthetic matrix with stable seed
     let mut rng = StdRng::seed_from_u64(42);
     let mut w = vec![0f32; rows * cols];
-    for v in &mut w { *v = rng.random::<f32>() * 4.0 - 2.0; }
+    for v in &mut w {
+        *v = rng.random::<f32>() * 4.0 - 2.0;
+    }
 
     // Quantize per 32-col block
     let mut blocks = vec![0u8; rows * nblocks * 16];
@@ -91,10 +114,10 @@ fn t5_cpu_gpu_parity_small() -> Result<()> {
     for r in 0..rows {
         for b in 0..nblocks {
             let base = r * cols + b * K_BLOCK;
-            let (se, packed) = quantize_block_e2m1(&w[base..base+K_BLOCK]);
+            let (se, packed) = quantize_block_e2m1(&w[base..base + K_BLOCK]);
             scales[r * nblocks + b] = se;
             let off = (r * nblocks + b) * 16;
-            blocks[off..off+16].copy_from_slice(&packed);
+            blocks[off..off + 16].copy_from_slice(&packed);
         }
     }
 
@@ -121,6 +144,88 @@ fn t5_cpu_gpu_parity_small() -> Result<()> {
 }
 
 #[test]
+fn t6_matmul_cuda_parity() -> Result<()> {
+    let dev = candle_core::Device::new_cuda(0)?;
+    let rows = 3usize;
+    let in_dim = 64usize;
+    let out_dim = 5usize;
+    let nblocks = in_dim / K_BLOCK;
+
+    let mut rng = StdRng::seed_from_u64(1234);
+
+    let mut act_vals = vec![0f32; rows * in_dim];
+    for v in &mut act_vals {
+        *v = rng.random_range(-3.0..3.0);
+    }
+    let act = Tensor::from_vec(act_vals, (rows, in_dim), &candle_core::Device::Cpu)?
+        .to_dtype(candle_core::DType::BF16)?
+        .to_device(&dev)?;
+
+    let mut weight_vals = vec![0f32; out_dim * in_dim];
+    for v in &mut weight_vals {
+        *v = rng.random_range(-2.5..2.5);
+    }
+
+    let mut blocks_data = vec![0u8; out_dim * nblocks * 16];
+    let mut scales_data = vec![0u8; out_dim * nblocks];
+    for row in 0..out_dim {
+        for block in 0..nblocks {
+            let start = row * in_dim + block * K_BLOCK;
+            let (scale, packed) = quantize_block_e2m1(&weight_vals[start..start + K_BLOCK]);
+            scales_data[row * nblocks + block] = scale;
+            let dst = (row * nblocks + block) * 16;
+            blocks_data[dst..dst + 16].copy_from_slice(&packed);
+        }
+    }
+
+    let blocks = Tensor::from_vec(blocks_data, (out_dim, nblocks, 16), &dev)?;
+    let scales = Tensor::from_vec(scales_data, (out_dim, nblocks), &dev)?;
+
+    let weight_dequant =
+        candle_core::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
+    let reference = act.matmul(&weight_dequant.t()?)?;
+    let fused = candle_core::mxfp4::matmul_mxfp4_bf16(&act, &blocks, &scales)?;
+
+    let fused_cpu = fused
+        .to_dtype(candle_core::DType::F32)?
+        .to_device(&candle_core::Device::Cpu)?
+        .to_vec2::<f32>()?;
+    let reference_cpu = reference
+        .to_dtype(candle_core::DType::F32)?
+        .to_device(&candle_core::Device::Cpu)?
+        .to_vec2::<f32>()?;
+
+    let mut max_abs = 0f32;
+    let mut sum_sq = 0f64;
+    for (f_row, r_row) in fused_cpu.iter().zip(reference_cpu.iter()) {
+        for (&f, &r) in f_row.iter().zip(r_row.iter()) {
+            let diff = f - r;
+            max_abs = max_abs.max(diff.abs());
+            sum_sq += (diff as f64) * (diff as f64);
+        }
+    }
+    let l2 = (sum_sq).sqrt();
+
+    println!("=== MXFP4 matmul CUDA parity ===");
+    println!(
+        "rows={}, in_dim={}, out_dim={}, seed=1234",
+        rows, in_dim, out_dim
+    );
+    println!("max_abs_diff={:.3e}, l2_diff={:.3e}", max_abs, l2);
+    println!(
+        "reference[0][:5]={:?}\nfused[0][:5]={:?}",
+        &reference_cpu[0][..5.min(reference_cpu[0].len())],
+        &fused_cpu[0][..5.min(fused_cpu[0].len())]
+    );
+
+    assert!(
+        max_abs <= 1.5e-3,
+        "excessive difference in fused MXFP4 matmul"
+    );
+    Ok(())
+}
+
+#[test]
 fn t4_e8m0_gpu_scale_key_codes() -> Result<()> {
     let dev = Device::new_cuda(0)?;
     // Single row, one block (32 elems)
@@ -143,10 +248,16 @@ fn t4_e8m0_gpu_scale_key_codes() -> Result<()> {
         let vals = out_cpu.to_vec2::<half::bf16>()?;
         let v0 = vals[0][0].to_f32();
         match code {
-            0 => assert!((v0 - 2f32.powi(-127)).abs() < 1e-7, "code=0 expected 2^-127, got {v0}"),
+            0 => assert!(
+                (v0 - 2f32.powi(-127)).abs() < 1e-7,
+                "code=0 expected 2^-127, got {v0}"
+            ),
             127 => assert!((v0 - 1.0).abs() < 1e-7, "code=127 expected 1.0, got {v0}"),
             128 => assert!((v0 - 2.0).abs() < 1e-7, "code=128 expected 2.0, got {v0}"),
-            254 => assert!((v0 - 2f32.powi(127)).abs() < 1e-2, "code=254 expected 2^127, got {v0}"),
+            254 => assert!(
+                (v0 - 2f32.powi(127)).abs() < 1e-2,
+                "code=254 expected 2^127, got {v0}"
+            ),
             255 => assert!(v0.is_nan(), "code=255 expected NaN"),
             _ => unreachable!(),
         }
@@ -161,16 +272,18 @@ fn t6_throughput_sanity_short() -> Result<()> {
     let nblocks = cols / K_BLOCK;
     let mut rng = StdRng::seed_from_u64(7);
     let mut w = vec![0f32; rows * cols];
-    for v in &mut w { *v = rng.random::<f32>() * 5.0 - 2.5; }
+    for v in &mut w {
+        *v = rng.random::<f32>() * 5.0 - 2.5;
+    }
     let mut blocks = vec![0u8; rows * nblocks * 16];
     let mut scales = vec![0u8; rows * nblocks];
     for r in 0..rows {
         for b in 0..nblocks {
             let base = r * cols + b * K_BLOCK;
-            let (se, packed) = quantize_block_e2m1(&w[base..base+K_BLOCK]);
+            let (se, packed) = quantize_block_e2m1(&w[base..base + K_BLOCK]);
             scales[r * nblocks + b] = se;
             let off = (r * nblocks + b) * 16;
-            blocks[off..off+16].copy_from_slice(&packed);
+            blocks[off..off + 16].copy_from_slice(&packed);
         }
     }
     let blocks_t = Tensor::from_vec(blocks.clone(), (rows, nblocks, 16), &Device::Cpu)?;

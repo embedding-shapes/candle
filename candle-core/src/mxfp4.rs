@@ -82,7 +82,11 @@ fn decode_fp4_e2m1(nibble: u8) -> f32 {
 /// - For code == 0xFF: scale = NaN (reserved code)
 #[inline]
 fn pow2_e8m0(scale_exp: u8) -> f32 {
-    if scale_exp == 0xFF { f32::NAN } else { (2f32).powi((scale_exp as i32) - 127) }
+    if scale_exp == 0xFF {
+        f32::NAN
+    } else {
+        (2f32).powi((scale_exp as i32) - 127)
+    }
 }
 
 /// Dequantize MXFP4 packed weights on CPU into a contiguous BF16 tensor with shape `[rows, cols]`.
@@ -145,7 +149,8 @@ pub fn dequant_mxfp4_to_bf16_cuda(
     use cudarc::driver::PushKernelArg;
     let (rows, cols, nblocks) = validate_mxfp4_shapes(blocks, scales, full_shape)?;
     // Both inputs must be on CUDA and same device.
-    if !matches!(blocks.device(), Device::Cuda(_)) || !blocks.device().same_device(scales.device()) {
+    if !matches!(blocks.device(), Device::Cuda(_)) || !blocks.device().same_device(scales.device())
+    {
         bail!("dequant_mxfp4_to_bf16_cuda expects both inputs on the same CUDA device")
     }
     let dev: &CudaDevice = blocks.device().as_cuda_device()?;
@@ -192,7 +197,12 @@ pub fn dequant_mxfp4_to_bf16_cuda(
     unsafe { builder.launch(cfg) }.w()?;
 
     let out_storage = CudaStorage::wrap_cuda_slice(out_slice, dev.clone());
-    let tensor = crate::tensor::from_storage(Storage::Cuda(out_storage), (rows, cols), BackpropOp::none(), false);
+    let tensor = crate::tensor::from_storage(
+        Storage::Cuda(out_storage),
+        (rows, cols),
+        BackpropOp::none(),
+        false,
+    );
     Ok(tensor)
 }
 
@@ -203,7 +213,10 @@ pub fn dequant_mxfp4_to_bf16(
     full_shape: [usize; 2],
 ) -> Result<Tensor> {
     // Diagnostic override: allow forcing CPU dequantization regardless of device.
-    let force_cpu = matches!(std::env::var("CANDLE_DEQUANT_ON_CPU").ok().as_deref(), Some("1") | Some("true") | Some("TRUE"));
+    let force_cpu = matches!(
+        std::env::var("CANDLE_DEQUANT_ON_CPU").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    );
     match (blocks.device(), scales.device()) {
         (Device::Cuda(_), d2) if blocks.device().same_device(d2) => {
             if force_cpu {
@@ -219,6 +232,140 @@ pub fn dequant_mxfp4_to_bf16(
             }
         }
         _ => dequant_mxfp4_to_bf16_cpu(blocks, scales, full_shape),
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub fn matmul_mxfp4_bf16_cuda(
+    act: &Tensor,
+    blocks: &Tensor,
+    scales: &Tensor,
+    rows: usize,
+    out_dim: usize,
+    nblocks: usize,
+    in_dim: usize,
+) -> Result<Tensor> {
+    use crate::{cuda_backend::WrapErr, op::BackpropOp, storage::Storage, CudaDevice, CudaStorage};
+    use cudarc::driver::PushKernelArg;
+
+    let dev: &CudaDevice = act.device().as_cuda_device()?;
+
+    let act_base = if act.is_contiguous() {
+        act.clone()
+    } else {
+        act.contiguous()?
+    };
+    let (act_storage, act_layout) = act_base.storage_and_layout();
+    let act_offset = act_layout.start_offset();
+    let act_view_base = match &*act_storage {
+        Storage::Cuda(s) => s.as_cuda_slice::<bf16>()?,
+        _ => bail!("expected CUDA storage for activations"),
+    };
+    let act_view = act_view_base.slice(act_offset..);
+    let act_strides = act_layout.stride();
+    if act_strides.len() != 2 || act_strides[1] != 1 {
+        bail!("matmul_mxfp4_bf16_cuda expects row-major activations (stride[1] == 1)")
+    }
+    let act_row_stride = act_strides[0];
+    if act_row_stride < in_dim {
+        bail!("activation row stride {act_row_stride} too small for in_dim {in_dim}")
+    }
+
+    let blocks_base = if blocks.is_contiguous() {
+        blocks.clone()
+    } else {
+        blocks.contiguous()?
+    };
+    let (blocks_storage, blocks_layout) = blocks_base.storage_and_layout();
+    let blocks_offset = blocks_layout.start_offset();
+    let blocks_view_base = match &*blocks_storage {
+        Storage::Cuda(s) => s.as_cuda_slice::<u8>()?,
+        _ => bail!("expected CUDA storage for MXFP4 blocks"),
+    };
+    let blocks_view = blocks_view_base.slice(blocks_offset..);
+
+    let scales_base = if scales.is_contiguous() {
+        scales.clone()
+    } else {
+        scales.contiguous()?
+    };
+    let (scales_storage, scales_layout) = scales_base.storage_and_layout();
+    let scales_offset = scales_layout.start_offset();
+    let scales_view_base = match &*scales_storage {
+        Storage::Cuda(s) => s.as_cuda_slice::<u8>()?,
+        _ => bail!("expected CUDA storage for MXFP4 scales"),
+    };
+    let scales_view = scales_view_base.slice(scales_offset..);
+
+    let mut out_slice = unsafe { dev.alloc::<bf16>(rows * out_dim)? };
+
+    let func = dev.get_or_load_func("matmul_mxfp4_bf16", &candle_kernels::QUANTIZED)?;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (rows as u32, out_dim as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    builder.arg(&act_view);
+    builder.arg(&blocks_view);
+    builder.arg(&scales_view);
+    builder.arg(&mut out_slice);
+    crate::builder_arg!(
+        builder,
+        rows as i32,
+        out_dim as i32,
+        nblocks as i32,
+        in_dim as i32,
+        act_row_stride as i32,
+        out_dim as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    let out_storage = CudaStorage::wrap_cuda_slice(out_slice, dev.clone());
+    let tensor = crate::tensor::from_storage(
+        crate::storage::Storage::Cuda(out_storage),
+        (rows, out_dim),
+        BackpropOp::none(),
+        false,
+    );
+    Ok(tensor)
+}
+
+pub fn matmul_mxfp4_bf16(act: &Tensor, blocks: &Tensor, scales: &Tensor) -> Result<Tensor> {
+    let (rows, in_dim) = act.dims2()?;
+    let (out_dim, nblocks, bytes) = blocks.dims3()?;
+    if bytes != MXFP4_BLOCK_BYTES {
+        bail!("mxfp4 blocks last dimension must be 16 bytes, got {bytes}")
+    }
+    let (_, cols, _) = validate_mxfp4_shapes(blocks, scales, [out_dim, in_dim])?;
+    if cols != in_dim {
+        bail!("activation dim {in_dim} does not match MXFP4 cols {cols}");
+    }
+    let act_dev = act.device();
+    let blocks_dev = blocks.device();
+    let scales_dev = scales.device();
+
+    if !act_dev.same_device(&blocks_dev) || !blocks_dev.same_device(&scales_dev) {
+        bail!("activations, blocks, and scales must live on the same device for MXFP4 matmul")
+    }
+
+    match act_dev {
+        Device::Cuda(_) => {
+            #[cfg(feature = "cuda")]
+            {
+                return matmul_mxfp4_bf16_cuda(act, blocks, scales, rows, out_dim, nblocks, in_dim);
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                bail!("CUDA matmul requested but candle built without feature=\"cuda\"")
+            }
+        }
+        Device::Cpu => {
+            let weight = dequant_mxfp4_to_bf16(blocks, scales, [out_dim, in_dim])?;
+            let output = act.matmul(&weight.t()?)?;
+            Ok(output)
+        }
+        other => bail!("unsupported device for MXFP4 matmul: {other:?}"),
     }
 }
 
@@ -294,8 +441,12 @@ mod tests {
             (6.0, 0b111), // e=3,m=1
         ];
         // Fast-path saturation and underflow
-        if ax < 0.25 { return sign << 3 /* +0.0 or -0.0, both decode to 0.0 */; }
-        if ax >= 6.0 { return (sign << 3) | POS[7].1; }
+        if ax < 0.25 {
+            return sign << 3 /* +0.0 or -0.0, both decode to 0.0 */;
+        }
+        if ax >= 6.0 {
+            return (sign << 3) | POS[7].1;
+        }
         // Search nearest; on exact ties prefer the candidate with mantissa bit 0 (even)
         let mut best = 0usize;
         let mut best_d = f32::INFINITY;
@@ -307,9 +458,13 @@ mod tests {
                 best = i;
                 best_d = d;
                 best_m_bit = m_bit;
-            } else if (d - best_d).abs() <= 0.0 { // exact tie
+            } else if (d - best_d).abs() <= 0.0 {
+                // exact tie
                 // prefer even mantissa (m_bit == 0)
-                if m_bit == 0 && best_m_bit == 1 { best = i; best_m_bit = 0; }
+                if m_bit == 0 && best_m_bit == 1 {
+                    best = i;
+                    best_m_bit = 0;
+                }
             }
         }
         // If the chosen representable is +0.0, force sign to + (ties-to-even near zero)
@@ -360,7 +515,9 @@ mod tests {
     // X = (largest power-of-two <= max|v|) / 2^2 = 2^(floor(log2(max|v|)) - 2)
     fn select_block_scale_pow2(vals: &[f32]) -> f32 {
         let max_abs = vals.iter().map(|v| v.abs()).fold(0f32, |a, b| a.max(b));
-        if max_abs == 0.0 { return (2f32).powi(-127); } // arbitrary minimal scale
+        if max_abs == 0.0 {
+            return (2f32).powi(-127);
+        } // arbitrary minimal scale
         let e = max_abs.log2().floor() as i32 - 2;
         (2f32).powi(e)
     }
@@ -382,11 +539,11 @@ mod tests {
     fn idempotent_round_trip_fixed_scale() {
         // Fix scale X, quantize -> dequantize -> requantize reproduces codes.
         let vals = [
-            -7.1, -6.0, -5.0, -3.7, -2.5, -1.75, -1.25, -0.75, -0.25, 0.0,
-             0.25, 0.3, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.1
+            -7.1, -6.0, -5.0, -3.7, -2.5, -1.75, -1.25, -0.75, -0.25, 0.0, 0.25, 0.3, 0.5, 0.75,
+            1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.1,
         ];
         let x = 2.0f32; // power-of-two scale
-        // Quantize codes
+                        // Quantize codes
         let mut codes = Vec::new();
         for &v in &vals {
             let q = v / x;
@@ -399,7 +556,10 @@ mod tests {
             let c2 = encode_fp4_e2m1_ties_even(v / x);
             rec.push(c2);
         }
-        assert_eq!(codes, rec, "codes not preserved under fixed-scale round-trip");
+        assert_eq!(
+            codes, rec,
+            "codes not preserved under fixed-scale round-trip"
+        );
     }
 
     #[test]
@@ -408,11 +568,17 @@ mod tests {
         let rows = 1usize;
         let cols = MXFP4_BLOCK_ELEMS;
         let nblocks = 1usize;
-        let blocks = Tensor::from_vec(vec![0x22u8; MXFP4_BLOCK_BYTES], (rows, nblocks, MXFP4_BLOCK_BYTES), &Device::Cpu)?;
+        let blocks = Tensor::from_vec(
+            vec![0x22u8; MXFP4_BLOCK_BYTES],
+            (rows, nblocks, MXFP4_BLOCK_BYTES),
+            &Device::Cpu,
+        )?;
         let scales = Tensor::from_vec(vec![0xFFu8], (rows, nblocks), &Device::Cpu)?;
         let out = dequant_mxfp4_to_bf16_cpu(&blocks, &scales, [rows, cols])?;
         let v = out.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        for i in 0..cols { assert!(v[0][i].is_nan(), "elem {i} expected NaN"); }
+        for i in 0..cols {
+            assert!(v[0][i].is_nan(), "elem {i} expected NaN");
+        }
         Ok(())
     }
 
@@ -448,7 +614,12 @@ mod tests {
             b_dq[i] = decode_fp4_e2m1(pb[i]) * xb;
         }
         let dot_ref: f32 = a_dq.iter().zip(b_dq.iter()).map(|(x, y)| x * y).sum();
-        assert!((dot_q - dot_ref).abs() < 1e-6, "dot semantics mismatch: {} vs {}", dot_q, dot_ref);
+        assert!(
+            (dot_q - dot_ref).abs() < 1e-6,
+            "dot semantics mismatch: {} vs {}",
+            dot_q,
+            dot_ref
+        );
     }
 
     #[test]
@@ -457,10 +628,19 @@ mod tests {
         let rows = 1usize;
         let cols = 48usize; // not divisible by 32
         let nblocks = 1usize; // mismatch on purpose
-        let blocks = Tensor::from_vec(vec![0u8; MXFP4_BLOCK_BYTES], (rows, nblocks, MXFP4_BLOCK_BYTES), &Device::Cpu).unwrap();
+        let blocks = Tensor::from_vec(
+            vec![0u8; MXFP4_BLOCK_BYTES],
+            (rows, nblocks, MXFP4_BLOCK_BYTES),
+            &Device::Cpu,
+        )
+        .unwrap();
         let scales = Tensor::from_vec(vec![0u8; nblocks], (rows, nblocks), &Device::Cpu).unwrap();
         let err = dequant_mxfp4_to_bf16_cpu(&blocks, &scales, [rows, cols]).unwrap_err();
         let msg = format!("{}", err);
-        assert!(msg.contains("must be multiple of 32"), "unexpected error: {}", msg);
+        assert!(
+            msg.contains("must be multiple of 32"),
+            "unexpected error: {}",
+            msg
+        );
     }
 }

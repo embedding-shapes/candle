@@ -85,9 +85,9 @@ pub mod config {
 }
 
 pub mod experts {
+    use crate::models::deepseek2::TopKLastDimOp;
     use candle::{DType, Module, Result, Tensor, D};
     use candle_nn::{ops, Linear};
-    use crate::models::deepseek2::TopKLastDimOp;
 
     // Configurable constants
     const DEFAULT_TOP_K: usize = 4;
@@ -102,7 +102,12 @@ pub mod experts {
 
     impl ExpertMlp {
         pub fn new(gate_up: Linear, down: Linear, limit: f32, alpha: f32) -> Self {
-            Self { gate_up, down, limit, alpha }
+            Self {
+                gate_up,
+                down,
+                limit,
+                alpha,
+            }
         }
     }
 
@@ -134,17 +139,26 @@ pub mod experts {
                 let gu_f32 = gu.to_dtype(DType::F32)?;
                 let gu_vec = gu_f32.to_vec2::<f32>()?;
                 if !gu_vec.is_empty() {
-                    eprintln!("[L1 Expert] gate_up first 16: {:?}", &gu_vec[0][..16.min(gu_vec[0].len())]);
+                    eprintln!(
+                        "[L1 Expert] gate_up first 16: {:?}",
+                        &gu_vec[0][..16.min(gu_vec[0].len())]
+                    );
                 }
 
                 let gate_vec = gate.to_vec2::<f32>()?;
                 if !gate_vec.is_empty() {
-                    eprintln!("[L1 Expert] gate first 8: {:?}", &gate_vec[0][..8.min(gate_vec[0].len())]);
+                    eprintln!(
+                        "[L1 Expert] gate first 8: {:?}",
+                        &gate_vec[0][..8.min(gate_vec[0].len())]
+                    );
                 }
 
                 let up_vec = up.to_vec2::<f32>()?;
                 if !up_vec.is_empty() {
-                    eprintln!("[L1 Expert] up first 8: {:?}", &up_vec[0][..8.min(up_vec[0].len())]);
+                    eprintln!(
+                        "[L1 Expert] up first 8: {:?}",
+                        &up_vec[0][..8.min(up_vec[0].len())]
+                    );
                 }
             }
 
@@ -166,7 +180,10 @@ pub mod experts {
                 let fused_f32 = fused.to_dtype(DType::F32)?;
                 let fused_vec = fused_f32.to_vec2::<f32>()?;
                 if !fused_vec.is_empty() {
-                    eprintln!("[L1 Expert] fused (before down) first 8: {:?}", &fused_vec[0][..8.min(fused_vec[0].len())]);
+                    eprintln!(
+                        "[L1 Expert] fused (before down) first 8: {:?}",
+                        &fused_vec[0][..8.min(fused_vec[0].len())]
+                    );
                 }
             }
 
@@ -176,7 +193,10 @@ pub mod experts {
                 let result_f32 = result.to_dtype(DType::F32)?;
                 let result_vec = result_f32.to_vec2::<f32>()?;
                 if !result_vec.is_empty() {
-                    eprintln!("[L1 Expert] result (after down) first 8: {:?}", &result_vec[0][..8.min(result_vec[0].len())]);
+                    eprintln!(
+                        "[L1 Expert] result (after down) first 8: {:?}",
+                        &result_vec[0][..8.min(result_vec[0].len())]
+                    );
                 }
             }
 
@@ -192,10 +212,20 @@ pub mod experts {
     }
 
     impl GptOssExperts {
-        pub fn new(router: Linear, experts: Vec<ExpertMlp>, num_experts_per_tok: Option<usize>) -> Self {
-            let k_env = std::env::var("CANDLE_MOE_TOPK").ok().and_then(|s| s.parse::<usize>().ok());
+        pub fn new(
+            router: Linear,
+            experts: Vec<ExpertMlp>,
+            num_experts_per_tok: Option<usize>,
+        ) -> Self {
+            let k_env = std::env::var("CANDLE_MOE_TOPK")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok());
             let k = k_env.or(num_experts_per_tok).unwrap_or(DEFAULT_TOP_K);
-            Self { router, experts, num_experts_per_tok: k }
+            Self {
+                router,
+                experts,
+                num_experts_per_tok: k,
+            }
         }
 
         pub fn router_topk_softmax(&self, logits: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -222,25 +252,39 @@ pub mod experts {
             let dump_l1 = std::env::var("CANDLE_DUMP_L1").ok().as_deref() == Some("1");
             if dump_l1 {
                 let last_idx = probs_host.len() - 1;
-                eprintln!("[L1 MLP Router] Last token routes to: {:?}", &idx_host[last_idx]);
-                eprintln!("[L1 MLP Router] Last token probs: {:?}", &probs_host[last_idx]);
+                eprintln!(
+                    "[L1 MLP Router] Last token routes to: {:?}",
+                    &idx_host[last_idx]
+                );
+                eprintln!(
+                    "[L1 MLP Router] Last token probs: {:?}",
+                    &probs_host[last_idx]
+                );
 
                 // Debug: print raw router logits for last token
                 let logits_f32 = logits.to_dtype(DType::F32)?;
                 let logits_host = logits_f32.to_vec2::<f32>()?;
-                eprintln!("[L1 MLP Router] Last token raw logits (all 32): {:?}", &logits_host[last_idx]);
+                eprintln!(
+                    "[L1 MLP Router] Last token raw logits (all 32): {:?}",
+                    &logits_host[last_idx]
+                );
 
                 // Debug: print top-k values before softmax
                 let topk_result = logits.contiguous()?.topk(self.num_experts_per_tok)?;
                 let topk_vals_f32 = topk_result.values.to_dtype(DType::F32)?;
                 let topk_vals_host = topk_vals_f32.to_vec2::<f32>()?;
-                eprintln!("[L1 MLP Router] Last token top-4 logits (before softmax): {:?}", &topk_vals_host[last_idx]);
+                eprintln!(
+                    "[L1 MLP Router] Last token top-4 logits (before softmax): {:?}",
+                    &topk_vals_host[last_idx]
+                );
             }
 
             let n_experts = self.experts.len();
             let mut token_ids: Vec<Vec<u32>> = vec![Vec::new(); n_experts];
             let mut token_wts: Vec<Vec<f32>> = vec![Vec::new(); n_experts];
-            for (row, (row_probs, row_experts)) in probs_host.iter().zip(idx_host.iter()).enumerate() {
+            for (row, (row_probs, row_experts)) in
+                probs_host.iter().zip(idx_host.iter()).enumerate()
+            {
                 for (&p, &e) in row_probs.iter().zip(row_experts.iter()) {
                     token_ids[e as usize].push(row as u32);
                     token_wts[e as usize].push(p);
@@ -261,22 +305,42 @@ pub mod experts {
                     .to_dtype(xs2.dtype())?;
                 let x_sel = xs2.index_select(&ids_t, 0)?;
                 if dump_l1 {
-                    eprintln!("[L1 MLP] Expert {}: {} tokens, weights: {:?}", e_idx, ids.len(), &token_wts[e_idx]);
+                    eprintln!(
+                        "[L1 MLP] Expert {}: {} tokens, weights: {:?}",
+                        e_idx,
+                        ids.len(),
+                        &token_wts[e_idx]
+                    );
                 }
                 let y_sel = expert.forward(&x_sel)?;
                 if dump_l1 && ids.contains(&((probs_host.len() - 1) as u32)) {
                     let y_sel_f32 = y_sel.to_dtype(DType::F32)?;
                     let y_sel_vec = y_sel_f32.to_vec2::<f32>()?;
-                    let last_in_batch = ids.iter().position(|&id| id == ((probs_host.len() - 1) as u32)).unwrap();
-                    eprintln!("[L1 MLP] Expert {} last token output (before weight): {:?}", e_idx, &y_sel_vec[last_in_batch][..8]);
+                    let last_in_batch = ids
+                        .iter()
+                        .position(|&id| id == ((probs_host.len() - 1) as u32))
+                        .unwrap();
+                    eprintln!(
+                        "[L1 MLP] Expert {} last token output (before weight): {:?}",
+                        e_idx,
+                        &y_sel_vec[last_in_batch][..8]
+                    );
                 }
                 let y_sel = y_sel.broadcast_mul(&wts_t)?;
                 if dump_l1 && ids.contains(&((probs_host.len() - 1) as u32)) {
                     let y_sel_f32 = y_sel.to_dtype(DType::F32)?;
                     let y_sel_vec = y_sel_f32.to_vec2::<f32>()?;
-                    let last_in_batch = ids.iter().position(|&id| id == ((probs_host.len() - 1) as u32)).unwrap();
+                    let last_in_batch = ids
+                        .iter()
+                        .position(|&id| id == ((probs_host.len() - 1) as u32))
+                        .unwrap();
                     let weight = token_wts[e_idx][last_in_batch];
-                    eprintln!("[L1 MLP] Expert {} last token output (after weight {}): {:?}", e_idx, weight, &y_sel_vec[last_in_batch][..8]);
+                    eprintln!(
+                        "[L1 MLP] Expert {} last token output (after weight {}): {:?}",
+                        e_idx,
+                        weight,
+                        &y_sel_vec[last_in_batch][..8]
+                    );
                 }
                 ys = ys.index_add(&ids_t, &y_sel, 0)?;
             }
@@ -286,7 +350,10 @@ pub mod experts {
                 let result_vec = result_f32.to_vec3::<f32>()?;
                 if !result_vec.is_empty() && !result_vec[0].is_empty() {
                     let last_idx = result_vec[0].len() - 1;
-                    eprintln!("[L1 MLP] Final aggregated last token [:8]: {:?}", &result_vec[0][last_idx][..8]);
+                    eprintln!(
+                        "[L1 MLP] Final aggregated last token [:8]: {:?}",
+                        &result_vec[0][last_idx][..8]
+                    );
                 }
             }
             Ok(result)
@@ -372,15 +439,19 @@ pub mod rotary {
                 ones.broadcast_sub(&ramp)?
             };
 
-            let inv_freq_extrapolation =
-                Tensor::from_vec(inv_freq_extrapolation, (1, dim2), dev)?;
-            let inv_freq_interpolation =
-                Tensor::from_vec(inv_freq_interpolation, (1, dim2), dev)?;
+            let inv_freq_extrapolation = Tensor::from_vec(inv_freq_extrapolation, (1, dim2), dev)?;
+            let inv_freq_interpolation = Tensor::from_vec(inv_freq_interpolation, (1, dim2), dev)?;
 
-            let ones = Tensor::ones(inv_freq_extrapolation_factor.shape().dims(), DType::F32, dev)?;
+            let ones = Tensor::ones(
+                inv_freq_extrapolation_factor.shape().dims(),
+                DType::F32,
+                dev,
+            )?;
             let inv_freq = inv_freq_interpolation
                 .broadcast_mul(&ones.broadcast_sub(&inv_freq_extrapolation_factor)?)?
-                .broadcast_add(&inv_freq_extrapolation.broadcast_mul(&inv_freq_extrapolation_factor)?)?;
+                .broadcast_add(
+                    &inv_freq_extrapolation.broadcast_mul(&inv_freq_extrapolation_factor)?,
+                )?;
 
             let t = Tensor::arange(0u32, cfg.max_position_embeddings as u32, dev)?
                 .to_dtype(DType::F32)?
@@ -404,7 +475,11 @@ pub mod rotary {
                 }
             }
 
-            Ok(Self { sin, cos, attn_factor })
+            Ok(Self {
+                sin,
+                cos,
+                attn_factor,
+            })
         }
 
         pub fn apply_rotary_emb_qk(
@@ -421,9 +496,15 @@ pub mod rotary {
             Ok((q_embed, k_embed))
         }
 
-        pub fn cos_table(&self) -> &Tensor { &self.cos }
-        pub fn sin_table(&self) -> &Tensor { &self.sin }
-        pub fn attention_factor(&self) -> f32 { self.attn_factor }
+        pub fn cos_table(&self) -> &Tensor {
+            &self.cos
+        }
+        pub fn sin_table(&self) -> &Tensor {
+            &self.sin
+        }
+        pub fn attention_factor(&self) -> f32 {
+            self.attn_factor
+        }
     }
 
     fn yarn_find_correction_dim(
@@ -454,7 +535,9 @@ pub mod rotary {
     }
 
     fn yarn_linear_ramp_mask(min: f32, mut max: f32, dim: usize, dev: &Device) -> Result<Tensor> {
-        if (min - max).abs() < f32::EPSILON { max += 0.001; }
+        if (min - max).abs() < f32::EPSILON {
+            max += 0.001;
+        }
         let idx = Tensor::arange(0f32, dim as f32, dev)?;
         let num = idx.broadcast_sub(&Tensor::new(min as f32, dev)?)?;
         let den = Tensor::new((max - min) as f32, dev)?;
@@ -463,7 +546,11 @@ pub mod rotary {
     }
 
     pub fn yarn_get_mscale(scale: f32) -> f32 {
-        if scale <= 1.0 { 1.0 } else { 0.1 * scale.ln() + 1.0 }
+        if scale <= 1.0 {
+            1.0
+        } else {
+            0.1 * scale.ln() + 1.0
+        }
     }
 }
 
@@ -472,7 +559,7 @@ pub mod model {
     use super::experts::{ExpertMlp, GptOssExperts};
     use super::rotary::{GptOssRopeConfig, GptOssRotaryEmbedding};
     use crate::models::with_tracing::{linear, Embedding, RmsNorm};
-    use candle::{DType, Device, Module, Result, Tensor, IndexOp, D};
+    use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
     use candle_nn::VarBuilder;
 
     const DEFAULT_RMS_EPS: f64 = 1e-5;
@@ -550,7 +637,11 @@ pub mod model {
 
                 let attn_vb = l_vb.pp("self_attn");
                 let q_proj = if attn_vb.contains_tensor("q_proj.bias") {
-                    linear(hidden, cfg.num_attention_heads * head_dim, attn_vb.pp("q_proj"))?
+                    linear(
+                        hidden,
+                        cfg.num_attention_heads * head_dim,
+                        attn_vb.pp("q_proj"),
+                    )?
                 } else {
                     crate::models::with_tracing::linear_no_bias(
                         hidden,
@@ -559,7 +650,11 @@ pub mod model {
                     )?
                 };
                 let k_proj = if attn_vb.contains_tensor("k_proj.bias") {
-                    linear(hidden, cfg.num_key_value_heads * head_dim, attn_vb.pp("k_proj"))?
+                    linear(
+                        hidden,
+                        cfg.num_key_value_heads * head_dim,
+                        attn_vb.pp("k_proj"),
+                    )?
                 } else {
                     crate::models::with_tracing::linear_no_bias(
                         hidden,
@@ -568,7 +663,11 @@ pub mod model {
                     )?
                 };
                 let v_proj = if attn_vb.contains_tensor("v_proj.bias") {
-                    linear(hidden, cfg.num_key_value_heads * head_dim, attn_vb.pp("v_proj"))?
+                    linear(
+                        hidden,
+                        cfg.num_key_value_heads * head_dim,
+                        attn_vb.pp("v_proj"),
+                    )?
                 } else {
                     crate::models::with_tracing::linear_no_bias(
                         hidden,
@@ -577,7 +676,11 @@ pub mod model {
                     )?
                 };
                 let o_proj = if attn_vb.contains_tensor("o_proj.bias") {
-                    linear(cfg.num_attention_heads * head_dim, hidden, attn_vb.pp("o_proj"))?
+                    linear(
+                        cfg.num_attention_heads * head_dim,
+                        hidden,
+                        attn_vb.pp("o_proj"),
+                    )?
                 } else {
                     crate::models::with_tracing::linear_no_bias(
                         cfg.num_attention_heads * head_dim,
@@ -591,10 +694,17 @@ pub mod model {
                     Tensor::zeros(cfg.num_attention_heads, DType::BF16, &Device::Cpu)?
                         .to_device(&dev)?
                 };
-                let attn = GptOssAttentionWeights { q_proj, k_proj, v_proj, o_proj, sinks };
+                let attn = GptOssAttentionWeights {
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    o_proj,
+                    sinks,
+                };
 
                 // HF/GPT-OSS uses `mlp.router` with a bias for the MoE router.
-                let router = candle_nn::linear(hidden, cfg.num_local_experts, l_vb.pp("mlp.router"))?;
+                let router =
+                    candle_nn::linear(hidden, cfg.num_local_experts, l_vb.pp("mlp.router"))?;
                 let experts = {
                     let mlp_vb = l_vb.pp("mlp");
                     let inter = cfg.intermediate_size;
@@ -619,56 +729,58 @@ pub mod model {
                         cfg.num_local_experts,
                     );
 
-                    let all: Vec<ExpertMlp> = if let (Ok(gate_ups), Ok(downs)) = (gate_up_all, down_all) {
-                        // Batched load succeeded - zip into ExpertMlp structs
-                        gate_ups.into_iter()
-                            .zip(downs.into_iter())
-                            .map(|(gate_up, down)| ExpertMlp::new(gate_up, down, limit, alpha))
-                            .collect()
-                    } else {
-                        // Batched load failed - fall back to per-expert loading
-                        let mut all: Vec<ExpertMlp> = Vec::with_capacity(cfg.num_local_experts);
-                        for e in 0..cfg.num_local_experts {
-                            let gate_up = match super::load_expert_linear_mxfp4_grouped(
-                                hidden,
-                                2 * inter,
-                                true,
-                                mlp_vb.clone(),
-                                "experts.gate_up_proj",
-                                e,
-                                cfg.num_local_experts,
-                            ) {
-                                Ok(l) => l,
-                                Err(_) => super::load_linear_maybe_mxfp4(
+                    let all: Vec<ExpertMlp> =
+                        if let (Ok(gate_ups), Ok(downs)) = (gate_up_all, down_all) {
+                            // Batched load succeeded - zip into ExpertMlp structs
+                            gate_ups
+                                .into_iter()
+                                .zip(downs.into_iter())
+                                .map(|(gate_up, down)| ExpertMlp::new(gate_up, down, limit, alpha))
+                                .collect()
+                        } else {
+                            // Batched load failed - fall back to per-expert loading
+                            let mut all: Vec<ExpertMlp> = Vec::with_capacity(cfg.num_local_experts);
+                            for e in 0..cfg.num_local_experts {
+                                let gate_up = match super::load_expert_linear_mxfp4_grouped(
                                     hidden,
                                     2 * inter,
                                     true,
-                                    mlp_vb.pp(&format!("experts.{e}")),
-                                    "gate_up_proj",
-                                )?,
-                            };
-                            let down = match super::load_expert_linear_mxfp4_grouped(
-                                inter,
-                                hidden,
-                                true,
-                                mlp_vb.clone(),
-                                "experts.down_proj",
-                                e,
-                                cfg.num_local_experts,
-                            ) {
-                                Ok(l) => l,
-                                Err(_) => super::load_linear_maybe_mxfp4(
+                                    mlp_vb.clone(),
+                                    "experts.gate_up_proj",
+                                    e,
+                                    cfg.num_local_experts,
+                                ) {
+                                    Ok(l) => l,
+                                    Err(_) => super::load_linear_maybe_mxfp4(
+                                        hidden,
+                                        2 * inter,
+                                        true,
+                                        mlp_vb.pp(&format!("experts.{e}")),
+                                        "gate_up_proj",
+                                    )?,
+                                };
+                                let down = match super::load_expert_linear_mxfp4_grouped(
                                     inter,
                                     hidden,
                                     true,
-                                    mlp_vb.pp(&format!("experts.{e}")),
-                                    "down_proj",
-                                )?,
-                            };
-                            all.push(ExpertMlp::new(gate_up, down, limit, alpha));
-                        }
-                        all
-                    };
+                                    mlp_vb.clone(),
+                                    "experts.down_proj",
+                                    e,
+                                    cfg.num_local_experts,
+                                ) {
+                                    Ok(l) => l,
+                                    Err(_) => super::load_linear_maybe_mxfp4(
+                                        inter,
+                                        hidden,
+                                        true,
+                                        mlp_vb.pp(&format!("experts.{e}")),
+                                        "down_proj",
+                                    )?,
+                                };
+                                all.push(ExpertMlp::new(gate_up, down, limit, alpha));
+                            }
+                            all
+                        };
                     GptOssExperts::new(router.clone(), all, Some(cfg.num_experts_per_tok))
                 };
                 let eps = cfg.rms_norm_eps.unwrap_or(DEFAULT_RMS_EPS);
@@ -685,7 +797,13 @@ pub mod model {
                     keep_rms_in_fp32,
                 )?;
 
-                layers.push(GptOssLayerWeights { attn, input_layernorm, post_attention_layernorm, router, experts });
+                layers.push(GptOssLayerWeights {
+                    attn,
+                    input_layernorm,
+                    post_attention_layernorm,
+                    router,
+                    experts,
+                });
             }
 
             let lm_head = candle_nn::linear_no_bias(hidden, cfg.vocab_size, vb_bf16.pp("lm_head"))?;
@@ -708,7 +826,15 @@ pub mod model {
                 kv_caches.push(candle_nn::kv_cache::RotatingKvCache::new(2, window));
             }
 
-            Ok(Self { cfg: cfg.clone(), embed, norm, layers, lm_head, rope, kv_caches })
+            Ok(Self {
+                cfg: cfg.clone(),
+                embed,
+                norm,
+                layers,
+                lm_head,
+                rope,
+                kv_caches,
+            })
         }
 
         pub fn forward_logits_minimal(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -717,7 +843,9 @@ pub mod model {
             let xs2 = xs.reshape(((), h))?.to_dtype(DType::F32)?;
             let w = self.lm_head.weight().to_dtype(DType::F32)?;
             let logits = xs2.matmul(&w.t()?)?;
-            let logits = logits.reshape((b, t, self.cfg.vocab_size))?.to_dtype(DType::BF16)?;
+            let logits = logits
+                .reshape((b, t, self.cfg.vocab_size))?
+                .to_dtype(DType::BF16)?;
             Ok(logits)
         }
 
@@ -753,10 +881,14 @@ pub mod model {
                     let v = last.to_vec1::<f32>()?;
                     let take = v.iter().take(8).copied().collect::<Vec<_>>();
                     let mean = v.iter().copied().sum::<f32>() / (v.len() as f32);
-                    let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / (v.len() as f32);
+                    let var =
+                        v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / (v.len() as f32);
                     eprintln!(
                         "[L1] post-norm last-token: len={} first8={:?} mean={:.6} std={:.6}",
-                        v.len(), take, mean, var.sqrt()
+                        v.len(),
+                        take,
+                        mean,
+                        var.sqrt()
                     );
                 }
 
@@ -778,12 +910,15 @@ pub mod model {
 
                 let q_bhtd = q.transpose(1, 2)?;
                 let k_bhtd = k.transpose(1, 2)?;
-                let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+                let (q_bhtd, k_bhtd) =
+                    self.rope
+                        .apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
                 let q = q_bhtd.transpose(1, 2)?;
                 let k_step = k_bhtd;
                 let v_step = v.transpose(1, 2)?;
 
-                let (k_all, v_all) = self.kv_caches[i].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
+                let (k_all, v_all) =
+                    self.kv_caches[i].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
 
                 let n_rep = n_q / n_kv;
                 let k_rep = crate::utils::repeat_kv(k_all.clone(), n_rep)?;
@@ -818,27 +953,72 @@ pub mod model {
                     );
                     if use_fa {
                         match attn_mode {
-                            super::AttnMode::Full => super::flash_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                            super::AttnMode::Sliding { left, right } => super::flash_attn_windowed_with_sinks(
-                                &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
+                            super::AttnMode::Full => super::flash_attn_with_sinks(
+                                &q,
+                                &k_btkhd,
+                                &v_btkhd,
+                                softmax_scale,
+                                t > 1,
+                                sinks,
                             )?,
+                            super::AttnMode::Sliding { left, right } => {
+                                super::flash_attn_windowed_with_sinks(
+                                    &q,
+                                    &k_btkhd,
+                                    &v_btkhd,
+                                    softmax_scale,
+                                    Some(left),
+                                    Some(right),
+                                    sinks,
+                                )?
+                            }
                         }
                     } else {
                         match attn_mode {
-                            super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                            super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(
-                                &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
+                            super::AttnMode::Full => super::eager_attn_with_sinks(
+                                &q,
+                                &k_btkhd,
+                                &v_btkhd,
+                                softmax_scale,
+                                t > 1,
+                                sinks,
                             )?,
+                            super::AttnMode::Sliding { left, right } => {
+                                super::eager_attn_windowed_with_sinks(
+                                    &q,
+                                    &k_btkhd,
+                                    &v_btkhd,
+                                    softmax_scale,
+                                    Some(left),
+                                    Some(right),
+                                    sinks,
+                                )?
+                            }
                         }
                     }
                 };
                 #[cfg(not(feature = "flash-attn"))]
                 let y = {
                     match attn_mode {
-                        super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                        super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(
-                            &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
+                        super::AttnMode::Full => super::eager_attn_with_sinks(
+                            &q,
+                            &k_btkhd,
+                            &v_btkhd,
+                            softmax_scale,
+                            t > 1,
+                            sinks,
                         )?,
+                        super::AttnMode::Sliding { left, right } => {
+                            super::eager_attn_windowed_with_sinks(
+                                &q,
+                                &k_btkhd,
+                                &v_btkhd,
+                                softmax_scale,
+                                Some(left),
+                                Some(right),
+                                sinks,
+                            )?
+                        }
                     }
                 };
 
@@ -854,7 +1034,8 @@ pub mod model {
                     let v = last.to_vec1::<f32>()?;
                     let take = v.iter().take(8).copied().collect::<Vec<_>>();
                     let mean = v.iter().copied().sum::<f32>() / (v.len() as f32);
-                    let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / (v.len() as f32);
+                    let var =
+                        v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / (v.len() as f32);
                     eprintln!(
                         "[L1] post-attn-residual last-token: len={} first8={:?} mean={:.6} std={:.6}",
                         v.len(), take, mean, var.sqrt()
@@ -863,12 +1044,18 @@ pub mod model {
 
                 let x_norm2 = layer.post_attention_layernorm.forward(&xs)?;
                 if dump_l1 && i == 0 {
-                    let norm2_last = x_norm2.i((0, t - 1))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                    let norm2_last = x_norm2
+                        .i((0, t - 1))?
+                        .to_dtype(DType::F32)?
+                        .to_vec1::<f32>()?;
                     eprintln!("[L1] post-attn-norm last [:8]: {:?}", &norm2_last[..8]);
                 }
                 let mlp_out = layer.experts.forward(&x_norm2)?;
                 if dump_l1 && i == 0 {
-                    let mlp_last = mlp_out.i((0, t - 1))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                    let mlp_last = mlp_out
+                        .i((0, t - 1))?
+                        .to_dtype(DType::F32)?
+                        .to_vec1::<f32>()?;
                     eprintln!("[L1] mlp_out last [:8]: {:?}", &mlp_last[..8]);
                 }
                 xs = (xs + mlp_out)?;
@@ -934,13 +1121,16 @@ pub mod model {
 
                 let q_bhtd = q.transpose(1, 2)?;
                 let k_bhtd = k.transpose(1, 2)?;
-                let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+                let (q_bhtd, k_bhtd) =
+                    self.rope
+                        .apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
                 let q = q_bhtd.transpose(1, 2)?;
                 let k_step = k_bhtd;
                 let v_step = v.transpose(1, 2)?;
 
                 // Append to KV cache and build repeated K/V for multi-query attention.
-                let (k_all, v_all) = self.kv_caches[i].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
+                let (k_all, v_all) =
+                    self.kv_caches[i].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
                 let n_rep = n_q / n_kv;
                 let k_rep = crate::utils::repeat_kv(k_all.clone(), n_rep)?;
                 let v_rep = crate::utils::repeat_kv(v_all.clone(), n_rep)?;
@@ -974,27 +1164,72 @@ pub mod model {
                     );
                     if use_fa {
                         match attn_mode {
-                            super::AttnMode::Full => super::flash_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                            super::AttnMode::Sliding { left, right } => super::flash_attn_windowed_with_sinks(
-                                &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
+                            super::AttnMode::Full => super::flash_attn_with_sinks(
+                                &q,
+                                &k_btkhd,
+                                &v_btkhd,
+                                softmax_scale,
+                                t > 1,
+                                sinks,
                             )?,
+                            super::AttnMode::Sliding { left, right } => {
+                                super::flash_attn_windowed_with_sinks(
+                                    &q,
+                                    &k_btkhd,
+                                    &v_btkhd,
+                                    softmax_scale,
+                                    Some(left),
+                                    Some(right),
+                                    sinks,
+                                )?
+                            }
                         }
                     } else {
                         match attn_mode {
-                            super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                            super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(
-                                &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
+                            super::AttnMode::Full => super::eager_attn_with_sinks(
+                                &q,
+                                &k_btkhd,
+                                &v_btkhd,
+                                softmax_scale,
+                                t > 1,
+                                sinks,
                             )?,
+                            super::AttnMode::Sliding { left, right } => {
+                                super::eager_attn_windowed_with_sinks(
+                                    &q,
+                                    &k_btkhd,
+                                    &v_btkhd,
+                                    softmax_scale,
+                                    Some(left),
+                                    Some(right),
+                                    sinks,
+                                )?
+                            }
                         }
                     }
                 };
                 #[cfg(not(feature = "flash-attn"))]
                 let y = {
                     match attn_mode {
-                        super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                        super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(
-                            &q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks,
+                        super::AttnMode::Full => super::eager_attn_with_sinks(
+                            &q,
+                            &k_btkhd,
+                            &v_btkhd,
+                            softmax_scale,
+                            t > 1,
+                            sinks,
                         )?,
+                        super::AttnMode::Sliding { left, right } => {
+                            super::eager_attn_windowed_with_sinks(
+                                &q,
+                                &k_btkhd,
+                                &v_btkhd,
+                                softmax_scale,
+                                Some(left),
+                                Some(right),
+                                sinks,
+                            )?
+                        }
                     }
                 };
 
@@ -1038,12 +1273,21 @@ pub mod model {
 
             let mut rows: Vec<Tensor> = Vec::with_capacity(1 + 3 * self.cfg.num_hidden_layers);
             // h0
-            rows.push(xs.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?);
+            rows.push(
+                xs.i((0, t - 1))?
+                    .to_dtype(DType::F32)?
+                    .to_device(&Device::Cpu)?,
+            );
 
             for (i, layer) in self.layers.iter_mut().enumerate() {
                 // pre_attn_norm
                 let x_norm = layer.input_layernorm.forward(&xs)?;
-                rows.push(x_norm.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?);
+                rows.push(
+                    x_norm
+                        .i((0, t - 1))?
+                        .to_dtype(DType::F32)?
+                        .to_device(&Device::Cpu)?,
+                );
 
                 // attention
                 let q = x_norm.apply(&layer.attn.q_proj)?;
@@ -1054,11 +1298,14 @@ pub mod model {
                 let v = v.reshape((b, t, n_kv, head_dim))?;
                 let q_bhtd = q.transpose(1, 2)?;
                 let k_bhtd = k.transpose(1, 2)?;
-                let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+                let (q_bhtd, k_bhtd) =
+                    self.rope
+                        .apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
                 let q = q_bhtd.transpose(1, 2)?;
                 let k_step = k_bhtd;
                 let v_step = v.transpose(1, 2)?;
-                let (k_all, v_all) = self.kv_caches[i].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
+                let (k_all, v_all) =
+                    self.kv_caches[i].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
                 let n_rep = n_q / n_kv;
                 let k_rep = crate::utils::repeat_kv(k_all.clone(), n_rep)?;
                 let v_rep = crate::utils::repeat_kv(v_all.clone(), n_rep)?;
@@ -1076,7 +1323,11 @@ pub mod model {
                 let sinks = if matches!(
                     std::env::var("CANDLE_DISABLE_SINKS").ok().as_deref(),
                     Some("1") | Some("true") | Some("TRUE")
-                ) { None } else { Some(&layer.attn.sinks) };
+                ) {
+                    None
+                } else {
+                    Some(&layer.attn.sinks)
+                };
                 #[cfg(feature = "flash-attn")]
                 let y = {
                     // Golden reference policy: when sinks are present, avoid flash-attn
@@ -1090,21 +1341,70 @@ pub mod model {
                     let use_fa = fa_requested && !sinks_present;
                     if use_fa {
                         match attn_mode {
-                            super::AttnMode::Full => candle_flash_attn::flash_attn(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1)?,
-                            super::AttnMode::Sliding { left, right } => candle_flash_attn::flash_attn_windowed(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right))?,
+                            super::AttnMode::Full => candle_flash_attn::flash_attn(
+                                &q,
+                                &k_btkhd,
+                                &v_btkhd,
+                                softmax_scale,
+                                t > 1,
+                            )?,
+                            super::AttnMode::Sliding { left, right } => {
+                                candle_flash_attn::flash_attn_windowed(
+                                    &q,
+                                    &k_btkhd,
+                                    &v_btkhd,
+                                    softmax_scale,
+                                    Some(left),
+                                    Some(right),
+                                )?
+                            }
                         }
                     } else {
                         match attn_mode {
-                            super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                            super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                            super::AttnMode::Full => super::eager_attn_with_sinks(
+                                &q,
+                                &k_btkhd,
+                                &v_btkhd,
+                                softmax_scale,
+                                t > 1,
+                                sinks,
+                            )?,
+                            super::AttnMode::Sliding { left, right } => {
+                                super::eager_attn_windowed_with_sinks(
+                                    &q,
+                                    &k_btkhd,
+                                    &v_btkhd,
+                                    softmax_scale,
+                                    Some(left),
+                                    Some(right),
+                                    sinks,
+                                )?
+                            }
                         }
                     }
                 };
                 #[cfg(not(feature = "flash-attn"))]
                 let y = {
                     match attn_mode {
-                        super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                        super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                        super::AttnMode::Full => super::eager_attn_with_sinks(
+                            &q,
+                            &k_btkhd,
+                            &v_btkhd,
+                            softmax_scale,
+                            t > 1,
+                            sinks,
+                        )?,
+                        super::AttnMode::Sliding { left, right } => {
+                            super::eager_attn_windowed_with_sinks(
+                                &q,
+                                &k_btkhd,
+                                &v_btkhd,
+                                softmax_scale,
+                                Some(left),
+                                Some(right),
+                                sinks,
+                            )?
+                        }
                     }
                 };
                 let y = y.reshape((b, t, n_q * head_dim))?;
@@ -1112,7 +1412,11 @@ pub mod model {
                 xs = (xs + y)?;
 
                 // post_attn_resid
-                rows.push(xs.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?);
+                rows.push(
+                    xs.i((0, t - 1))?
+                        .to_dtype(DType::F32)?
+                        .to_device(&Device::Cpu)?,
+                );
 
                 // MLP
                 let x_norm2 = layer.post_attention_layernorm.forward(&xs)?;
@@ -1120,7 +1424,11 @@ pub mod model {
                 xs = (xs + mlp_out)?;
 
                 // post_mlp_resid
-                rows.push(xs.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?);
+                rows.push(
+                    xs.i((0, t - 1))?
+                        .to_dtype(DType::F32)?
+                        .to_device(&Device::Cpu)?,
+                );
             }
 
             // Stack rows along a new leading dimension -> (1+3L, H)
@@ -1185,7 +1493,9 @@ pub mod model {
             // Transpose to (b, h, t, d) to apply RoPE as in the forward
             let q_bhtd = q.transpose(1, 2)?;
             let k_bhtd = k.transpose(1, 2)?;
-            let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+            let (q_bhtd, k_bhtd) =
+                self.rope
+                    .apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
 
             // Grab last token after RoPE: (b,h,d)
             let q_rope_last_bhd = q_bhtd.i((0..b, 0..n_q, t - 1, 0..head_dim))?;
@@ -1193,7 +1503,9 @@ pub mod model {
 
             // Squeeze batch dimension and move to CPU f32 for easy inspection.
             let to_cpu_f32 = |t: Tensor| -> Result<Tensor> {
-                t.squeeze(0)?.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)
+                t.squeeze(0)?
+                    .to_dtype(DType::F32)?
+                    .to_device(&candle::Device::Cpu)
             };
             let q_pre = to_cpu_f32(q_last_bhd)?; // (n_q, d)
             let k_pre = to_cpu_f32(k_last_bhd)?; // (n_kv, d)
@@ -1211,7 +1523,15 @@ pub mod model {
                 0,
             );
 
-            Ok((q_pre, k_pre, v_pre, q_rope, k_rope, softmax_scale, attn_mode))
+            Ok((
+                q_pre,
+                k_pre,
+                v_pre,
+                q_rope,
+                k_rope,
+                softmax_scale,
+                attn_mode,
+            ))
         }
 
         /// Debug: return the sinks vector for layer 0 as f32 on CPU.
@@ -1222,16 +1542,35 @@ pub mod model {
 
         /// Debug: return (q,k,v) projection weights for layer 0 as f32 on CPU.
         pub fn debug_l0_qkv_weights(&self) -> Result<(Tensor, Tensor, Tensor)> {
-            let q = self.layers[0].attn.q_proj.weight().to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
-            let k = self.layers[0].attn.k_proj.weight().to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
-            let v = self.layers[0].attn.v_proj.weight().to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
+            let q = self.layers[0]
+                .attn
+                .q_proj
+                .weight()
+                .to_dtype(DType::F32)?
+                .to_device(&candle::Device::Cpu)?;
+            let k = self.layers[0]
+                .attn
+                .k_proj
+                .weight()
+                .to_dtype(DType::F32)?
+                .to_device(&candle::Device::Cpu)?;
+            let v = self.layers[0]
+                .attn
+                .v_proj
+                .weight()
+                .to_dtype(DType::F32)?
+                .to_device(&candle::Device::Cpu)?;
             Ok((q, k, v))
         }
 
         /// Debug: compute attention output at layer 0 for the whole sequence
         /// and return the last-token vector both before and after the o_proj.
         /// Returns (pre_o_proj: (n_q*head_dim), post_o_proj: (hidden)) as f32 on CPU.
-        pub fn debug_l0_attn_last_token(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<(Tensor, Tensor)> {
+        pub fn debug_l0_attn_last_token(
+            &mut self,
+            input_ids: &Tensor,
+            seqlen_offset: usize,
+        ) -> Result<(Tensor, Tensor)> {
             let xs0 = self.embed.forward(input_ids)?; // (b,t,h)
             let (b, t, _h) = xs0.dims3()?;
             let head_dim = self.cfg.head_dim();
@@ -1254,11 +1593,14 @@ pub mod model {
             let v = v.reshape((b, t, n_kv, head_dim))?;
             let q_bhtd = q.transpose(1, 2)?;
             let k_bhtd = k.transpose(1, 2)?;
-            let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+            let (q_bhtd, k_bhtd) =
+                self.rope
+                    .apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
             let q = q_bhtd.transpose(1, 2)?;
             let k_step = k_bhtd;
             let v_step = v.transpose(1, 2)?;
-            let (k_all, v_all) = self.kv_caches[0].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
+            let (k_all, v_all) =
+                self.kv_caches[0].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
             let n_rep = n_q / n_kv;
             let k_rep = crate::utils::repeat_kv(k_all.clone(), n_rep)?;
             let v_rep = crate::utils::repeat_kv(v_all.clone(), n_rep)?;
@@ -1282,27 +1624,84 @@ pub mod model {
                 );
                 if use_fa {
                     match attn_mode {
-                        super::AttnMode::Full => super::flash_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                        super::AttnMode::Sliding { left, right } => super::flash_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                        super::AttnMode::Full => super::flash_attn_with_sinks(
+                            &q,
+                            &k_btkhd,
+                            &v_btkhd,
+                            softmax_scale,
+                            t > 1,
+                            sinks,
+                        )?,
+                        super::AttnMode::Sliding { left, right } => {
+                            super::flash_attn_windowed_with_sinks(
+                                &q,
+                                &k_btkhd,
+                                &v_btkhd,
+                                softmax_scale,
+                                Some(left),
+                                Some(right),
+                                sinks,
+                            )?
+                        }
                     }
                 } else {
                     match attn_mode {
-                        super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                        super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                        super::AttnMode::Full => super::eager_attn_with_sinks(
+                            &q,
+                            &k_btkhd,
+                            &v_btkhd,
+                            softmax_scale,
+                            t > 1,
+                            sinks,
+                        )?,
+                        super::AttnMode::Sliding { left, right } => {
+                            super::eager_attn_windowed_with_sinks(
+                                &q,
+                                &k_btkhd,
+                                &v_btkhd,
+                                softmax_scale,
+                                Some(left),
+                                Some(right),
+                                sinks,
+                            )?
+                        }
                     }
                 }
             };
             #[cfg(not(feature = "flash-attn"))]
             let y = {
                 match attn_mode {
-                    super::AttnMode::Full => super::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-                    super::AttnMode::Sliding { left, right } => super::eager_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+                    super::AttnMode::Full => super::eager_attn_with_sinks(
+                        &q,
+                        &k_btkhd,
+                        &v_btkhd,
+                        softmax_scale,
+                        t > 1,
+                        sinks,
+                    )?,
+                    super::AttnMode::Sliding { left, right } => {
+                        super::eager_attn_windowed_with_sinks(
+                            &q,
+                            &k_btkhd,
+                            &v_btkhd,
+                            softmax_scale,
+                            Some(left),
+                            Some(right),
+                            sinks,
+                        )?
+                    }
                 }
             };
             let y_pre = y.reshape((b, t, n_q * head_dim))?; // before o_proj
             let y_post = y_pre.apply(&layer.attn.o_proj)?;
-            let y_pre_last = y_pre.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
-            let y_post_last = y_post.i((0, t - 1))?.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
+            let y_pre_last = y_pre
+                .i((0, t - 1))?
+                .to_dtype(DType::F32)?
+                .to_device(&candle::Device::Cpu)?;
+            let y_post_last = y_post
+                .i((0, t - 1))?
+                .to_dtype(DType::F32)?
+                .to_device(&candle::Device::Cpu)?;
             Ok((y_pre_last, y_post_last))
         }
 
@@ -1339,16 +1738,19 @@ pub mod model {
             let v = v.reshape((b, t, n_kv, head_dim))?;
             let q_bhtd = q.transpose(1, 2)?; // (b,hq,t,d)
             let k_bhtd = k.transpose(1, 2)?; // (b,hkv,t,d)
-            let (q_bhtd, k_bhtd) = self.rope.apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
+            let (q_bhtd, k_bhtd) =
+                self.rope
+                    .apply_rotary_emb_qk(&q_bhtd, &k_bhtd, seqlen_offset)?;
             let q_bt_hqd = q_bhtd.transpose(1, 2)?; // (b,t,hq,d)
             let k_step = k_bhtd; // (b,hkv,t,d)
             let v_step = v.transpose(1, 2)?; // (b,hkv,t,d)
 
             // KV cache append and GQA replication
-            let (k_all, _v_all) = self.kv_caches[0].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
+            let (k_all, _v_all) =
+                self.kv_caches[0].append(&k_step.contiguous()?, &v_step.contiguous()?)?;
             let n_rep = n_q / n_kv;
             let k_rep = crate::utils::repeat_kv(k_all.clone(), n_rep)?; // (b,hq,t,d)
-            // No need to replicate V for logits/weights dump
+                                                                        // No need to replicate V for logits/weights dump
             let k_btkhd = k_rep.transpose(1, 2)?; // (b,t,hq,d)
 
             // Determine attention mode for mask semantics.
@@ -1365,8 +1767,9 @@ pub mod model {
             // Build logits = (b,h,q,k)
             let q_bhqd = q_bt_hqd.to_dtype(DType::F32)?.transpose(1, 2)?; // (b,hq,q,d)
             let k_bhkd = k_btkhd.to_dtype(DType::F32)?.transpose(1, 2)?; // (b,hq,k,d)
-            // v_bhkd only needed when reconstructing attn_output; not required for logits/weights dump
-            let mut logits = (q_bhqd.contiguous()?.matmul(&k_bhkd.t()?.contiguous()?)? * softmax_scale as f64)?; // (b,h,q,k)
+                                                                         // v_bhkd only needed when reconstructing attn_output; not required for logits/weights dump
+            let mut logits =
+                (q_bhqd.contiguous()?.matmul(&k_bhkd.t()?.contiguous()?)? * softmax_scale as f64)?; // (b,h,q,k)
 
             // Apply mask (causal or sliding)
             let (_, qlen, _, _) = q_bt_hqd.dims4()?;
@@ -1378,7 +1781,11 @@ pub mod model {
                             .flat_map(|i| (0..klen).map(move |j| u8::from(j > i)))
                             .collect();
                         let mask = Tensor::from_slice(&mask, (qlen, klen), logits.device())?;
-                        super::masked_fill(&logits, &mask.broadcast_as((b, n_q, qlen, klen))?, f32::NEG_INFINITY)?
+                        super::masked_fill(
+                            &logits,
+                            &mask.broadcast_as((b, n_q, qlen, klen))?,
+                            f32::NEG_INFINITY,
+                        )?
                     } else {
                         logits
                     }
@@ -1387,17 +1794,23 @@ pub mod model {
                     let left = left;
                     let right = right;
                     let mask: Vec<u8> = (0..qlen)
-                        .flat_map(|i| (0..klen).map(move |j| {
-                            let i = i as isize;
-                            let j = j as isize;
-                            let l = left as isize;
-                            let r = right as isize;
-                            let allow = (j >= i - l) && (j <= i + r);
-                            u8::from(!allow)
-                        }))
+                        .flat_map(|i| {
+                            (0..klen).map(move |j| {
+                                let i = i as isize;
+                                let j = j as isize;
+                                let l = left as isize;
+                                let r = right as isize;
+                                let allow = (j >= i - l) && (j <= i + r);
+                                u8::from(!allow)
+                            })
+                        })
                         .collect();
                     let mask = Tensor::from_slice(&mask, (qlen, klen), logits.device())?;
-                    super::masked_fill(&logits, &mask.broadcast_as((b, n_q, qlen, klen))?, f32::NEG_INFINITY)?
+                    super::masked_fill(
+                        &logits,
+                        &mask.broadcast_as((b, n_q, qlen, klen))?,
+                        f32::NEG_INFINITY,
+                    )?
                 }
             };
 
@@ -1429,8 +1842,12 @@ pub mod model {
             let scores_last = scores.i((0, 0..dump_h, qlen - 1))?; // (dump_h, klen)
 
             // Move to CPU f32 for deterministic printing/comparison.
-            let logits_last = logits_last.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
-            let scores_last = scores_last.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?;
+            let logits_last = logits_last
+                .to_dtype(DType::F32)?
+                .to_device(&candle::Device::Cpu)?;
+            let scores_last = scores_last
+                .to_dtype(DType::F32)?
+                .to_device(&candle::Device::Cpu)?;
             Ok((logits_last, scores_last))
         }
     }
@@ -1562,14 +1979,16 @@ pub fn load_linear_maybe_mxfp4(
 
         // Load blocks and scales as U8 tensors on the VarBuilder device.
         let vb_u8 = vb.to_dtype(DType::U8);
-        let blocks = vb_u8.get((out_dim, nblocks, MXFP4_BLOCK_BYTES), &blocks_name)?;
-        let scales = vb_u8.get((out_dim, nblocks), &scales_name)?;
-
-        // Dequantize to BF16 on the appropriate device (CPU or CUDA).
-        let mut weight = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
-        if !weight.device().same_device(vb.device()) {
-            weight = weight.to_device(vb.device())?;
+        let mut blocks = vb_u8.get((out_dim, nblocks, MXFP4_BLOCK_BYTES), &blocks_name)?;
+        let mut scales = vb_u8.get((out_dim, nblocks), &scales_name)?;
+        if !blocks.device().same_device(vb.device()) {
+            blocks = blocks.to_device(vb.device())?;
         }
+        if !scales.device().same_device(vb.device()) {
+            scales = scales.to_device(vb.device())?;
+        }
+        let blocks = blocks.contiguous()?;
+        let scales = scales.contiguous()?;
 
         // Optionally load bias (kept BF16 as-is). Support dot and underscore naming.
         let bias_t = if bias {
@@ -1587,7 +2006,7 @@ pub fn load_linear_maybe_mxfp4(
             None
         };
 
-        return Ok(Linear::new(weight, bias_t));
+        return Ok(Linear::from_mxfp4(blocks, scales, in_dim, out_dim, bias_t));
     }
 
     // Fallback: standard BF16 linear loading under "{base}.weight" and optional bias.
@@ -1637,9 +2056,15 @@ pub fn load_expert_linear_mxfp4_grouped(
 
     // Load U8 grouped tensors and select expert slice along the leading dimension.
     let vb_u8 = vb.to_dtype(DType::U8);
-    let blocks_g = vb_u8.get((n_experts, out_dim, nblocks, MXFP4_BLOCK_BYTES), &blocks_name)?; // (E, out, nb, 16)
+    let blocks_g = vb_u8.get(
+        (n_experts, out_dim, nblocks, MXFP4_BLOCK_BYTES),
+        &blocks_name,
+    )?; // (E, out, nb, 16)
     let scales_g = vb_u8.get((n_experts, out_dim, nblocks), &scales_name)?; // (E, out, nb)
-    if matches!(std::env::var("CANDLE_DEBUG_MXFP4_SHAPES").ok().as_deref(), Some("1") | Some("true") | Some("TRUE")) {
+    if matches!(
+        std::env::var("CANDLE_DEBUG_MXFP4_SHAPES").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    ) {
         if expert_idx == 0 {
             eprintln!(
                 "[MXFP4] {}: blocks {:?}, scales {:?} (expect (E={}, out={}, nb={}, 16); (E={}, out={}, nb={}))",
@@ -1655,39 +2080,73 @@ pub fn load_expert_linear_mxfp4_grouped(
             );
         }
     }
-    let blocks = blocks_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb, 16)
-    let scales = scales_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb)
+    let mut blocks = blocks_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb, 16)
+    let mut scales = scales_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb)
+
+    if !blocks.device().same_device(vb.device()) {
+        blocks = blocks.to_device(vb.device())?;
+    }
+    if !scales.device().same_device(vb.device()) {
+        scales = scales.to_device(vb.device())?;
+    }
+    let blocks = blocks.contiguous()?;
+    let scales = scales.contiguous()?;
 
     // Debug: Print raw block bytes for expert 3, row 0, block 0
-    if matches!(std::env::var("CANDLE_DUMP_L1").ok().as_deref(), Some("1")) && expert_idx == 3 && base.contains("gate_up") {
-        eprintln!("[MXFP4_RAW] blocks shape before dequant: {:?}, device: {:?}", blocks.dims(), blocks.device());
-        eprintln!("[MXFP4_RAW] scales shape before dequant: {:?}, device: {:?}", scales.dims(), scales.device());
+    if matches!(std::env::var("CANDLE_DUMP_L1").ok().as_deref(), Some("1"))
+        && expert_idx == 3
+        && base.contains("gate_up")
+    {
+        eprintln!(
+            "[MXFP4_RAW] blocks shape before dequant: {:?}, device: {:?}",
+            blocks.dims(),
+            blocks.device()
+        );
+        eprintln!(
+            "[MXFP4_RAW] scales shape before dequant: {:?}, device: {:?}",
+            scales.dims(),
+            scales.device()
+        );
         let blocks_u8 = blocks.to_vec3::<u8>()?;
         let scales_u8 = scales.to_vec2::<u8>()?;
         if blocks_u8.len() > 0 && blocks_u8[0].len() > 0 {
-            eprintln!("[MXFP4_RAW] Expert 3 row 0 block 0 bytes: {:?}", &blocks_u8[0][0]);
-            eprintln!("[MXFP4_RAW] Expert 3 row 0 block 0 scale: {}", scales_u8[0][0]);
+            eprintln!(
+                "[MXFP4_RAW] Expert 3 row 0 block 0 bytes: {:?}",
+                &blocks_u8[0][0]
+            );
+            eprintln!(
+                "[MXFP4_RAW] Expert 3 row 0 block 0 scale: {}",
+                scales_u8[0][0]
+            );
         }
     }
 
-    // Dequantize normally: this produces [out_dim, in_dim]
-    let mut weight = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
+    if matches!(std::env::var("CANDLE_DUMP_L1").ok().as_deref(), Some("1"))
+        && expert_idx == 3
+        && base.contains("gate_up")
+    {
+        let weight_dbg = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
+        eprintln!(
+            "[MXFP4] Expert 3 gate_up_proj weight shape after dequant: {:?}",
+            weight_dbg.dims()
+        );
+        eprintln!(
+            "[MXFP4] Expected: ({}, {}) [out_dim, in_dim] for candle::Linear",
+            out_dim, in_dim
+        );
 
-    if matches!(std::env::var("CANDLE_DUMP_L1").ok().as_deref(), Some("1")) && expert_idx == 3 && base.contains("gate_up") {
-        eprintln!("[MXFP4] Expert 3 gate_up_proj weight shape after dequant: {:?}", weight.dims());
-        eprintln!("[MXFP4] Expected: ({}, {}) [out_dim, in_dim] for candle::Linear", out_dim, in_dim);
-
-        // Print first 32 values of first two rows for comparison with Python
-        let w_f32 = weight.to_dtype(DType::F32)?;
+        let w_f32 = weight_dbg.to_dtype(DType::F32)?;
         let w_vec = w_f32.to_vec2::<f32>()?;
         if w_vec.len() >= 2 {
-            eprintln!("[MXFP4] Expert 3 row 0 [:32]: {:?}", &w_vec[0][..32.min(w_vec[0].len())]);
-            eprintln!("[MXFP4] Expert 3 row 1 [:32]: {:?}", &w_vec[1][..32.min(w_vec[1].len())]);
+            eprintln!(
+                "[MXFP4] Expert 3 row 0 [:32]: {:?}",
+                &w_vec[0][..32.min(w_vec[0].len())]
+            );
+            eprintln!(
+                "[MXFP4] Expert 3 row 1 [:32]: {:?}",
+                &w_vec[1][..32.min(w_vec[1].len())]
+            );
         }
-    }
-
-    if !weight.device().same_device(vb.device()) {
-        weight = weight.to_device(vb.device())?;
     }
 
     // Optional grouped bias under e.g. "experts.gate_up_proj_bias" (shape [E, out]).
@@ -1696,9 +2155,19 @@ pub fn load_expert_linear_mxfp4_grouped(
         let bias_dot = format!("{base}.bias");
         let vb_bf16 = vb.to_dtype(DType::BF16);
         if vb.contains_tensor(&bias_us) {
-            Some(vb_bf16.get((n_experts, out_dim), &bias_us)?.narrow(0, expert_idx, 1)?.squeeze(0)?)
+            Some(
+                vb_bf16
+                    .get((n_experts, out_dim), &bias_us)?
+                    .narrow(0, expert_idx, 1)?
+                    .squeeze(0)?,
+            )
         } else if vb.contains_tensor(&bias_dot) {
-            Some(vb_bf16.get((n_experts, out_dim), &bias_dot)?.narrow(0, expert_idx, 1)?.squeeze(0)?)
+            Some(
+                vb_bf16
+                    .get((n_experts, out_dim), &bias_dot)?
+                    .narrow(0, expert_idx, 1)?
+                    .squeeze(0)?,
+            )
         } else {
             None
         }
@@ -1710,13 +2179,17 @@ pub fn load_expert_linear_mxfp4_grouped(
         if let Some(ref b) = bias_t {
             let b_f32 = b.to_dtype(DType::F32)?;
             let b_vec = b_f32.to_vec1::<f32>()?;
-            eprintln!("[BIAS] {} expert 3 bias [:8]: {:?}", base, &b_vec[..8.min(b_vec.len())]);
+            eprintln!(
+                "[BIAS] {} expert 3 bias [:8]: {:?}",
+                base,
+                &b_vec[..8.min(b_vec.len())]
+            );
         } else {
             eprintln!("[BIAS] {} expert 3: NO BIAS LOADED", base);
         }
     }
 
-    Ok(Linear::new(weight, bias_t))
+    Ok(Linear::from_mxfp4(blocks, scales, in_dim, out_dim, bias_t))
 }
 
 /// Load ALL experts' Linear layers at once from grouped MXFP4 tensors, dequantizing in a single
@@ -1757,18 +2230,16 @@ pub fn load_all_experts_linear_mxfp4_grouped(
 
     // Load U8 grouped tensors ONCE
     let vb_u8 = vb.to_dtype(DType::U8);
-    let blocks_g = vb_u8.get((n_experts, out_dim, nblocks, MXFP4_BLOCK_BYTES), &blocks_name)?; // (E, out, nb, 16)
-    let scales_g = vb_u8.get((n_experts, out_dim, nblocks), &scales_name)?; // (E, out, nb)
-
-    // Reshape to flatten expert dimension: (E, out, nb, 16) -> (E*out, nb, 16)
-    let blocks_flat = blocks_g.reshape((n_experts * out_dim, nblocks, MXFP4_BLOCK_BYTES))?;
-    let scales_flat = scales_g.reshape((n_experts * out_dim, nblocks))?;
-
-    // Dequantize ALL experts in ONE kernel launch: produces (E*out, in)
-    let mut weights_all = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks_flat, &scales_flat, [n_experts * out_dim, in_dim])?;
-
-    if !weights_all.device().same_device(vb.device()) {
-        weights_all = weights_all.to_device(vb.device())?;
+    let mut blocks_g = vb_u8.get(
+        (n_experts, out_dim, nblocks, MXFP4_BLOCK_BYTES),
+        &blocks_name,
+    )?; // (E, out, nb, 16)
+    let mut scales_g = vb_u8.get((n_experts, out_dim, nblocks), &scales_name)?; // (E, out, nb)
+    if !blocks_g.device().same_device(vb.device()) {
+        blocks_g = blocks_g.to_device(vb.device())?;
+    }
+    if !scales_g.device().same_device(vb.device()) {
+        scales_g = scales_g.to_device(vb.device())?;
     }
 
     // Load optional grouped bias ONCE if present
@@ -1790,13 +2261,14 @@ pub fn load_all_experts_linear_mxfp4_grouped(
     // Slice into per-expert Linear layers
     let mut experts = Vec::with_capacity(n_experts);
     for e in 0..n_experts {
-        let weight = weights_all.narrow(0, e * out_dim, out_dim)?;
+        let blocks = blocks_g.narrow(0, e, 1)?.squeeze(0)?.contiguous()?;
+        let scales = scales_g.narrow(0, e, 1)?.squeeze(0)?.contiguous()?;
         let bias_t = if let Some(ref b) = bias_all {
             Some(b.narrow(0, e, 1)?.squeeze(0)?)
         } else {
             None
         };
-        experts.push(Linear::new(weight, bias_t));
+        experts.push(Linear::from_mxfp4(blocks, scales, in_dim, out_dim, bias_t));
     }
 
     Ok(experts)
@@ -1816,9 +2288,7 @@ fn sinks_scale_from_lse(lse: &Tensor, sinks: &Tensor) -> Result<Tensor> {
     let sinks_f32 = sinks.to_dtype(DType::F32)?;
     let (b, h, q) = lse_f32.dims3()?;
     // Expand sinks to (b, h, q)
-    let sinks_bhq = sinks_f32
-        .reshape((1, h, 1))?
-        .broadcast_as((b, h, q))?;
+    let sinks_bhq = sinks_f32.reshape((1, h, 1))?.broadcast_as((b, h, q))?;
 
     // combined_lse = logsumexp([lse, sinks], axis=-1 of the concat)
     let lse_exp = lse_f32.unsqueeze(D::Minus1)?; // (b,h,q,1)
@@ -1852,9 +2322,7 @@ pub fn eager_attn_with_sinks(
     let q_bhqd = q.transpose(1, 2)?;
     let k_bhkd = k.transpose(1, 2)?;
     let v_bhkd = v.transpose(1, 2)?;
-    let logits = (
-        q_bhqd.contiguous()?.matmul(&k_bhkd.t()?.contiguous()?)? * softmax_scale as f64
-    )?;
+    let logits = (q_bhqd.contiguous()?.matmul(&k_bhkd.t()?.contiguous()?)? * softmax_scale as f64)?;
 
     // Apply causal mask if requested.
     let logits = if causal && qlen > 1 {
@@ -1863,7 +2331,11 @@ pub fn eager_attn_with_sinks(
             .flat_map(|i| (0..klen).map(move |j| u8::from(j > i)))
             .collect();
         let mask = Tensor::from_slice(&mask, (qlen, klen), q.device())?;
-        masked_fill(&logits, &mask.broadcast_as((b, h, qlen, klen))?, f32::NEG_INFINITY)?
+        masked_fill(
+            &logits,
+            &mask.broadcast_as((b, h, qlen, klen))?,
+            f32::NEG_INFINITY,
+        )?
     } else {
         logits
     };
@@ -1918,9 +2390,7 @@ pub fn eager_attn_windowed_with_sinks(
     let q_bhqd = q.transpose(1, 2)?;
     let k_bhkd = k.transpose(1, 2)?;
     let v_bhkd = v.transpose(1, 2)?;
-    let logits = (
-        q_bhqd.contiguous()?.matmul(&k_bhkd.t()?.contiguous()?)? * softmax_scale as f64
-    )?; // (b,h,q,k)
+    let logits = (q_bhqd.contiguous()?.matmul(&k_bhkd.t()?.contiguous()?)? * softmax_scale as f64)?; // (b,h,q,k)
 
     // Build windowed mask if needed.
     let logits = match (window_size_left, window_size_right) {
@@ -1943,7 +2413,11 @@ pub fn eager_attn_windowed_with_sinks(
                 })
                 .collect();
             let mask = Tensor::from_slice(&mask, (qlen, klen), q.device())?;
-            masked_fill(&logits, &mask.broadcast_as((b, h, qlen, klen))?, f32::NEG_INFINITY)?
+            masked_fill(
+                &logits,
+                &mask.broadcast_as((b, h, qlen, klen))?,
+                f32::NEG_INFINITY,
+            )?
         }
     };
 
@@ -1992,7 +2466,7 @@ pub fn flash_attn_with_sinks(
         Some(s) => {
             let (o, lse) = candle_flash_attn::flash_attn_with_lse(q, k, v, softmax_scale, causal)?;
             let scale = sinks_scale_from_lse(&lse, s)?; // (b,h,q)
-            // Broadcast to (b,q,h,1) to match o (b,q,h,d)
+                                                        // Broadcast to (b,q,h,1) to match o (b,q,h,d)
             let scale = scale.transpose(1, 2)?.unsqueeze(D::Minus1)?; // (b,q,h,1)
             let (b, qlen, h, d) = o.dims4()?;
             let scale = scale.broadcast_as((b, qlen, h, d))?; // (b,q,h,d)
@@ -2014,7 +2488,14 @@ pub fn flash_attn_windowed_with_sinks(
     sinks: Option<&Tensor>,
 ) -> Result<Tensor> {
     match sinks {
-        None => candle_flash_attn::flash_attn_windowed(q, k, v, softmax_scale, window_size_left, window_size_right),
+        None => candle_flash_attn::flash_attn_windowed(
+            q,
+            k,
+            v,
+            softmax_scale,
+            window_size_left,
+            window_size_right,
+        ),
         Some(s) => {
             let (o, lse) = candle_flash_attn::flash_attn_windowed_with_lse(
                 q,
@@ -2044,7 +2525,7 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle::{Device, Tensor, Module, IndexOp};
+    use candle::{Device, IndexOp, Module, Tensor};
     use candle_nn::VarBuilder;
     use std::collections::HashMap;
 
@@ -2056,8 +2537,7 @@ mod tests {
         let lse = Tensor::from_vec(
             vec![
                 // h0
-                0.0f32, 1.0, 2.0,
-                // h1
+                0.0f32, 1.0, 2.0, // h1
                 -1.0, 0.5, 3.0,
             ],
             (1, 2, 3),
@@ -2076,7 +2556,11 @@ mod tests {
                     let s = if h == 0 { 0.5 } else { -0.5 };
                     let ref_v = 1.0 / (1.0 + (s - lse_v).exp());
                     let diff = (ref_v - got[b][h][q]).abs();
-                    assert!(diff < 1e-6, "mismatch at (b={b},h={h},q={q}): ref={ref_v} got={} diff={diff}", got[b][h][q]);
+                    assert!(
+                        diff < 1e-6,
+                        "mismatch at (b={b},h={h},q={q}): ref={ref_v} got={} diff={diff}",
+                        got[b][h][q]
+                    );
                 }
             }
         }
@@ -2114,7 +2598,9 @@ mod tests {
         let gate_up = Linear::new(w_gate_up, None);
 
         let mut w_down = vec![0f32; d * d];
-        for i in 0..d { w_down[i * d + i] = 1.0; }
+        for i in 0..d {
+            w_down[i * d + i] = 1.0;
+        }
         let w_down = Tensor::from_vec(w_down, (d, d), &dev)?.to_dtype(dtype)?;
         let down = Linear::new(w_down, None);
 
@@ -2203,7 +2689,13 @@ mod tests {
         let right = 0usize;
         let softmax_scale = 1.0f32; // irrelevant since logits are zeros
         let out = super::eager_attn_windowed_with_sinks(
-            &q, &k, &v, softmax_scale, Some(left), Some(right), None,
+            &q,
+            &k,
+            &v,
+            softmax_scale,
+            Some(left),
+            Some(right),
+            None,
         )?; // (b,q,h,d)
 
         let out_f32 = out.to_dtype(DType::F32)?;
@@ -2226,8 +2718,10 @@ mod tests {
 
         // Logging for evidence
         println!("device: cuda:0");
-        println!("dtype: f32 shapes: q=({},{},{},{}), k=({},{},{},{}), v=({},{},{},{})",
-            b, qlen, h, d, b, klen, h, d, b, klen, h, d);
+        println!(
+            "dtype: f32 shapes: q=({},{},{},{}), k=({},{},{},{}), v=({},{},{},{})",
+            b, qlen, h, d, b, klen, h, d, b, klen, h, d
+        );
         println!("window: left={}, right={}", left, right);
         // Print per-query expected vs actual for head 0, channel 0
         for i in 0..qlen {
@@ -2237,12 +2731,18 @@ mod tests {
             let sum: f32 = (j_start..=j_end).map(|j| j as f32).sum();
             let expected = sum / n;
             let got = out_f32.i((0, i, 0, 0))?.to_scalar::<f32>()?;
-            println!("q={} allowed=[{}..={}] expected_mean={:.6} got={:.6}", i, j_start, j_end, expected, got);
+            println!(
+                "q={} allowed=[{}..={}] expected_mean={:.6} got={:.6}",
+                i, j_start, j_end, expected, got
+            );
         }
         println!("errors: Linf={:.6} L2={:.6}", linf, l2);
 
         // Tight tolerance: exact in f32
-        assert!(linf < 1e-6, "left boundary must be inclusive (Linf={linf} L2={l2})");
+        assert!(
+            linf < 1e-6,
+            "left boundary must be inclusive (Linf={linf} L2={l2})"
+        );
         Ok(())
     }
 
@@ -2288,7 +2788,9 @@ mod tests {
         // Embeddings: simple increasing values per row.
         let mut emb: Vec<f32> = Vec::with_capacity(vocab * hidden);
         for i in 0..vocab {
-            for j in 0..hidden { emb.push((i * hidden + j) as f32 / 100.0); }
+            for j in 0..hidden {
+                emb.push((i * hidden + j) as f32 / 100.0);
+            }
         }
         ts.insert(
             "model.embed_tokens.weight".to_string(),
@@ -2339,7 +2841,10 @@ mod tests {
         println!("actual   (first 6): {:?}", &got);
         println!("errors: Linf={:.6} L2={:.6}", linf, l2);
         // BF16 rounding yields ~3e-3 absolute differences; accept small tolerance.
-        assert!(linf < 5e-3 && l2 < 1e-2, "embed scaling mismatch Linf={linf} L2={l2}");
+        assert!(
+            linf < 5e-3 && l2 < 1e-2,
+            "embed scaling mismatch Linf={linf} L2={l2}"
+        );
         Ok(())
     }
 
@@ -2362,7 +2867,11 @@ mod tests {
         let qlen = 3usize;
         let klen = 4usize;
         let d = 16usize;
-        let dtype = if dev.supports_bf16() { DType::BF16 } else { DType::F16 };
+        let dtype = if dev.supports_bf16() {
+            DType::BF16
+        } else {
+            DType::F16
+        };
         let scale = 1f32 / (d as f32).sqrt();
 
         // q,k,v shaped as FA layout: (b, seqlen, heads, dim)
@@ -2386,7 +2895,10 @@ mod tests {
         // logits: (b,h,q,k)
         let q_bhqd = q.transpose(1, 2)?;
         let k_bhkd = k.transpose(1, 2)?;
-        let logits = (q_bhqd.contiguous()?.matmul(&k_bhkd.transpose(2, 3)?.contiguous()?)? * scale as f64)?;
+        let logits = (q_bhqd
+            .contiguous()?
+            .matmul(&k_bhkd.transpose(2, 3)?.contiguous()?)?
+            * scale as f64)?;
         let bq = logits.dims4()?.0;
         let sinks_broadcast = sinks
             .to_dtype(logits.dtype())?
@@ -2398,7 +2910,9 @@ mod tests {
         let z = probs.sum_keepdim(D::Minus1)?;
         let probs = probs.broadcast_div(&z)?; // (b,h,q,k+1)
         let scores = probs.narrow(D::Minus1, 0, klen)?; // drop sink
-        let o_bhqd = scores.contiguous()?.matmul(&v.transpose(1, 2)?.contiguous()?)?; // (b,h,q,d)
+        let o_bhqd = scores
+            .contiguous()?
+            .matmul(&v.transpose(1, 2)?.contiguous()?)?; // (b,h,q,d)
         let out_spec = o_bhqd.transpose(1, 2)?; // (b,q,h,d)
 
         // Move to f32 for comparison
@@ -2415,12 +2929,22 @@ mod tests {
 
         // Logging
         let (b0, q0, h0, d0) = out_eager.dims4()?;
-        println!("device: cuda:0 dtype: {}", match dtype { DType::BF16 => "bf16", DType::F16 => "f16", _ => "other" });
+        println!(
+            "device: cuda:0 dtype: {}",
+            match dtype {
+                DType::BF16 => "bf16",
+                DType::F16 => "f16",
+                _ => "other",
+            }
+        );
         println!("shapes: b={}, q={}, h={}, d={}", b0, q0, h0, d0);
         println!("errors: Linf={:.8} L2={:.8}", linf, l2);
 
         // Tight enough for f32 math; casting from bf16/f16 introduces tiny error margins.
-        assert!(linf < 4e-5 && l2 < 2e-4, "eager sinks != spec (Linf={linf} L2={l2})");
+        assert!(
+            linf < 4e-5 && l2 < 2e-4,
+            "eager sinks != spec (Linf={linf} L2={l2})"
+        );
         Ok(())
     }
 }
