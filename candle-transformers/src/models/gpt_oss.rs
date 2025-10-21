@@ -257,7 +257,9 @@ pub mod experts {
             // CPU-side organization (fast)
             let mut token_ids: Vec<Vec<u32>> = vec![Vec::new(); n_experts];
             let mut token_wts: Vec<Vec<f32>> = vec![Vec::new(); n_experts];
-            for (row, (row_probs, row_experts)) in probs_host.iter().zip(idx_host.iter()).enumerate() {
+            for (row, (row_probs, row_experts)) in
+                probs_host.iter().zip(idx_host.iter()).enumerate()
+            {
                 for (&p, &e) in row_probs.iter().zip(row_experts.iter()) {
                     token_ids[e as usize].push(row as u32);
                     token_wts[e as usize].push(p);
@@ -1957,8 +1959,6 @@ pub fn load_linear_maybe_mxfp4(
         }
         let blocks = blocks.contiguous()?;
         let scales = scales.contiguous()?;
-        let weight = dequantize_mxfp4_linear(&blocks, &scales, out_dim, in_dim)?.contiguous()?;
-
         // Optionally load bias (kept BF16 as-is). Support dot and underscore naming.
         let bias_t = if bias {
             let bias_dot = format!("{base}.bias");
@@ -1975,7 +1975,7 @@ pub fn load_linear_maybe_mxfp4(
             None
         };
 
-        return Ok(Linear::new(weight, bias_t));
+        return Ok(Linear::from_mxfp4(blocks, scales, in_dim, out_dim, bias_t));
     }
 
     // Fallback: standard BF16 linear loading under "{base}.weight" and optional bias.
@@ -2060,7 +2060,6 @@ pub fn load_expert_linear_mxfp4_grouped(
     }
     let blocks = blocks.contiguous()?;
     let scales = scales.contiguous()?;
-    let weight = dequantize_mxfp4_linear(&blocks, &scales, out_dim, in_dim)?.contiguous()?;
 
     // Debug: Print raw block bytes for expert 3, row 0, block 0
     if matches!(std::env::var("CANDLE_DUMP_L1").ok().as_deref(), Some("1"))
@@ -2095,16 +2094,17 @@ pub fn load_expert_linear_mxfp4_grouped(
         && expert_idx == 3
         && base.contains("gate_up")
     {
+        let weight_debug = dequantize_mxfp4_linear(&blocks, &scales, out_dim, in_dim)?;
         eprintln!(
             "[MXFP4] Expert 3 gate_up_proj weight shape after dequant: {:?}",
-            weight.dims()
+            weight_debug.dims()
         );
         eprintln!(
             "[MXFP4] Expected: ({}, {}) [out_dim, in_dim] for candle::Linear",
             out_dim, in_dim
         );
 
-        let w_f32 = weight.clone().to_dtype(DType::F32)?;
+        let w_f32 = weight_debug.to_dtype(DType::F32)?;
         let w_vec = w_f32.to_vec2::<f32>()?;
         if w_vec.len() >= 2 {
             eprintln!(
@@ -2158,7 +2158,7 @@ pub fn load_expert_linear_mxfp4_grouped(
         }
     }
 
-    Ok(Linear::new(weight, bias_t))
+    Ok(Linear::from_mxfp4(blocks, scales, in_dim, out_dim, bias_t))
 }
 
 /// Load ALL experts' Linear layers at once from grouped MXFP4 tensors, dequantizing in a single
@@ -2213,12 +2213,6 @@ pub fn load_all_experts_linear_mxfp4_grouped(
     let blocks_g = blocks_g.contiguous()?;
     let scales_g = scales_g.contiguous()?;
 
-    let blocks_flat = blocks_g.reshape((n_experts * out_dim, nblocks, MXFP4_BLOCK_BYTES))?;
-    let scales_flat = scales_g.reshape((n_experts * out_dim, nblocks))?;
-    let dense_flat =
-        dequantize_mxfp4_linear(&blocks_flat, &scales_flat, n_experts * out_dim, in_dim)?;
-    let dense_all = dense_flat.reshape((n_experts, out_dim, in_dim))?;
-
     // Load optional grouped bias ONCE if present
     let bias_all = if bias {
         let bias_us = format!("{base}_bias");
@@ -2243,8 +2237,11 @@ pub fn load_all_experts_linear_mxfp4_grouped(
         } else {
             None
         };
-        let weight = dense_all.narrow(0, e, 1)?.squeeze(0)?.contiguous()?;
-        experts.push(Linear::new(weight, bias_t));
+        let blocks_e = blocks_g.narrow(0, e, 1)?.squeeze(0)?.contiguous()?;
+        let scales_e = scales_g.narrow(0, e, 1)?.squeeze(0)?.contiguous()?;
+        experts.push(Linear::from_mxfp4(
+            blocks_e, scales_e, in_dim, out_dim, bias_t,
+        ));
     }
 
     Ok(experts)

@@ -51,6 +51,10 @@ fn main() -> Result<()> {
     let program_start = Instant::now();
     let args = Args::parse();
 
+    if std::env::var("CANDLE_MXFP4_USE_Q8_ACT").is_err() {
+        std::env::set_var("CANDLE_MXFP4_USE_Q8_ACT", "1");
+    }
+
     // Resolve the local HF snapshot path (expand leading ~ for convenience).
     let snapshot_dir = expand_tilde(DEFAULT_SNAPSHOT_DIR)?;
 

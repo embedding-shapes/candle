@@ -16,6 +16,8 @@ use half::bf16;
 const MXFP4_FP4_BIAS: i32 = 1; // IEEE754-style bias for E=2
 const MXFP4_BLOCK_ELEMS: usize = 32; // k=32 elements per block
 const MXFP4_BLOCK_BYTES: usize = 16; // 2 values per byte
+#[cfg(feature = "cuda")]
+const BLOCK_Q8_1_BYTES: usize = 36; // two half scales + 32 int8 quants
 
 // Shared shape validation used by CPU/CUDA paths.
 fn validate_mxfp4_shapes(
@@ -267,8 +269,8 @@ pub fn matmul_mxfp4_bf16_cuda(
         bail!("matmul_mxfp4_bf16_cuda expects row-major activations (stride[1] == 1)")
     }
     let act_row_stride = act_strides[0];
-    if act_row_stride < in_dim {
-        bail!("activation row stride {act_row_stride} too small for in_dim {in_dim}")
+    if act_row_stride != in_dim {
+        bail!("matmul_mxfp4_bf16_cuda expects contiguous rows (stride[0] == in_dim)")
     }
 
     let blocks_base = if blocks.is_contiguous() {
@@ -301,29 +303,88 @@ pub fn matmul_mxfp4_bf16_cuda(
 
     const TILE_COLS: usize = 16;
     const TILE_K_BLOCKS: usize = candle_kernels::MATMUL_MXFP4_TILE_K_BLOCKS;
+    const WARPS_PER_BLOCK: usize = 4;
     let grid_y = (out_dim + TILE_COLS - 1) / TILE_COLS;
 
-    let func = dev.get_or_load_func("matmul_mxfp4_bf16", &candle_kernels::QUANTIZED)?;
-    let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (rows as u32, grid_y as u32, 1),
-        block_dim: (32, 4, 1),
-        shared_mem_bytes: (TILE_K_BLOCKS * 32 * core::mem::size_of::<f32>()) as u32,
-    };
-    let mut builder = func.builder();
-    builder.arg(&act_view);
-    builder.arg(&blocks_view);
-    builder.arg(&scales_view);
-    builder.arg(&mut out_slice);
-    crate::builder_arg!(
-        builder,
-        rows as i32,
-        out_dim as i32,
-        nblocks as i32,
-        in_dim as i32,
-        act_row_stride as i32,
-        out_dim as i32
+    let use_q8 = matches!(
+        std::env::var("CANDLE_MXFP4_USE_Q8_ACT").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
     );
-    unsafe { builder.launch(cfg) }.w()?;
+
+    if use_q8 {
+        use crate::quantized::cuda::{CUDA_QUANTIZE_BLOCK_SIZE, MATRIX_ROW_PADDING};
+
+        let in_dim_padded =
+            ((in_dim + MATRIX_ROW_PADDING - 1) / MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
+        let act_blocks_stride = in_dim_padded / MXFP4_BLOCK_ELEMS;
+        let quantized_bytes = match rows
+            .checked_mul(act_blocks_stride)
+            .and_then(|v| v.checked_mul(BLOCK_Q8_1_BYTES))
+        {
+            Some(v) => v,
+            None => bail!("overflow allocating quantized activations"),
+        };
+        let mut act_q8 = unsafe { dev.alloc::<u8>(quantized_bytes)? };
+
+        let func_quant = dev.get_or_load_func("quantize_q8_1_bf16", &candle_kernels::QUANTIZED)?;
+        let num_blocks = (in_dim_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+        let cfg_quant = cudarc::driver::LaunchConfig {
+            grid_dim: (num_blocks as u32, rows as u32, 1),
+            block_dim: (CUDA_QUANTIZE_BLOCK_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut quant_builder = func_quant.builder();
+        quant_builder.arg(&act_view);
+        quant_builder.arg(&mut act_q8);
+        crate::builder_arg!(quant_builder, in_dim as i32, in_dim_padded as i32);
+        unsafe { quant_builder.launch(cfg_quant) }.w()?;
+
+        let func = dev.get_or_load_func("matmul_mxfp4_q8_1", &candle_kernels::QUANTIZED)?;
+        let shared_mem_bytes = (TILE_K_BLOCKS * BLOCK_Q8_1_BYTES) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (rows as u32, grid_y as u32, 1),
+            block_dim: (32, WARPS_PER_BLOCK as u32, 1),
+            shared_mem_bytes,
+        };
+        let mut builder = func.builder();
+        builder.arg(&act_q8);
+        builder.arg(&blocks_view);
+        builder.arg(&scales_view);
+        builder.arg(&mut out_slice);
+        crate::builder_arg!(
+            builder,
+            rows as i32,
+            out_dim as i32,
+            nblocks as i32,
+            act_blocks_stride as i32,
+            out_dim as i32
+        );
+        unsafe { builder.launch(cfg) }.w()?;
+    } else {
+        let func = dev.get_or_load_func("matmul_mxfp4_bf16", &candle_kernels::QUANTIZED)?;
+        let shared_mem_bytes =
+            (TILE_K_BLOCKS * MXFP4_BLOCK_ELEMS * core::mem::size_of::<f32>()) as u32;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (rows as u32, grid_y as u32, 1),
+            block_dim: (32, WARPS_PER_BLOCK as u32, 1),
+            shared_mem_bytes,
+        };
+        let mut builder = func.builder();
+        builder.arg(&act_view);
+        builder.arg(&blocks_view);
+        builder.arg(&scales_view);
+        builder.arg(&mut out_slice);
+        crate::builder_arg!(
+            builder,
+            rows as i32,
+            out_dim as i32,
+            nblocks as i32,
+            in_dim as i32,
+            act_row_stride as i32,
+            out_dim as i32
+        );
+        unsafe { builder.launch(cfg) }.w()?;
+    }
 
     let out_storage = CudaStorage::wrap_cuda_slice(out_slice, dev.clone());
     let tensor = crate::tensor::from_storage(
