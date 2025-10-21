@@ -23,8 +23,11 @@ fn t23_harmony_assistant_header_order() -> Result<()> {
 
     assert!(!ids.is_empty(), "header encoding should not be empty");
     assert_eq!(ids[0], id_channel, "first token must be <|channel|>");
-    assert_eq!(ids[ids.len() - 1], id_message, "last header token must be <|message|>");
+    assert_eq!(
+        ids[ids.len() - 1],
+        id_message,
+        "last header token must be <|message|>"
+    );
 
     Ok(())
 }
-

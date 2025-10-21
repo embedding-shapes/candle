@@ -21,7 +21,9 @@ use half::bf16;
 const G: usize = 32; // MXFP4 group size per block
 
 // Pack 32 FP4 E2M1 codes (all set to +1.0 => 0b0010) into 16 bytes, low nibble then high nibble per spec.
-fn packed_block_all_ones() -> [u8; 16] { [0x22u8; 16] }
+fn packed_block_all_ones() -> [u8; 16] {
+    [0x22u8; 16]
+}
 
 fn l2_linf(a: &[f32], b: &[f32]) -> (f32, f32) {
     assert_eq!(a.len(), b.len());
@@ -30,7 +32,9 @@ fn l2_linf(a: &[f32], b: &[f32]) -> (f32, f32) {
     for i in 0..a.len() {
         let d = (a[i] - b[i]).abs();
         l2 += d * d;
-        if d > linf { linf = d; }
+        if d > linf {
+            linf = d;
+        }
     }
     (l2.sqrt(), linf)
 }
@@ -73,7 +77,8 @@ fn t_mxfp4_group_axis_linear_contract() -> Result<()> {
     // Build COLUMN-grouped MXFP4: blocks (k, nb_m, 16), scales (k, nb_m)
     let mut blocks_col = vec![0u8; k * nb_m * 16];
     let mut scales_col = vec![0u8; k * nb_m];
-    for c in 0..k { // interpret as "row" in this packing
+    for c in 0..k {
+        // interpret as "row" in this packing
         for mb in 0..nb_m {
             let off = (c * nb_m + mb) * 16;
             blocks_col[off..off + 16].copy_from_slice(&blk);
@@ -99,11 +104,7 @@ fn t_mxfp4_group_axis_linear_contract() -> Result<()> {
     let scales_col_t = Tensor::from_vec(scales_col.clone(), (k, nb_m), &dev)?;
     let out_col_bf16 = dequant_mxfp4_to_bf16(&blocks_col_t, &scales_col_t, [k, m])?;
     let out_col_f32 = out_col_bf16.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-    let out_col_t = Tensor::from_vec(
-        out_col_f32.to_vec2::<f32>()?.concat(),
-        (k, m),
-        &Device::Cpu,
-    )?;
+    let out_col_t = Tensor::from_vec(out_col_f32.to_vec2::<f32>()?.concat(), (k, m), &Device::Cpu)?;
     let out_col_trans = out_col_t.t()?; // (m, k)
     let out_col = out_col_trans.flatten_all()?.to_vec1::<f32>()?;
 
@@ -111,15 +112,30 @@ fn t_mxfp4_group_axis_linear_contract() -> Result<()> {
     let e_bf16: Vec<f32> = e_host.iter().map(|v| bf16::from_f32(*v).to_f32()).collect();
 
     // Logs
-    println!("GPU ROW dequant dtype bf16->f32 shape [m={},k={}] stride K-contiguous", m, k);
-    println!("GPU COL dequant dtype bf16->f32 shape [k={},m={}] then transpose", k, m);
-    println!("blocks_row shape (m,nb_k,16)=({}, {}, 16); scales_row (m,nb_k)=({}, {})", m, nb_k, m, nb_k);
-    println!("blocks_col shape (k,nb_m,16)=({}, {}, 16); scales_col (k,nb_m)=({}, {})", k, nb_m, k, nb_m);
+    println!(
+        "GPU ROW dequant dtype bf16->f32 shape [m={},k={}] stride K-contiguous",
+        m, k
+    );
+    println!(
+        "GPU COL dequant dtype bf16->f32 shape [k={},m={}] then transpose",
+        k, m
+    );
+    println!(
+        "blocks_row shape (m,nb_k,16)=({}, {}, 16); scales_row (m,nb_k)=({}, {})",
+        m, nb_k, m, nb_k
+    );
+    println!(
+        "blocks_col shape (k,nb_m,16)=({}, {}, 16); scales_col (k,nb_m)=({}, {})",
+        k, nb_m, k, nb_m
+    );
     // Show a few sample cells (r=0,1 ; c=0,31,32,63)
-    let sample_idxs = [(0usize,0usize),(0,31),(0,32),(0,63),(1,0),(1,32)];
-    for (r,c) in sample_idxs {
+    let sample_idxs = [(0usize, 0usize), (0, 31), (0, 32), (0, 63), (1, 0), (1, 32)];
+    for (r, c) in sample_idxs {
         let idx = r * k + c;
-        println!("E[{},{}]={:.6}  ROW={:.6}  COL={:.6}", r, c, e_bf16[idx], out_row[idx], out_col[idx]);
+        println!(
+            "E[{},{}]={:.6}  ROW={:.6}  COL={:.6}",
+            r, c, e_bf16[idx], out_row[idx], out_col[idx]
+        );
     }
 
     // Metrics and assertions
@@ -130,8 +146,16 @@ fn t_mxfp4_group_axis_linear_contract() -> Result<()> {
 
     // Exact equality after BF16 rounding for row-grouped path; column-grouped must not match.
     let tol = 0.0f32;
-    assert!(linf_row <= tol, "Row-grouping mismatch: L∞={} > {}", linf_row, tol);
-    assert!(linf_col > 0.0, "Column-grouping unexpectedly matched E exactly");
+    assert!(
+        linf_row <= tol,
+        "Row-grouping mismatch: L∞={} > {}",
+        linf_row,
+        tol
+    );
+    assert!(
+        linf_col > 0.0,
+        "Column-grouping unexpectedly matched E exactly"
+    );
 
     Ok(())
 }

@@ -8,7 +8,7 @@
 // and that all indices and bounds are correct.
 
 use anyhow::Result;
-use candle_core::{Device, Tensor, DType};
+use candle_core::{DType, Device, Tensor};
 use half::bf16;
 
 const G: usize = 32; // group size per block
@@ -32,7 +32,13 @@ fn decode_fp4_e2m1(n: u8) -> f32 {
 }
 
 #[inline]
-fn pow2_e8m0(u: u8) -> f32 { if u == 0xFF { f32::NAN } else { (2f32).powi((u as i32) - 127) } }
+fn pow2_e8m0(u: u8) -> f32 {
+    if u == 0xFF {
+        f32::NAN
+    } else {
+        (2f32).powi((u as i32) - 127)
+    }
+}
 
 fn l2_linf(a: &[f32], b: &[f32]) -> (f32, f32) {
     assert_eq!(a.len(), b.len());
@@ -41,7 +47,9 @@ fn l2_linf(a: &[f32], b: &[f32]) -> (f32, f32) {
     for i in 0..a.len() {
         let d = (a[i] - b[i]).abs();
         l2 += d * d;
-        if d > linf { linf = d; }
+        if d > linf {
+            linf = d;
+        }
     }
     (l2.sqrt(), linf)
 }
@@ -64,16 +72,24 @@ fn t_mxfp4_tail_groups_indexing() -> Result<()> {
     let mut b1 = [0u8; 16];
     // Block 0: first 32 codes
     for j in 0..16 {
-        let c0 = codes[2*j] & 0x0F;
-        let c1 = codes[2*j + 1] & 0x0F;
+        let c0 = codes[2 * j] & 0x0F;
+        let c1 = codes[2 * j + 1] & 0x0F;
         b0[j] = c0 | (c1 << 4);
     }
     // Block 1: next 13 codes then zeros
     for j in 0..16 {
-        let idx0 = 2*j;
+        let idx0 = 2 * j;
         let idx1 = idx0 + 1;
-        let c0 = if idx0 < n_tail { codes[G + idx0] & 0x0F } else { 0 };
-        let c1 = if idx1 < n_tail { codes[G + idx1] & 0x0F } else { 0 };
+        let c0 = if idx0 < n_tail {
+            codes[G + idx0] & 0x0F
+        } else {
+            0
+        };
+        let c1 = if idx1 < n_tail {
+            codes[G + idx1] & 0x0F
+        } else {
+            0
+        };
         b1[j] = c0 | (c1 << 4);
     }
 
@@ -102,14 +118,14 @@ fn t_mxfp4_tail_groups_indexing() -> Result<()> {
         let byte = b0[j];
         let lo = byte & 0x0F;
         let hi = byte >> 4;
-        let c0 = 2*j;
+        let c0 = 2 * j;
         let c1 = c0 + 1;
         exp[c0] = decode_fp4_e2m1(lo) * scale0;
         exp[c1] = decode_fp4_e2m1(hi) * scale0;
     }
     // Second group tail: 13 elems
     for j in 0..n_tail {
-        let byte = b1[j/2];
+        let byte = b1[j / 2];
         let nib = if (j & 1) == 0 { byte & 0x0F } else { byte >> 4 };
         exp[G + j] = decode_fp4_e2m1(nib) * scale1;
     }
@@ -117,15 +133,33 @@ fn t_mxfp4_tail_groups_indexing() -> Result<()> {
     let exp_bf16: Vec<f32> = exp.iter().map(|v| bf16::from_f32(*v).to_f32()).collect();
 
     // Logs: shapes, dtypes, seed and samples
-    println!("Seed: 0x12345678 (LCG) ⇒ codes checksum={} (N={})", codes.iter().map(|&c| c as u64).sum::<u64>(), n);
+    println!(
+        "Seed: 0x12345678 (LCG) ⇒ codes checksum={} (N={})",
+        codes.iter().map(|&c| c as u64).sum::<u64>(),
+        n
+    );
     println!("blocks dtype u8 device cuda:0 shape [1,2,16] strides [32,16,1]");
     println!("scales dtype u8 device cuda:0 shape [1,2] strides [2,1]");
     println!("out dtype bf16 device cuda:0->cpu shape [1,64] strides [64,1]");
     println!("First block first 8 codes:   {:?}", &codes[..8]);
-    println!("Second block tail 13 codes:  {:?}", &codes[G..G+n_tail]);
+    println!("Second block tail 13 codes:  {:?}", &codes[G..G + n_tail]);
     println!("Scale[0]={} ({}) Scale[1]={} ({})", s0, scale0, s1, scale1);
-    println!("Expected last 8 tail vals:   {:?}", &exp_bf16[G..G+n_tail].iter().rev().take(8).collect::<Vec<&f32>>());
-    println!("Actual   last 8 tail vals:   {:?}", &act[G..G+n_tail].iter().rev().take(8).collect::<Vec<&f32>>());
+    println!(
+        "Expected last 8 tail vals:   {:?}",
+        &exp_bf16[G..G + n_tail]
+            .iter()
+            .rev()
+            .take(8)
+            .collect::<Vec<&f32>>()
+    );
+    println!(
+        "Actual   last 8 tail vals:   {:?}",
+        &act[G..G + n_tail]
+            .iter()
+            .rev()
+            .take(8)
+            .collect::<Vec<&f32>>()
+    );
 
     // Compare only the meaningful N elements
     let (l2, linf) = l2_linf(&exp_bf16, &act);
@@ -135,4 +169,3 @@ fn t_mxfp4_tail_groups_indexing() -> Result<()> {
 
     Ok(())
 }
-

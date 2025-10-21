@@ -27,12 +27,14 @@ fn t50_expert_mlp_split_contiguous_cuda() -> Result<()> {
 
     // down: identity (4x4) so final y == fused result
     let mut eye = vec![0f32; hidden * inter];
-    for i in 0..hidden { eye[i * inter + i] = 1.0; }
+    for i in 0..hidden {
+        eye[i * inter + i] = 1.0;
+    }
     let w_dn = Tensor::from_vec(eye, (hidden, inter), &dev)?; // (4,4)
     let down = Linear::new(w_dn, None);
 
     let limit = 1000.0f32; // effectively disable clamp
-    let alpha = 1.0f32;    // simplify expected
+    let alpha = 1.0f32; // simplify expected
     let mlp = ExpertMlp::new(gate_up, down, limit, alpha);
 
     // Input single token -> gate_up output equals bias on CUDA
@@ -54,9 +56,24 @@ fn t50_expert_mlp_split_contiguous_cuda() -> Result<()> {
 
     // Diagnostics: dtypes, devices, shapes, strides
     eprintln!("seed: fixed (deterministic constants)");
-    eprintln!("xs: dtype={:?}, device={:?}, shape={:?}, stride={:?}", xs.dtype(), xs.device(), xs.dims(), xs.stride());
-    eprintln!("gate_up.bias (concat halves) checksum={:.6}", bias.iter().copied().sum::<f32>());
-    eprintln!("y: dtype={:?}, device={:?}, shape={:?}, stride={:?}", y.dtype(), y.device(), y.dims(), y.stride());
+    eprintln!(
+        "xs: dtype={:?}, device={:?}, shape={:?}, stride={:?}",
+        xs.dtype(),
+        xs.device(),
+        xs.dims(),
+        xs.stride()
+    );
+    eprintln!(
+        "gate_up.bias (concat halves) checksum={:.6}",
+        bias.iter().copied().sum::<f32>()
+    );
+    eprintln!(
+        "y: dtype={:?}, device={:?}, shape={:?}, stride={:?}",
+        y.dtype(),
+        y.device(),
+        y.dims(),
+        y.stride()
+    );
     eprintln!("expected: {:?}", expected);
     eprintln!("actual:   {:?}", got);
 
@@ -77,4 +94,3 @@ fn t50_expert_mlp_split_contiguous_cuda() -> Result<()> {
 
     Ok(())
 }
-

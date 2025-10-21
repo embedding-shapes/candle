@@ -49,12 +49,21 @@ fn t50_hidden_states_steps_sanity() -> Result<()> {
     assert!(s2.layers > 0 && s2.hidden_size > 0);
     assert_eq!(s2.data.len(), s2.layers);
     // Length consistency
-    for row in &s1.data { assert_eq!(row.len(), s1.hidden_size); }
-    for row in &s2.data { assert_eq!(row.len(), s2.hidden_size); }
+    for row in &s1.data {
+        assert_eq!(row.len(), s1.hidden_size);
+    }
+    for row in &s2.data {
+        assert_eq!(row.len(), s2.hidden_size);
+    }
     // Ensure there is at least one differing value between steps
     let mut diff = 0.0f32;
-    for (a, b) in s1.data[0].iter().zip(&s2.data[0]) { diff += (a - b).abs(); }
-    assert!(diff > 1e-6, "hidden states identical across steps; expected change");
+    for (a, b) in s1.data[0].iter().zip(&s2.data[0]) {
+        diff += (a - b).abs();
+    }
+    assert!(
+        diff > 1e-6,
+        "hidden states identical across steps; expected change"
+    );
     Ok(())
 }
 
@@ -69,7 +78,12 @@ fn t51_attn_weights_are_probabilities() -> Result<()> {
         // Each sampled row should sum to ~1
         for row in &a.weights_sample {
             let s: f32 = row.iter().copied().sum();
-            assert!((s - 1.0).abs() < 1e-4, "{}: weights row not normalized: {}", name, s);
+            assert!(
+                (s - 1.0).abs() < 1e-4,
+                "{}: weights row not normalized: {}",
+                name,
+                s
+            );
         }
     }
     Ok(())
@@ -121,7 +135,13 @@ fn decode_fp4_e2m1(nibble: u8) -> f32 {
     }
 }
 
-fn pow2_e8m0(u: u8) -> f32 { if u == 0xFF { f32::NAN } else { (2.0f32).powf(u as f32 - 127.0) } }
+fn pow2_e8m0(u: u8) -> f32 {
+    if u == 0xFF {
+        f32::NAN
+    } else {
+        (2.0f32).powf(u as f32 - 127.0)
+    }
+}
 
 #[test]
 fn t53_mxfp4_slice_roundtrip_decode() -> Result<()> {

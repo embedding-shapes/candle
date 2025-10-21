@@ -55,7 +55,10 @@ fn t42_swiglu_cuda_parity() -> Result<()> {
     // Log evidence
     eprintln!(
         "device={:?} dtype={:?} x.shape={:?} w.shape={:?}",
-        dev, y_lib.dtype(), x.shape(), wcat.shape()
+        dev,
+        y_lib.dtype(),
+        x.shape(),
+        wcat.shape()
     );
     eprintln!("x (first 8) = {:?}", &x_vals[..8.min(x_vals.len())]);
     let y_lib_host = y_lib.to_dtype(DType::F32)?.to_vec2::<f32>()?;
@@ -64,6 +67,9 @@ fn t42_swiglu_cuda_parity() -> Result<()> {
     eprintln!("y_ref first8 = {:?}", &y_ref_host[0][..8.min(inter)]);
     eprintln!("L_inf = {:.9}, L2 = {:.9}", l_inf, l2);
 
-    assert!(l_inf <= 1e-6, "SwiGLU variant mismatch: L_inf={l_inf} > 1e-6");
+    assert!(
+        l_inf <= 1e-6,
+        "SwiGLU variant mismatch: L_inf={l_inf} > 1e-6"
+    );
     Ok(())
 }

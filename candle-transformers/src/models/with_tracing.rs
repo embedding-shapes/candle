@@ -46,8 +46,12 @@ impl Linear {
         Self { inner, span }
     }
 
-    pub fn weight(&self) -> &Tensor { self.inner.weight() }
-    pub fn bias(&self) -> Option<&Tensor> { self.inner.bias() }
+    pub fn weight(&self) -> &Tensor {
+        self.inner.weight()
+    }
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.inner.bias()
+    }
 }
 
 pub fn linear_b(d1: usize, d2: usize, b: bool, vb: VarBuilder) -> Result<Linear> {
@@ -184,7 +188,11 @@ impl RmsNorm {
     pub fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
         let inner = candle_nn::rms_norm(size, eps, vb)?;
-        Ok(Self { inner, span, safe_fp32: false })
+        Ok(Self {
+            inner,
+            span,
+            safe_fp32: false,
+        })
     }
 
     /// Construct with an explicit compute mode toggle: when `safe_fp32` is true,
@@ -193,7 +201,11 @@ impl RmsNorm {
     pub fn new_with_mode(size: usize, eps: f64, vb: VarBuilder, safe_fp32: bool) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
         let inner = candle_nn::rms_norm(size, eps, vb)?;
-        Ok(Self { inner, span, safe_fp32 })
+        Ok(Self {
+            inner,
+            span,
+            safe_fp32,
+        })
     }
 
     pub fn forward_diff(&self, x: &Tensor) -> Result<Tensor> {

@@ -40,7 +40,11 @@ impl Mistral3PatchMerger {
     ///
     /// It reduces token count by merging non-overlapping s×s windows (s = spatial_merge_size),
     /// concatenating features inside each window and applying a linear projection d*s*s -> d.
-    pub fn forward(&self, image_features: &Tensor, image_sizes: &[(usize, usize)]) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        image_features: &Tensor,
+        image_sizes: &[(usize, usize)],
+    ) -> Result<Tensor> {
         let d = image_features.dim(1)?;
         let s = self.spatial_merge_size;
 
@@ -92,7 +96,9 @@ impl Mistral3PatchMerger {
                 .reshape((1, d * s * s, h_blocks, w_blocks))?;
 
             // (1, d*s*s, h_blocks, w_blocks) -> (h_blocks * w_blocks, d*s*s), then merge d*s*s -> d.
-            let y = y.permute((0, 2, 3, 1))?.reshape((h_blocks * w_blocks, d * s * s))?;
+            let y = y
+                .permute((0, 2, 3, 1))?
+                .reshape((h_blocks * w_blocks, d * s * s))?;
             let y = y.apply(&self.merging_layer)?; // (h_blocks * w_blocks, d)
             merged.push(y);
         }
@@ -103,17 +109,21 @@ impl Mistral3PatchMerger {
 
 #[derive(Debug, Clone)]
 pub struct Mistral3MultiModalProjector {
-    norm: RmsNorm,                // RMSNorm over vision hidden dim
+    norm: RmsNorm, // RMSNorm over vision hidden dim
     pub patch_merger: Mistral3PatchMerger,
-    linear_1: Linear,             // (hidden_v * num_feature_layers) -> hidden_t
-    act: candle_nn::Activation,   // projector_hidden_act
-    linear_2: Linear,             // hidden_t -> hidden_t
+    linear_1: Linear,           // (hidden_v * num_feature_layers) -> hidden_t
+    act: candle_nn::Activation, // projector_hidden_act
+    linear_2: Linear,           // hidden_t -> hidden_t
 }
 
 impl Mistral3MultiModalProjector {
     pub fn new(cfg: &Mistral3Config, vb: VarBuilder) -> Result<Self> {
         let eps = cfg.text_config.inner.rms_norm_eps;
-        let eps = if eps.is_finite() { eps } else { DEFAULT_EPS_FALLBACK };
+        let eps = if eps.is_finite() {
+            eps
+        } else {
+            DEFAULT_EPS_FALLBACK
+        };
         let hidden_v = cfg.vision_config.inner.hidden_size;
         let hidden_t = cfg.text_config.inner.hidden_size;
         let num_feature_layers = match &cfg.vision_feature_layer {
@@ -150,10 +160,16 @@ impl Mistral3MultiModalProjector {
     /// - `image_features`: (total_tokens, hidden_v) or (total_tokens, hidden_v * num_feature_layers)
     ///   when concatenating multiple feature layers.
     /// - `image_sizes`: list of (H, W) pixel sizes.
-    pub fn forward(&self, image_features: &Tensor, image_sizes: &[(usize, usize)]) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        image_features: &Tensor,
+        image_sizes: &[(usize, usize)],
+    ) -> Result<Tensor> {
         let xs = self.norm.forward(image_features)?;
         let xs = self.patch_merger.forward(&xs, image_sizes)?;
-        xs.apply(&self.linear_1)?.apply(&self.act)?.apply(&self.linear_2)
+        xs.apply(&self.linear_1)?
+            .apply(&self.act)?
+            .apply(&self.linear_2)
     }
 }
 
@@ -324,7 +340,8 @@ mod tests {
         // patch_merger.merging_layer.weight = identity (d x d)
         let mut merge_w = Tensor::zeros((hidden, hidden), DType::F32, &dev)?;
         for i in 0..hidden {
-            merge_w = merge_w.slice_assign(&[i..i + 1, i..i + 1], &Tensor::new(&[[1f32]], &dev)?)?;
+            merge_w =
+                merge_w.slice_assign(&[i..i + 1, i..i + 1], &Tensor::new(&[[1f32]], &dev)?)?;
         }
         tensors.insert(
             "multi_modal_projector.patch_merger.merging_layer.weight".to_string(),
@@ -350,10 +367,8 @@ mod tests {
         let image_sizes = vec![(2, 2)];
         let data: Vec<f32> = vec![
             // 4 tokens, each with `hidden` dims; mix negatives to trigger ReLU
-            -1.0, -0.5, 0.0, 0.1, 1.0, 2.0,
-            -2.0, 0.0, 3.0, -3.0, 0.5, -0.1,
-            0.2, -0.2, 0.3, -0.3, 0.4, -0.4,
-            -0.9, 0.9, -0.8, 0.8, -0.7, 0.7,
+            -1.0, -0.5, 0.0, 0.1, 1.0, 2.0, -2.0, 0.0, 3.0, -3.0, 0.5, -0.1, 0.2, -0.2, 0.3, -0.3,
+            0.4, -0.4, -0.9, 0.9, -0.8, 0.8, -0.7, 0.7,
         ];
         let xs = Tensor::from_vec(data, (4, hidden), &dev)?;
         let ys = projector.forward(&xs, &image_sizes)?;

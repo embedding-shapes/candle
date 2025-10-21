@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use candle::Device;
 use candle::safetensors::{MmapedFile, MmapedSafetensors};
+use candle::Device;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
@@ -32,7 +32,9 @@ fn sha256_bytes(buf: &[u8]) -> Result<String> {
             stdin.write_all(buf).context("write stdin sha256sum")?;
         }
         let out = child.wait_with_output().context("run sha256sum")?;
-        if !out.status.success() { anyhow::bail!("sha256sum failed: {}", out.status); }
+        if !out.status.success() {
+            anyhow::bail!("sha256sum failed: {}", out.status);
+        }
         let s = String::from_utf8_lossy(&out.stdout);
         Ok(s.split_whitespace().next().unwrap_or("").to_string())
     };
@@ -50,7 +52,9 @@ fn sha256_bytes(buf: &[u8]) -> Result<String> {
                 stdin.write_all(buf).context("write stdin shasum")?;
             }
             let out = child.wait_with_output().context("run shasum")?;
-            if !out.status.success() { anyhow::bail!("shasum failed: {}", out.status); }
+            if !out.status.success() {
+                anyhow::bail!("shasum failed: {}", out.status);
+            }
             let s = String::from_utf8_lossy(&out.stdout);
             Ok(s.split_whitespace().next().unwrap_or("").to_string())
         }
@@ -72,13 +76,20 @@ fn t42_sharded_safetensors_loader_mapping_parity() -> Result<()> {
 
     // 1) Parse model.safetensors.index.json → weight_map
     #[derive(serde::Deserialize)]
-    struct Idx { weight_map: BTreeMap<String, String> }
-    let idx_bytes = std::fs::read(&idx_path).with_context(|| format!("read {}", idx_path.display()))?;
-    let idx: Idx = serde_json::from_slice(&idx_bytes).context("invalid model.safetensors.index.json")?;
+    struct Idx {
+        weight_map: BTreeMap<String, String>,
+    }
+    let idx_bytes =
+        std::fs::read(&idx_path).with_context(|| format!("read {}", idx_path.display()))?;
+    let idx: Idx =
+        serde_json::from_slice(&idx_bytes).context("invalid model.safetensors.index.json")?;
 
     // 2) Build loader union and our own name→file index map by scanning headers.
     let files = candle_examples::hub_load_local_safetensors(&snap, INDEX_FILE)?;
-    assert!(!files.is_empty(), "no safetensors files resolved from index");
+    assert!(
+        !files.is_empty(),
+        "no safetensors files resolved from index"
+    );
     let union = unsafe { MmapedSafetensors::multi(&files)? };
 
     let mut name_to_file_idx: HashMap<String, usize> = HashMap::new();
@@ -144,7 +155,8 @@ fn t42_sharded_safetensors_loader_mapping_parity() -> Result<()> {
 
         assert_eq!(
             actual_hash, expected_hash,
-            "byte-slice sha256 mismatch for {}", name
+            "byte-slice sha256 mismatch for {}",
+            name
         );
     }
 

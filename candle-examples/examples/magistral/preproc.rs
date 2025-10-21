@@ -76,11 +76,9 @@ pub fn load_image_pixtral<P: AsRef<Path>>(
     let data = Tensor::from_vec(data, (height, width, 3), &Device::Cpu)?.permute((2, 0, 1))?;
     let mean = Tensor::new(mean, &Device::Cpu)?.reshape((3, 1, 1))?;
     let std = Tensor::new(std, &Device::Cpu)?.reshape((3, 1, 1))?;
-    Ok(
-        (data.to_dtype(candle::DType::F32)? / 255.)?
-            .broadcast_sub(&mean)?
-            .broadcast_div(&std)?,
-    )
+    Ok((data.to_dtype(candle::DType::F32)? / 255.)?
+        .broadcast_sub(&mean)?
+        .broadcast_div(&std)?)
 }
 
 #[cfg(test)]

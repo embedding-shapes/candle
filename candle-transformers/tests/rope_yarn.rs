@@ -19,14 +19,31 @@ fn yarn_reference_cos_sin(
         .map(|i| rope_theta.powf(i as f32 / head_dim as f32))
         .collect();
     let inv_freq_extrapolation: Vec<f32> = pos_freqs.iter().map(|&v| 1.0 / v).collect();
-    let inv_freq_interpolation: Vec<f32> = inv_freq_extrapolation.iter().map(|&v| v / factor).collect();
+    let inv_freq_interpolation: Vec<f32> =
+        inv_freq_extrapolation.iter().map(|&v| v / factor).collect();
 
-    fn find_correction_dim(num_rot: f32, dim: usize, base: f32, max_position_embeddings: usize) -> f32 {
-        (dim as f32 * (max_position_embeddings as f32 / (num_rot * 2.0 * std::f32::consts::PI)).ln())
+    fn find_correction_dim(
+        num_rot: f32,
+        dim: usize,
+        base: f32,
+        max_position_embeddings: usize,
+    ) -> f32 {
+        (dim as f32
+            * (max_position_embeddings as f32 / (num_rot * 2.0 * std::f32::consts::PI)).ln())
             / (2.0 * base.ln())
     }
-    let mut low = find_correction_dim(beta_fast, head_dim, rope_theta, original_max_position_embeddings);
-    let mut high = find_correction_dim(beta_slow, head_dim, rope_theta, original_max_position_embeddings);
+    let mut low = find_correction_dim(
+        beta_fast,
+        head_dim,
+        rope_theta,
+        original_max_position_embeddings,
+    );
+    let mut high = find_correction_dim(
+        beta_slow,
+        head_dim,
+        rope_theta,
+        original_max_position_embeddings,
+    );
     low = low.max(0.0);
     high = high.min(head_dim as f32 - 1.0);
     let mut maxv = high;
@@ -49,8 +66,12 @@ fn yarn_reference_cos_sin(
     // Per-position frequencies
     let t = Tensor::new(pos as f32, dev)?.reshape((1, 1))?; // (1,1)
     let freqs = t.matmul(&inv_freq)?; // (1,dim/2)
-    // Apply HF-style YARN attention scaling directly to tables.
-    let mscale = if factor <= 1.0 { 1.0 } else { 0.1 * factor.ln() + 1.0 };
+                                      // Apply HF-style YARN attention scaling directly to tables.
+    let mscale = if factor <= 1.0 {
+        1.0
+    } else {
+        0.1 * factor.ln() + 1.0
+    };
     let sin = (freqs.sin()? * mscale as f64)?.to_dtype(DType::F32)?;
     let cos = (freqs.cos()? * mscale as f64)?.to_dtype(DType::F32)?;
     Ok((cos, sin))
@@ -83,7 +104,9 @@ fn rope_yarn_spot_positions_against_reference() -> Result<()> {
 
     // Use max position for table creation once
     let max_t = positions.iter().copied().max().unwrap() + 1;
-    let rope_cfg = GptOssRopeConfig::new(head_dim, max_t, rope_theta, factor, beta_fast, beta_slow, orig);
+    let rope_cfg = GptOssRopeConfig::new(
+        head_dim, max_t, rope_theta, factor, beta_fast, beta_slow, orig,
+    );
     let rope = GptOssRotaryEmbedding::new_yarn(DType::F32, &dev, &rope_cfg)?;
 
     // Fixed inputs
@@ -94,7 +117,9 @@ fn rope_yarn_spot_positions_against_reference() -> Result<()> {
     let k_in = (&q_in * 0.5f64)?; // deterministic different input
 
     for &pos in &positions {
-        let (cos_ref, sin_ref) = yarn_reference_cos_sin(head_dim, pos, rope_theta, factor, beta_fast, beta_slow, orig, &dev)?; // (1, d/2)
+        let (cos_ref, sin_ref) = yarn_reference_cos_sin(
+            head_dim, pos, rope_theta, factor, beta_fast, beta_slow, orig, &dev,
+        )?; // (1, d/2)
 
         let (q_out, k_out) = rope.apply_rotary_emb_qk(&q_in, &k_in, pos)?; // offset=pos, t=1
         let q_ref = apply_rotary_reference(&q_in, &cos_ref, &sin_ref)?;

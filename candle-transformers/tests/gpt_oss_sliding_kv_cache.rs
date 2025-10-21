@@ -1,5 +1,5 @@
-use candle::{Device, Result, Tensor, D};
 use candle::IndexOp;
+use candle::{Device, Result, Tensor, D};
 use candle_transformers::models::gpt_oss::{
     eager_attn_windowed_with_sinks, select_attn_mode_for_layer, AttnMode, GptOssConfigMinimal,
     GptOssLayerType,
@@ -25,7 +25,10 @@ fn t18_kv_cache_trimming_and_decode_equiv() -> Result<()> {
     };
     // Verify selection helper behaves as expected.
     assert_eq!(select_attn_mode_for_layer(&cfg, 0), AttnMode::Full);
-    assert_eq!(select_attn_mode_for_layer(&cfg, 1), AttnMode::Sliding { left: 3, right: 0 });
+    assert_eq!(
+        select_attn_mode_for_layer(&cfg, 1),
+        AttnMode::Sliding { left: 3, right: 0 }
+    );
 
     // Use RotatingKvCache directly to test trimming semantics on a sliding layer.
     let window = cfg.sliding_window.unwrap();
@@ -114,7 +117,9 @@ fn t18_kv_cache_trimming_and_decode_equiv() -> Result<()> {
             Some(0),
             None,
         )?; // (b,t_step,h,d)
-        let o_step = o_step_all.i((.., t_step - 1, .., ..))?.reshape((b, 1, h, d))?;
+        let o_step = o_step_all
+            .i((.., t_step - 1, .., ..))?
+            .reshape((b, 1, h, d))?;
         if s == t - 1 {
             last_step_out = Some(o_step.clone());
         }

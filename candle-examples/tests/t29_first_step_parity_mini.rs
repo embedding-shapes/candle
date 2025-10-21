@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use candle::{DType, Tensor, IndexOp};
+use candle::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::gpt_oss::config::GptOssConfig;
 use candle_transformers::models::gpt_oss::model::GptOssModel;
@@ -38,15 +38,25 @@ fn t29_first_step_parity_mini() -> Result<()> {
         .context("missing <|channel|> in tokenizer")? as usize;
 
     // Messages -> tokens
-    let user = Message::from_role_and_content(Role::User, "Explain what MXFP4 quantization is".to_string());
-    let input_ids: Vec<u32> = render_then_encode(&snapshot, &[user], true)
-        .context("render_then_encode failed")?;
+    let user = Message::from_role_and_content(
+        Role::User,
+        "Explain what MXFP4 quantization is".to_string(),
+    );
+    let input_ids: Vec<u32> =
+        render_then_encode(&snapshot, &[user], true).context("render_then_encode failed")?;
     assert!(!input_ids.is_empty(), "prompt tokens should not be empty");
 
     // Candle forward (GPU, BF16/F16)
     let device = candle_examples::device(false /* cpu */)?;
-    let dtype = if device.supports_bf16() { DType::BF16 } else { DType::F16 };
-    assert!(device.is_cuda(), "CUDA device required for this parity test");
+    let dtype = if device.supports_bf16() {
+        DType::BF16
+    } else {
+        DType::F16
+    };
+    assert!(
+        device.is_cuda(),
+        "CUDA device required for this parity test"
+    );
 
     // Load config + weights
     let cfg_path = snapshot.join("config.json");
@@ -58,9 +68,16 @@ fn t29_first_step_parity_mini() -> Result<()> {
         let idx_bytes = std::fs::read(&model_index)
             .with_context(|| format!("failed to read model index: {}", model_index.display()))?;
         #[derive(serde::Deserialize)]
-        struct Idx { weight_map: std::collections::BTreeMap<String, String> }
-        let idx: Idx = serde_json::from_slice(&idx_bytes).context("invalid model.safetensors.index.json")?;
-        let files = idx.weight_map.values().cloned().collect::<std::collections::BTreeSet<_>>();
+        struct Idx {
+            weight_map: std::collections::BTreeMap<String, String>,
+        }
+        let idx: Idx =
+            serde_json::from_slice(&idx_bytes).context("invalid model.safetensors.index.json")?;
+        let files = idx
+            .weight_map
+            .values()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         files.iter().map(|f| snapshot.join(f)).collect()
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, &device)? };
@@ -76,11 +93,19 @@ fn t29_first_step_parity_mini() -> Result<()> {
     let probs_v = probs.to_vec1::<f32>()?;
     let mut argmax = 0usize;
     let mut maxv = f32::NEG_INFINITY;
-    for (i, &p) in probs_v.iter().enumerate() { if p > maxv { maxv = p; argmax = i; } }
+    for (i, &p) in probs_v.iter().enumerate() {
+        if p > maxv {
+            maxv = p;
+            argmax = i;
+        }
+    }
     let p_channel = probs_v[channel_id];
 
     // Python HF compute of the same quantities (top-1 id, p_channel)
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let py_src = repo_root.join("py-transformers").join("src");
     let script = {
         let toks_json = serde_json::to_string(&input_ids).unwrap();
@@ -108,7 +133,8 @@ with torch.no_grad():
             py_src = format!("{:?}", py_src.display()),
             snap = format!("{:?}", snapshot.display()),
             toks = toks_json,
-            chid = channel_id)
+            chid = channel_id
+        )
     };
 
     let output = Command::new("uv")
@@ -124,13 +150,24 @@ with torch.no_grad():
     }
     let out = String::from_utf8_lossy(&output.stdout);
     #[derive(serde::Deserialize)]
-    struct PyRes { top1_id: usize, p_channel: f32 }
+    struct PyRes {
+        top1_id: usize,
+        p_channel: f32,
+    }
     let py_res: PyRes = serde_json::from_str(&out).context("invalid python json")?;
 
     // Assertions
     assert_eq!(argmax, channel_id, "Candle top-1 must be <|channel|>");
-    assert!(p_channel > 0.99, "Candle p_channel must be > 0.99, was {}", p_channel);
+    assert!(
+        p_channel > 0.99,
+        "Candle p_channel must be > 0.99, was {}",
+        p_channel
+    );
     assert_eq!(py_res.top1_id, channel_id, "HF top-1 must be <|channel|>");
-    assert!(py_res.p_channel > 0.99, "HF p_channel must be > 0.99, was {}", py_res.p_channel);
+    assert!(
+        py_res.p_channel > 0.99,
+        "HF p_channel must be > 0.99, was {}",
+        py_res.p_channel
+    );
     Ok(())
 }

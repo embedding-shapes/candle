@@ -8,8 +8,10 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::gpt_oss::config::GptOssConfig;
 use candle_transformers::models::gpt_oss::model::GptOssModel;
 
-use openai_harmony::{chat::{Message, Role}};
-use gpt_oss_tokenizer::{render_then_encode, load_stop_token_ids, extract_final_assistant_text_from_decoded};
+use gpt_oss_tokenizer::{
+    extract_final_assistant_text_from_decoded, load_stop_token_ids, render_then_encode,
+};
+use openai_harmony::chat::{Message, Role};
 
 // Constants
 const DEFAULT_SNAPSHOT_DIR: &str =
@@ -18,7 +20,11 @@ const MODEL_INDEX_FILE: &str = "model.safetensors.index.json";
 // Special tokens are handled via tokenizer decoding and the shared helper in gpt_oss_tokenizer.
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "GPT-OSS-20B example (Harmony prompt formatting)")]
+#[command(
+    author,
+    version,
+    about = "GPT-OSS-20B example (Harmony prompt formatting)"
+)]
 struct Args {
     /// The user prompt to format and tokenize via Harmony.
     #[arg(long)]
@@ -53,8 +59,15 @@ fn main() -> Result<()> {
     if !device.is_cuda() {
         eprintln!("Warning: CUDA not available, running on {:?}", device);
     }
-    let mut dtype = if device.supports_bf16() { DType::BF16 } else { DType::F16 };
-    if matches!(std::env::var("CANDLE_FORCE_BF16").ok().as_deref(), Some("1") | Some("true") | Some("TRUE")) {
+    let mut dtype = if device.supports_bf16() {
+        DType::BF16
+    } else {
+        DType::F16
+    };
+    if matches!(
+        std::env::var("CANDLE_FORCE_BF16").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    ) {
         dtype = DType::BF16;
     }
 
@@ -64,7 +77,14 @@ fn main() -> Result<()> {
     } else {
         println!("Device set to use {:?}", device);
     }
-    println!("dtype: {}", match dtype { DType::BF16 => "bf16", DType::F16 => "f16", _ => "other" });
+    println!(
+        "dtype: {}",
+        match dtype {
+            DType::BF16 => "bf16",
+            DType::F16 => "f16",
+            _ => "other",
+        }
+    );
     println!("Snapshot: {}", snapshot_dir.display());
 
     // Conversation: one user message. Render via the model's chat_template.jinja and
@@ -72,12 +92,18 @@ fn main() -> Result<()> {
     let user_msg = Message::from_role_and_content(Role::User, args.prompt.clone());
     println!(
         "messages: [{}]",
-        format!("{{'role': 'user', 'content': '{}'}}", args.prompt.replace('\n', "\\n").replace('\'', "\\'"))
+        format!(
+            "{{'role': 'user', 'content': '{}'}}",
+            args.prompt.replace('\n', "\\n").replace('\'', "\\'")
+        )
     );
     let mut tokens: Vec<u32> = render_then_encode(&snapshot_dir, &[user_msg], true)
         .context("failed to render+encode with chat_template.jinja + tokenizer.json")?;
     // Dump both the first 32 and the full set of prompt tokens for exact parity inspection.
-    println!("first 32 token ids: {:?}", &tokens.iter().take(32).copied().collect::<Vec<_>>());
+    println!(
+        "first 32 token ids: {:?}",
+        &tokens.iter().take(32).copied().collect::<Vec<_>>()
+    );
     println!("prompt token ids: {:?}", &tokens);
     let ids_u32: Vec<u32> = tokens.iter().take(32).copied().collect();
     let tok_path = snapshot_dir.join("tokenizer.json");
@@ -107,9 +133,18 @@ fn main() -> Result<()> {
     {
         let rope_str = if let Some(r) = cfg.rope_scaling.as_ref() {
             let ty = r.r#type.as_deref().unwrap_or("?");
-            let f = r.factor.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
-            let bf = r.beta_fast.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
-            let bs = r.beta_slow.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+            let f = r
+                .factor
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let bf = r
+                .beta_fast
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let bs = r
+                .beta_slow
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string());
             let orig = r
                 .original_max_position_embeddings
                 .map(|v| v.to_string())
@@ -133,16 +168,28 @@ fn main() -> Result<()> {
 
     // Resolve safetensors shard files from the local index.
     let model_files = candle_examples::hub_load_local_safetensors(&snapshot_dir, MODEL_INDEX_FILE)
-        .with_context(|| format!("failed to read index {MODEL_INDEX_FILE} under {}", snapshot_dir.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to read index {MODEL_INDEX_FILE} under {}",
+                snapshot_dir.display()
+            )
+        })?;
     if model_files.is_empty() {
-        bail!("no safetensors files found under {}", snapshot_dir.display());
+        bail!(
+            "no safetensors files found under {}",
+            snapshot_dir.display()
+        );
     }
     // Debug: shard summary (count and first few filenames)
     {
         let first: Vec<_> = model_files
             .iter()
             .take(3)
-            .map(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())
+            .map(|p| {
+                p.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
             .collect();
         println!("Shards: count={} first={:?}", model_files.len(), first);
     }
@@ -166,8 +213,13 @@ fn main() -> Result<()> {
         Sampling::ArgMax
     } else {
         match args.top_p {
-            None => Sampling::All { temperature: args.temperature },
-            Some(p) => Sampling::TopP { p, temperature: args.temperature },
+            None => Sampling::All {
+                temperature: args.temperature,
+            },
+            Some(p) => Sampling::TopP {
+                p,
+                temperature: args.temperature,
+            },
         }
     };
     let mut sampler = LogitsProcessor::from_sampling(args.seed, sampling);
@@ -200,11 +252,19 @@ fn main() -> Result<()> {
     let mut last_emitted_len = 0usize; // number of bytes already emitted from final-channel text
     for step in 0..args.sample_len {
         let iter_forward_start = Instant::now();
-        let (context_size, context_index) = if step > 0 { (1usize, index_pos) } else { (tokens.len(), 0usize) };
+        let (context_size, context_index) = if step > 0 {
+            (1usize, index_pos)
+        } else {
+            (tokens.len(), 0usize)
+        };
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
 
         // Profile first forward pass with detailed timing breakdown
-        let t_tensor_start = if step == 0 { Some(Instant::now()) } else { None };
+        let t_tensor_start = if step == 0 {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let t = Tensor::from_vec(ctxt.to_vec(), (1, context_size), &device)?;
         let t_tensor_dur = t_tensor_start.map(|start| start.elapsed());
 
@@ -229,26 +289,41 @@ fn main() -> Result<()> {
                 eprintln!("[head-only] top-5 candidates:");
                 for &i in &idx[..topn] {
                     let id = i as u32;
-                    let s = tk.decode(&[id], /*skip_special_tokens=*/ false).unwrap_or_else(|_| "<dec-err>".to_string());
+                    let s = tk
+                        .decode(&[id], /*skip_special_tokens=*/ false)
+                        .unwrap_or_else(|_| "<dec-err>".to_string());
                     eprintln!("  id={:6} p={:.4} tok={}", id, v[i], s);
                 }
                 if let Some(ch_id) = tk.token_to_id("<|channel|>") {
-                    eprintln!("  [head-only] '<|channel|>' id={} p={:.6}", ch_id, v[ch_id as usize]);
+                    eprintln!(
+                        "  [head-only] '<|channel|>' id={} p={:.6}",
+                        ch_id, v[ch_id as usize]
+                    );
                 }
             }
         }
 
-        let t_forward_start = if step == 0 { Some(Instant::now()) } else { None };
+        let t_forward_start = if step == 0 {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let logits = model.forward(&t, context_index)?; // (1, context_size, vocab)
         let t_forward_dur = t_forward_start.map(|start| start.elapsed());
 
         let last = logits.i((0, context_size - 1))?; // (vocab)
         if step == 0 {
             if let Some(dur) = t_forward_dur {
-                eprintln!("  - full forward (all layers + lm_head): {:.3} ms", dur.as_secs_f64() * 1000.0);
+                eprintln!(
+                    "  - full forward (all layers + lm_head): {:.3} ms",
+                    dur.as_secs_f64() * 1000.0
+                );
             }
             let total_step0 = iter_forward_start.elapsed();
-            eprintln!("  - total step 0 time: {:.3} ms", total_step0.as_secs_f64() * 1000.0);
+            eprintln!(
+                "  - total step 0 time: {:.3} ms",
+                total_step0.as_secs_f64() * 1000.0
+            );
         }
         // Sample next token. The model was trained on Harmony protocol and naturally
         // follows the correct sequence without forcing. Just sample with temperature.
@@ -280,7 +355,9 @@ fn main() -> Result<()> {
                 }
             }
         }
-        if stop_tokens.contains(&next) { break; }
+        if stop_tokens.contains(&next) {
+            break;
+        }
     }
 
     let response_stream_duration = match (response_write_start, response_write_end) {
@@ -320,12 +397,14 @@ fn main() -> Result<()> {
         time_to_model_load_start_secs
     );
     println!("- model_load_duration: {:.3} s", model_load_duration_secs);
-    println!("- prompt_processing_duration: {:.3} s", prompt_processing_secs);
+    println!(
+        "- prompt_processing_duration: {:.3} s",
+        prompt_processing_secs
+    );
     println!("- response_stream_duration: {:.3} s", response_stream_secs);
     println!(
         "- tokens_per_second: {:.3} tok/s over {} tokens",
-        tokens_per_second,
-        generated_tokens
+        tokens_per_second, generated_tokens
     );
 
     println!("full harmony decode: {}", decoded_full);

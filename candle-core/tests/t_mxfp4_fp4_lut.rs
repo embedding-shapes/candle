@@ -32,13 +32,15 @@ fn t_mxfp4_fp4_lut_parity_gpu() -> Result<()> {
     // Construct one block [rows=1, cols=32] from 16 bytes so that the low nibble cycles codes 0..15.
     // High nibble set to 0 for simplicity; scale=1.0 via E8M0 code 127.
     let mut block_bytes = [0u8; 16];
-    for j in 0..16u8 { block_bytes[j as usize] = j; /* hi=0, lo=j */ }
+    for j in 0..16u8 {
+        block_bytes[j as usize] = j; /* hi=0, lo=j */
+    }
     let blocks = Tensor::from_vec(block_bytes.to_vec(), (1, 1, 16), &dev)?; // U8 by default
     let scales = Tensor::from_vec(vec![127u8], (1, 1), &dev)?; // E8M0 -> 2^(127-127)=1
 
     // Launch fused dequant on GPU.
     let out_bf16 = dequant_mxfp4_to_bf16(&blocks, &scales, [1, 32])?; // BF16 on CUDA
-    // Bring back to CPU and extract BF16 values and raw bits.
+                                                                      // Bring back to CPU and extract BF16 values and raw bits.
     let out_cpu = out_bf16.to_device(&Device::Cpu)?;
     let out_vals: Vec<bf16> = out_cpu.flatten_all()?.to_vec1::<bf16>()?; // length 32
 
@@ -63,19 +65,28 @@ fn t_mxfp4_fp4_lut_parity_gpu() -> Result<()> {
 
     // Diagnostics: print inputs/outputs and metadata.
     println!("Device: CUDA, DType(out) = {:?}", out_bf16.dtype());
-    println!("Blocks shape: [1,1,16], Scales shape: [1,1], Out shape: {:?}", out_bf16.dims());
+    println!(
+        "Blocks shape: [1,1,16], Scales shape: [1,1], Out shape: {:?}",
+        out_bf16.dims()
+    );
     println!("Block bytes (lo=code, hi=0): {:?}", &block_bytes);
     // Show mapping table
     println!("LUT codes 0..15 -> BF16 bits (exp vs got, even indices):");
     for i in 0..16 {
         println!(
             "code {:2}: exp={:04x} got={:04x} exp_f={:?} got_f={:?}",
-            i, exp_bits[i], got_bits[i], f32::from(exp_vals[i]), f32::from(got_vals[i])
+            i,
+            exp_bits[i],
+            got_bits[i],
+            f32::from(exp_vals[i]),
+            f32::from(got_vals[i])
         );
     }
 
     // Compare bitwise equality for all 16 entries.
-    for i in 0..16 { assert_eq!(got_bits[i], exp_bits[i], "BF16 bits mismatch at code {}", i); }
+    for i in 0..16 {
+        assert_eq!(got_bits[i], exp_bits[i], "BF16 bits mismatch at code {}", i);
+    }
 
     // Compute numeric metrics for completeness.
     let mut linf = 0f32;

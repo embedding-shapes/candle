@@ -1,7 +1,7 @@
-use candle::{Device, DType, Result, Tensor};
-use candle_transformers::models::gpt_oss::{eager_attn_with_sinks, eager_attn_windowed_with_sinks};
+use candle::{DType, Device, Result, Tensor};
+use candle_transformers::models::gpt_oss::{eager_attn_windowed_with_sinks, eager_attn_with_sinks};
 #[cfg(feature = "flash-attn")]
-use candle_transformers::models::gpt_oss::{flash_attn_with_sinks, flash_attn_windowed_with_sinks};
+use candle_transformers::models::gpt_oss::{flash_attn_windowed_with_sinks, flash_attn_with_sinks};
 
 // T12: FA (+LSE sinks) vs eager sinks parity on tiny shapes
 #[cfg(feature = "flash-attn")]
@@ -20,7 +20,11 @@ fn gpt_oss_fa_lse_sinks_vs_eager_parity() -> Result<()> {
     let qlen = 3usize;
     let klen = 4usize;
     let d = 64usize; // FA head-dim multiple of 8
-    let dtype = if device.supports_bf16() { DType::BF16 } else { DType::F16 };
+    let dtype = if device.supports_bf16() {
+        DType::BF16
+    } else {
+        DType::F16
+    };
     let scale = 1f32 / (d as f32).sqrt();
 
     // Build q/k/v in FA layout: (b, seqlen, heads, dim)
@@ -67,7 +71,11 @@ fn gpt_oss_fa_windowed_lse_sinks_vs_eager_parity() -> Result<()> {
     let qlen = 5usize;
     let klen = 5usize;
     let d = 64usize;
-    let dtype = if device.supports_bf16() { DType::BF16 } else { DType::F16 };
+    let dtype = if device.supports_bf16() {
+        DType::BF16
+    } else {
+        DType::F16
+    };
     let scale = 1f32 / (d as f32).sqrt();
 
     let q_bqhd = Tensor::arange(0u32, (b * h * qlen * d) as u32, &device)?

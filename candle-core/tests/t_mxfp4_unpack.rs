@@ -4,16 +4,19 @@
 // Runs on CUDA, small deterministic inputs, no full model load.
 
 use anyhow::{bail, Result};
-use candle_core::{Device, Tensor};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::WrapErr;
+use candle_core::{Device, Tensor};
 #[cfg(feature = "cuda")]
 use cudarc::driver::PushKernelArg;
 use half::bf16;
 
 #[cfg(feature = "cuda")]
 fn hex_bytes(v: &[u8]) -> String {
-    v.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+    v.iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(feature = "cuda")]
@@ -42,7 +45,9 @@ fn l2_linf(a: &[f32], b: &[f32]) -> (f32, f32) {
     for i in 0..a.len() {
         let d = (a[i] - b[i]).abs();
         l2 += d * d;
-        if d > linf { linf = d; }
+        if d > linf {
+            linf = d;
+        }
     }
     (l2.sqrt(), linf)
 }
@@ -56,8 +61,8 @@ fn t_mxfp4_unpack_and_map() -> Result<()> {
 
     // Input buffer: 16 bytes with adversarial patterns
     let bytes: [u8; 16] = [
-        0xF1, 0x1F, 0xAB, 0xBA, 0x00, 0xFF, 0x0F, 0xF0,
-        0x5A, 0xA5, 0x3C, 0xC3, 0x7E, 0xE7, 0x12, 0x21,
+        0xF1, 0x1F, 0xAB, 0xBA, 0x00, 0xFF, 0x0F, 0xF0, 0x5A, 0xA5, 0x3C, 0xC3, 0x7E, 0xE7, 0x12,
+        0x21,
     ];
     let n = bytes.len() as i32;
 
@@ -78,7 +83,11 @@ fn t_mxfp4_unpack_and_map() -> Result<()> {
     let func = dev.get_or_load_func("mxfp4_unpack", &candle_kernels::QUANTIZED)?;
     let block = 64u32;
     let grid = ((bytes.len() as u32 + block - 1) / block).max(1);
-    let cfg = cudarc::driver::LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let mut builder = func.builder();
     builder.arg(&d_in);
     builder.arg(&mut d_hi);
@@ -107,7 +116,7 @@ fn t_mxfp4_unpack_and_map() -> Result<()> {
     // Downstream mapping: fuse decode using CUDA dequant kernel and compare vs spec
     // Construct minimal MXFP4 tensors: rows=1, nblocks=1, cols=32
     let blocks = Tensor::from_vec(bytes.to_vec(), (1, 1, 16), &device)?; // U8 [1,1,16]
-    let scales = Tensor::from_vec(vec![127u8], (1, 1), &device)?;        // E8M0=127 => scale=1.0
+    let scales = Tensor::from_vec(vec![127u8], (1, 1), &device)?; // E8M0=127 => scale=1.0
     let out = candle_core::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [1, 32])?;
     let out_cpu = out.to_device(&Device::Cpu)?;
     let out_bf16: Vec<bf16> = out_cpu.to_vec2::<bf16>()?.into_iter().next().unwrap(); // [1,32] -> Vec<bf16>
@@ -128,7 +137,10 @@ fn t_mxfp4_unpack_and_map() -> Result<()> {
     println!("Exp first 8:   {:?}", &exp[..8]);
     println!("Act first 8:   {:?}", &act[..8]);
     let (l2, linf) = l2_linf(&exp, &act);
-    println!("Metrics: L2={:.6}, L∞={:.6} (bf16 rounding expected)", l2, linf);
+    println!(
+        "Metrics: L2={:.6}, L∞={:.6} (bf16 rounding expected)",
+        l2, linf
+    );
 
     // BF16 rounding may introduce <= ~0.0078125 (1 ulp) error around magnitude 1.
     let tol = 0.01f32;

@@ -11,7 +11,10 @@ const INDEX: &str = "model.safetensors.index.json";
 
 fn expand_tilde(p: &str) -> std::io::Result<std::path::PathBuf> {
     if let Some(rest) = p.strip_prefix("~/") {
-        Ok(std::env::var("HOME").map(std::path::PathBuf::from).unwrap().join(rest))
+        Ok(std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap()
+            .join(rest))
     } else {
         Ok(std::path::PathBuf::from(p))
     }
@@ -43,7 +46,11 @@ fn gpt_oss_yarn_place_cos() -> Result<()> {
     // Build prompt tokens using Harmony template+tokenizer from snapshot
     let user = Message::from_role_and_content(Role::User, "What is YaRN RoPE?".to_string());
     let tokens = render_then_encode(&snap, &[user], true).context("render+encode")?;
-    eprintln!("prompt_len={} last_id={}", tokens.len(), tokens.last().copied().unwrap_or(0));
+    eprintln!(
+        "prompt_len={} last_id={}",
+        tokens.len(),
+        tokens.last().copied().unwrap_or(0)
+    );
 
     // Compute logits for last prompt token (step-0)
     let context_index = 0usize; // full context on first pass
@@ -61,7 +68,9 @@ fn gpt_oss_yarn_place_cos() -> Result<()> {
     eprintln!("-- Mode=A (cos) top-10 next-token candidates --");
     for &i in &idx[..top] {
         let id = i as u32;
-        let s = tk.decode(&[id], /*skip_special_tokens=*/ false).unwrap_or_else(|_| "<dec-err>".to_string());
+        let s = tk
+            .decode(&[id], /*skip_special_tokens=*/ false)
+            .unwrap_or_else(|_| "<dec-err>".to_string());
         eprintln!("  id={:6} p={:.6} tok={}", id, v[i], s);
     }
     let channel_id = 200005usize; // <|channel|>
@@ -81,14 +90,27 @@ fn gpt_oss_yarn_place_cos() -> Result<()> {
     let sin = model.rope.sin_table().to_dtype(DType::F32)?;
     eprintln!("cos/sin mean|.| over first 8 positions (dim-avg):");
     for pos in 0..8usize {
-        let c = cos.narrow(0, pos, 1)?.flatten_all()?.abs()?.mean_all()?.to_scalar::<f32>()?;
-        let s = sin.narrow(0, pos, 1)?.flatten_all()?.abs()?.mean_all()?.to_scalar::<f32>()?;
+        let c = cos
+            .narrow(0, pos, 1)?
+            .flatten_all()?
+            .abs()?
+            .mean_all()?
+            .to_scalar::<f32>()?;
+        let s = sin
+            .narrow(0, pos, 1)?
+            .flatten_all()?
+            .abs()?
+            .mean_all()?
+            .to_scalar::<f32>()?;
         eprintln!("  pos={:<2} mean|cos|={:.6} mean|sin|={:.6}", pos, c, s);
     }
 
     // Assertions for Mode A: expect <|channel|> to be top-1.
     let argmax = idx[0];
-    assert_eq!(argmax, channel_id, "Mode A (cos) must have <|channel|> as top-1");
+    assert_eq!(
+        argmax, channel_id,
+        "Mode A (cos) must have <|channel|> as top-1"
+    );
 
     Ok(())
 }

@@ -1,5 +1,5 @@
-use candle_transformers::utils::repeat_kv;
 use candle::{Device, Result, Tensor, D};
+use candle_transformers::utils::repeat_kv;
 
 // Validate that repeat_kv repeats each KV head contiguously across the head axis,
 // i.e. with n_rep=3: [kv0,kv1] -> [kv0,kv0,kv0, kv1,kv1,kv1].

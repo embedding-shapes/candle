@@ -56,7 +56,11 @@ fn t_gqa_head_mapping_cuda_flashattn() -> Result<()> {
     let a = y_rep.to_dtype(DType::F32)?;
     let b_out = y_red.to_dtype(DType::F32)?;
     let max_diff = (a - &b_out)?.abs()?.max_all()?.to_scalar::<f32>()?;
-    assert!(max_diff < 1e-2, "flash-attn outputs mismatch (replicated vs reduced): max_diff={}", max_diff);
+    assert!(
+        max_diff < 1e-2,
+        "flash-attn outputs mismatch (replicated vs reduced): max_diff={}",
+        max_diff
+    );
 
     // Check grouping semantics on Path B directly: output head h must equal the KV head floor(h/n_rep).
     // With uniform attention over time and V constant per (kv head), the output per (b,t,h,*) should be that constant.
@@ -66,7 +70,11 @@ fn t_gqa_head_mapping_cuda_flashattn() -> Result<()> {
         .broadcast_as((b, tq, n_q, d))?
         .to_dtype(DType::F32)?;
     let max_diff2 = (b_out - expected)?.abs()?.max_all()?.to_scalar::<f32>()?;
-    assert!(max_diff2 < 1e-2, "group mapping wrong: max_diff={} (should be <1e-2)", max_diff2);
+    assert!(
+        max_diff2 < 1e-2,
+        "group mapping wrong: max_diff={} (should be <1e-2)",
+        max_diff2
+    );
 
     Ok(())
 }

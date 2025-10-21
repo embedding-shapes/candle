@@ -1,7 +1,8 @@
 use openai_harmony::{load_harmony_encoding, HarmonyEncodingName};
 
 #[test]
-fn sampling_stop_tokens_match_harmony_assistant_actions() -> Result<(), Box<dyn std::error::Error>> {
+fn sampling_stop_tokens_match_harmony_assistant_actions() -> Result<(), Box<dyn std::error::Error>>
+{
     let enc = load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)?;
     let tok = enc.tokenizer();
     let id = |s: &str| -> u32 {
@@ -14,9 +15,17 @@ fn sampling_stop_tokens_match_harmony_assistant_actions() -> Result<(), Box<dyn 
     let id_call = id("<|call|>");
 
     let stop_actions = enc.stop_tokens_for_assistant_actions()?;
-    assert!(stop_actions.contains(&id_return), "<|return|> must be a stop token");
-    assert!(stop_actions.contains(&id_call), "<|call|> must be a stop token");
-    assert!(!stop_actions.contains(&id_end), "<|end|> must not be a stop in sampling loop");
+    assert!(
+        stop_actions.contains(&id_return),
+        "<|return|> must be a stop token"
+    );
+    assert!(
+        stop_actions.contains(&id_call),
+        "<|call|> must be a stop token"
+    );
+    assert!(
+        !stop_actions.contains(&id_end),
+        "<|end|> must not be a stop in sampling loop"
+    );
     Ok(())
 }
-

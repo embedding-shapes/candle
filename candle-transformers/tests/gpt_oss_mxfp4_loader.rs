@@ -1,5 +1,6 @@
 use candle as candle_core;
 use candle::{DType, Device, Result, Tensor};
+use candle_nn::Module;
 use candle_transformers::models::gpt_oss::load_linear_maybe_mxfp4;
 use std::collections::HashMap;
 
@@ -21,6 +22,65 @@ fn make_blocks_scales(out_dim: usize, in_dim: usize) -> (Tensor, Tensor) {
     let blocks = Tensor::from_vec(blocks_data, (out_dim, nblocks, 16), &dev).unwrap();
     let scales = Tensor::from_vec(scales_data, (out_dim, nblocks), &dev).unwrap();
     (blocks, scales)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn t9_cuda_forward_matches_dense_matmul() -> Result<()> {
+    let dev = Device::new_cuda(0)?;
+    let (out_dim, in_dim) = (4, 64);
+    let (blocks_cpu, scales_cpu) = make_blocks_scales(out_dim, in_dim);
+    let blocks_gpu = blocks_cpu.clone().to_device(&dev)?;
+    let scales_gpu = scales_cpu.clone().to_device(&dev)?;
+
+    let mut tensors: HashMap<String, Tensor> = HashMap::new();
+    tensors.insert("down_proj_blocks".to_string(), blocks_gpu);
+    tensors.insert("down_proj_scales".to_string(), scales_gpu);
+
+    let vb = candle_nn::VarBuilder::from_tensors(tensors, DType::BF16, &dev);
+    let lin = load_linear_maybe_mxfp4(in_dim, out_dim, false, vb, "down_proj")?;
+
+    let weight = lin.weight();
+    println!(
+        "loaded weight: dtype={:?}, device={:?}, shape={:?}",
+        weight.dtype(),
+        weight.device(),
+        weight.dims()
+    );
+
+    let batch = 3;
+    let mut x_data = vec![0f32; batch * in_dim];
+    for (i, v) in x_data.iter_mut().enumerate() {
+        *v = ((i % 11) as f32 - 5.0) * 0.125;
+    }
+    let x_gpu = Tensor::from_vec(x_data.clone(), (batch, in_dim), &dev)?.to_dtype(DType::BF16)?;
+    let y_gpu = lin
+        .forward(&x_gpu)?
+        .to_dtype(DType::F32)?
+        .to_device(&Device::Cpu)?;
+
+    let w_cpu =
+        candle_core::mxfp4::dequant_mxfp4_to_bf16_cpu(&blocks_cpu, &scales_cpu, [out_dim, in_dim])?;
+    let w_cpu_f32 = w_cpu.to_dtype(DType::F32)?;
+    let x_cpu = Tensor::from_vec(x_data, (batch, in_dim), &Device::Cpu)?.to_dtype(DType::F32)?;
+    let y_ref = x_cpu.matmul(&w_cpu_f32.t()?)?;
+
+    let diff = (&y_gpu - &y_ref)?.abs()?;
+    let max_abs = diff.max_all()?.to_scalar::<f32>()?;
+    let l2 = diff.sqr()?.sum_all()?.to_scalar::<f32>()?;
+    let y_gpu_rows = y_gpu.to_vec2::<f32>()?;
+    let y_ref_rows = y_ref.to_vec2::<f32>()?;
+    println!(
+        "y_gpu first row [:8]: {:?}",
+        &y_gpu_rows[0][..8.min(y_gpu_rows[0].len())]
+    );
+    println!(
+        "y_ref first row [:8]: {:?}",
+        &y_ref_rows[0][..8.min(y_ref_rows[0].len())]
+    );
+    println!("max_abs_diff={max_abs}, l2_diff={l2}");
+    assert!(max_abs <= 5e-3, "GPU dense matmul mismatch: {max_abs}");
+    Ok(())
 }
 
 #[test]

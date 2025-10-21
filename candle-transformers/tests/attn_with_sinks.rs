@@ -4,9 +4,9 @@ use candle_transformers::models::gpt_oss::eager_attn_with_sinks;
 // Helper: compute baseline by explicitly concatenating a per-head sink logit,
 // softmax over [tokens + sink], drop sink column, then @V.
 fn baseline_with_sink(
-    q: &Tensor, // (b, q, h, d)
-    k: &Tensor, // (b, k, h, d)
-    v: &Tensor, // (b, k, h, d)
+    q: &Tensor,     // (b, q, h, d)
+    k: &Tensor,     // (b, k, h, d)
+    v: &Tensor,     // (b, k, h, d)
     sinks: &Tensor, // (h)
     softmax_scale: f32,
 ) -> Result<Tensor> {
@@ -20,9 +20,7 @@ fn baseline_with_sink(
     let q_bhqd = q.transpose(1, 2)?; // (b,h,q,d)
     let k_bhkd = k.transpose(1, 2)?; // (b,h,k,d)
     let v_bhkd = v.transpose(1, 2)?; // (b,h,k,d)
-    let logits = (
-        q_bhqd.contiguous()?.matmul(&k_bhkd.t()?.contiguous()?)? * softmax_scale as f64
-    )?; // (b,h,q,k)
+    let logits = (q_bhqd.contiguous()?.matmul(&k_bhkd.t()?.contiguous()?)? * softmax_scale as f64)?; // (b,h,q,k)
 
     // Append sink per head and query: broadcast (h) -> (b,h,q,1)
     let sinks = sinks.to_dtype(DType::F32)?;
@@ -67,7 +65,10 @@ fn attn_with_sinks_two_tokens() -> Result<()> {
     let ref_out = baseline_with_sink(&q, &k, &v, &sinks, scale)?;
     let rust_out = eager_attn_with_sinks(&q, &k, &v, scale, /*causal=*/ false, Some(&sinks))?;
 
-    let rel = rel_error(&ref_out.to_dtype(DType::F32)?, &rust_out.to_dtype(DType::F32)?)?;
+    let rel = rel_error(
+        &ref_out.to_dtype(DType::F32)?,
+        &rust_out.to_dtype(DType::F32)?,
+    )?;
     assert!(rel <= 1e-3, "relative error too large: {}", rel);
     Ok(())
 }
@@ -93,7 +94,10 @@ fn attn_with_sinks_three_tokens() -> Result<()> {
     let ref_out = baseline_with_sink(&q, &k, &v, &sinks, scale)?;
     let rust_out = eager_attn_with_sinks(&q, &k, &v, scale, /*causal=*/ false, Some(&sinks))?;
 
-    let rel = rel_error(&ref_out.to_dtype(DType::F32)?, &rust_out.to_dtype(DType::F32)?)?;
+    let rel = rel_error(
+        &ref_out.to_dtype(DType::F32)?,
+        &rust_out.to_dtype(DType::F32)?,
+    )?;
     assert!(rel <= 1e-3, "relative error too large: {}", rel);
     Ok(())
 }

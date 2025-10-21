@@ -8,7 +8,9 @@ use candle::{DType, Device, Result, Tensor};
 fn test_mxfp4_dequant_expert3_first_row() -> Result<()> {
     // Raw MXFP4 data from Python for Expert 3, out_dim=0, block=0
     // From /tmp/test_step1_python_weights.py output
-    let block_bytes: [u8; 16] = [66, 197, 60, 198, 140, 69, 17, 237, 137, 198, 9, 1, 149, 4, 176, 37];
+    let block_bytes: [u8; 16] = [
+        66, 197, 60, 198, 140, 69, 17, 237, 137, 198, 9, 1, 149, 4, 176, 37,
+    ];
     let scale_byte: u8 = 121;
 
     // Expected dequantized values from Python (first 32 values = first row, first block)
@@ -46,8 +48,10 @@ fn test_mxfp4_dequant_expert3_first_row() -> Result<()> {
     for i in 0..32 {
         let diff = (result_row[i] - expected[i]).abs();
         if diff > epsilon {
-            panic!("Mismatch at index {}: expected {}, got {}, diff={}",
-                   i, expected[i], result_row[i], diff);
+            panic!(
+                "Mismatch at index {}: expected {}, got {}, diff={}",
+                i, expected[i], result_row[i], diff
+            );
         }
     }
 

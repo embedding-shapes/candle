@@ -1,7 +1,7 @@
 use candle::{DType, Device, Module, Result, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use candle_transformers::models::llama::{Cache, Config as LlamaCfg, Llama};
-use candle_transformers::models::mistral as mistral;
+use candle_transformers::models::mistral;
 
 // Constants live at the top per AGENTS.md
 const HIDDEN: usize = 64;
@@ -117,7 +117,10 @@ fn bf16_long_prefill_weight_stability_embed_first() -> Result<()> {
     // Check embedding outputs did not change.
     let emb_after = model.embed(&probe)?.to_dtype(DType::F32)?;
     let emb_after_v = emb_after.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(emb_before_v, emb_after_v, "embedding outputs changed after prefill; weights likely mutated");
+    assert_eq!(
+        emb_before_v, emb_after_v,
+        "embedding outputs changed after prefill; weights likely mutated"
+    );
 
     // Check model-wide checksum did not change.
     let (m_sum_after, m_sumsq_after) = model_checksum(&varmap)?;
@@ -139,7 +142,8 @@ fn bf16_long_prefill_weight_stability_embed_first() -> Result<()> {
         drop(guard2);
         let (w_sum_after, w_sumsq_after) = tensor_checksum(&w2)?;
         assert!(
-            (w_sum_before - w_sum_after).abs() == 0.0 && (w_sumsq_before - w_sumsq_after).abs() == 0.0,
+            (w_sum_before - w_sum_after).abs() == 0.0
+                && (w_sumsq_before - w_sumsq_after).abs() == 0.0,
             "layer 35 q_proj weight checksum changed"
         );
     }
@@ -149,8 +153,14 @@ fn bf16_long_prefill_weight_stability_embed_first() -> Result<()> {
     let mut cache2 = Cache::new(true, dtype, &cfg, &device)?;
     let logits1 = model.forward(&prefill, 0, &mut cache)?;
     let logits2 = model.forward(&prefill2, 0, &mut cache2)?;
-    let l1 = logits1.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let l2 = logits2.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let l1 = logits1
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let l2 = logits2
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     assert_eq!(l1.len(), l2.len());
     let mut max_abs = 0f32;
     for i in 0..l1.len() {
@@ -159,7 +169,10 @@ fn bf16_long_prefill_weight_stability_embed_first() -> Result<()> {
             max_abs = d;
         }
     }
-    assert!(max_abs < 1e-3, "logits mismatch after repeated prefill: max_abs_diff={max_abs}");
+    assert!(
+        max_abs < 1e-3,
+        "logits mismatch after repeated prefill: max_abs_diff={max_abs}"
+    );
 
     Ok(())
 }
@@ -247,8 +260,14 @@ fn bf16_mistral_embed_first_weight_stability() -> Result<()> {
     );
 
     // Reproducibility: logits should match across fresh models given same inputs.
-    let l1 = logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let l2 = logits2.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let l1 = logits
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let l2 = logits2
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     assert_eq!(l1.len(), l2.len());
     let mut max_abs = 0f32;
     for i in 0..l1.len() {
@@ -257,7 +276,10 @@ fn bf16_mistral_embed_first_weight_stability() -> Result<()> {
             max_abs = d;
         }
     }
-    assert!(max_abs < 1e-3, "mistral logits mismatch after repeated embed-first prefill: max_abs_diff={max_abs}");
+    assert!(
+        max_abs < 1e-3,
+        "mistral logits mismatch after repeated embed-first prefill: max_abs_diff={max_abs}"
+    );
 
     Ok(())
 }

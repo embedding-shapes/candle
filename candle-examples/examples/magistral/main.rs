@@ -13,17 +13,17 @@ use clap::Parser;
 
 use candle::{DType, IndexOp, Tensor};
 mod preproc;
-use preproc::{compute_pixtral_resize_dims, load_image_pixtral};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::mistral3::{
     config::Mistral3Config,
-    model::{Model as Mistral3, Mistral3Cache},
+    model::{Mistral3Cache, Model as Mistral3},
 };
-use serde_json::json;
 use hf_hub::{api::sync::Api, Repo, RepoType};
-use tekken::Tekkenizer;
+use preproc::{compute_pixtral_resize_dims, load_image_pixtral};
+use serde_json::json;
 use std::time::Instant;
+use tekken::Tekkenizer;
 
 // Constants/configurable values placed below imports
 const DEFAULT_MODEL_ID: &str = "mistralai/magistral-small-2509";
@@ -214,7 +214,8 @@ fn main() -> Result<()> {
     let config_file = repo.get("config.json")?;
     let system_prompt_file = repo.get("SYSTEM_PROMPT.txt")?;
     let tekken_file = repo.get("tekken.json")?;
-    let weight_files = candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?;
+    let weight_files =
+        candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?;
     println!("retrieved metadata and shards in {:?}", start.elapsed());
 
     // Load tokenizer and special ids
@@ -225,12 +226,17 @@ fn main() -> Result<()> {
 
     // Load system prompt
     let t_sys = Instant::now();
-    let system_prompt = fs::read_to_string(&system_prompt_file).context("read SYSTEM_PROMPT.txt")?;
+    let system_prompt =
+        fs::read_to_string(&system_prompt_file).context("read SYSTEM_PROMPT.txt")?;
     println!("timing: read SYSTEM_PROMPT.txt: {:?}", t_sys.elapsed());
 
     // Device and dtype
     let device = candle_examples::device(args.cpu)?;
-    let dtype = if device.supports_bf16() { DType::BF16 } else { DType::F32 };
+    let dtype = if device.supports_bf16() {
+        DType::BF16
+    } else {
+        DType::F32
+    };
     // Prefer BF16 reduced-precision GEMM on CUDA for faster matmuls.
     #[cfg(feature = "cuda")]
     {
@@ -269,7 +275,11 @@ fn main() -> Result<()> {
     let patch = {
         // Prefer reading from config to avoid drift
         let p = config.vision_config.inner.patch_size as usize;
-        if p == 0 { 14 } else { p }
+        if p == 0 {
+            14
+        } else {
+            p
+        }
     };
     let s = config.spatial_merge_size.max(1);
     // Resize rounding to multiples of the downsample ratio (patch * s),
@@ -279,14 +289,15 @@ fn main() -> Result<()> {
     println!("timing: compute_resize_dims: {:?}", t_resize.elapsed());
     let t_img = Instant::now();
     let img_loaded = load_image_pixtral(&args.image, new_h, new_w, &PIXTRAL_MEAN, &PIXTRAL_STD)?;
-    println!("timing: load_image+bicubic+normalize (cpu f32): {:?}", t_img.elapsed());
+    println!(
+        "timing: load_image+bicubic+normalize (cpu f32): {:?}",
+        t_img.elapsed()
+    );
     let t_cast = Instant::now();
     let img_cast = img_loaded.to_dtype(dtype)?;
     println!("timing: cast_to_model_dtype: {:?}", t_cast.elapsed());
     let t_h2d = Instant::now();
-    let image = img_cast
-        .to_device(&device)?
-        .unsqueeze(0)?; // (1, C, H, W)
+    let image = img_cast.to_device(&device)?.unsqueeze(0)?; // (1, C, H, W)
     println!("timing: host_to_device+unsqueeze: {:?}", t_h2d.elapsed());
     let (_b, _c, h, w) = image.dims4()?;
     let image_sizes: Vec<(u32, u32)> = vec![(h as u32, w as u32)];
@@ -294,7 +305,11 @@ fn main() -> Result<()> {
     let grid_w = w / patch;
     println!(
         "loaded image with shape {:?}, sizes {:?} (patch={} grid={}x{})",
-        image.dims(), image_sizes, patch, grid_h, grid_w
+        image.dims(),
+        image_sizes,
+        patch,
+        grid_h,
+        grid_w
     );
 
     // Compute the number of image placeholders needed after patch merging
@@ -309,7 +324,11 @@ fn main() -> Result<()> {
         num_image_tokens,
     )?;
     if args.print_token_ids {
-        println!("input token ids ({}): {:?}", input_ids_vec.len(), input_ids_vec);
+        println!(
+            "input token ids ({}): {:?}",
+            input_ids_vec.len(),
+            input_ids_vec
+        );
     }
     let input_ids = Tensor::new(input_ids_vec.as_slice(), &device)?.unsqueeze(0)?; // (1, S)
 
@@ -321,7 +340,9 @@ fn main() -> Result<()> {
     let eff_grid_w = grid_w / s_u;
 
     // Pixel stats on normalized image (float32 copy for stats)
-    let img_cpu = image.to_dtype(DType::F32)?.to_device(&candle::Device::Cpu)?; // (1,3,H,W)
+    let img_cpu = image
+        .to_dtype(DType::F32)?
+        .to_device(&candle::Device::Cpu)?; // (1,3,H,W)
     let (_b1, _c1, hh, ww) = img_cpu.dims4()?;
     let mut per_channel = Vec::new();
     for cix in 0..3usize {
@@ -332,15 +353,23 @@ fn main() -> Result<()> {
         let mut sum = 0f64;
         let mut sumsq = 0f64;
         for &x in &v {
-            if x < min_v { min_v = x; }
-            if x > max_v { max_v = x; }
+            if x < min_v {
+                min_v = x;
+            }
+            if x > max_v {
+                max_v = x;
+            }
             let xd = x as f64;
             sum += xd;
             sumsq += xd * xd;
         }
         let n = v.len() as f64;
         let mean = if n > 0.0 { sum / n } else { 0.0 };
-        let var = if n > 0.0 { (sumsq / n) - (mean * mean) } else { 0.0 };
+        let var = if n > 0.0 {
+            (sumsq / n) - (mean * mean)
+        } else {
+            0.0
+        };
         let std = if var > 0.0 { var.sqrt() } else { 0.0 };
         per_channel.push(json!({
             "min": min_v,
@@ -359,15 +388,23 @@ fn main() -> Result<()> {
     let mut gsum = 0f64;
     let mut gsum2 = 0f64;
     for &x in &g {
-        if x < gmin { gmin = x; }
-        if x > gmax { gmax = x; }
+        if x < gmin {
+            gmin = x;
+        }
+        if x > gmax {
+            gmax = x;
+        }
         let xd = x as f64;
         gsum += xd;
         gsum2 += xd * xd;
     }
     let gn = g.len() as f64;
     let gmean = if gn > 0.0 { gsum / gn } else { 0.0 };
-    let gvar = if gn > 0.0 { (gsum2 / gn) - (gmean * gmean) } else { 0.0 };
+    let gvar = if gn > 0.0 {
+        (gsum2 / gn) - (gmean * gmean)
+    } else {
+        0.0
+    };
     let gstd = if gvar > 0.0 { gvar.sqrt() } else { 0.0 };
     let first_vals_ch0_row0: Vec<f32> = img_cpu
         .i((0, 0, 0, 0..8))?
@@ -427,7 +464,10 @@ fn main() -> Result<()> {
             "text_dtype": text_dtype_str,
         }
     });
-    println!("=== magistral_debug ===\n{}", serde_json::to_string_pretty(&debug)?);
+    println!(
+        "=== magistral_debug ===\n{}",
+        serde_json::to_string_pretty(&debug)?
+    );
 
     // Generation setup
     let mut cache = Mistral3Cache::default();
@@ -438,7 +478,9 @@ fn main() -> Result<()> {
     let use_top_p = args.top_p.or(default_top_p);
     println!(
         "temp: {} top-p: {:?} seed: {}",
-        use_temp.map(|v| format!("{v:.2}")).unwrap_or_else(|| "None".to_string()),
+        use_temp
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "None".to_string()),
         use_top_p,
         args.seed
     );
@@ -447,13 +489,23 @@ fn main() -> Result<()> {
     let initial_len = tokens.len();
     let mut generated = 0usize;
     let start_gen = std::time::Instant::now();
-    println!("IMG placeholders: {} (merged grid {}x{})", num_image_tokens, grid_h / s, grid_w / s);
+    println!(
+        "IMG placeholders: {} (merged grid {}x{})",
+        num_image_tokens,
+        grid_h / s,
+        grid_w / s
+    );
 
     let mut t_decode_total = std::time::Duration::ZERO;
     let mut t_prefill = std::time::Duration::ZERO;
     for step in 0..args.sample_len {
         let (inp, index_pos, pixel_opt, sizes_opt) = if step == 0 {
-            (input_ids.clone(), 0usize, Some(&image), Some(image_sizes.as_slice()))
+            (
+                input_ids.clone(),
+                0usize,
+                Some(&image),
+                Some(image_sizes.as_slice()),
+            )
         } else {
             let last = *tokens.last().unwrap();
             let pos = initial_len + step - 1;
@@ -465,9 +517,20 @@ fn main() -> Result<()> {
             )
         };
         let t_fw = Instant::now();
-        let logits = model.forward(&inp, pixel_opt, sizes_opt, &mut cache, index_pos, &config.vision_feature_layer)?;
+        let logits = model.forward(
+            &inp,
+            pixel_opt,
+            sizes_opt,
+            &mut cache,
+            index_pos,
+            &config.vision_feature_layer,
+        )?;
         let dt_fw = t_fw.elapsed();
-        if step == 0 { t_prefill = dt_fw; } else { t_decode_total += dt_fw; }
+        if step == 0 {
+            t_prefill = dt_fw;
+        } else {
+            t_decode_total += dt_fw;
+        }
         // logits shape: [B, vocab] or [B, 1, vocab]
         let logits = if logits.dims().len() == 3 {
             logits.i((.., logits.dim(1)? - 1, ..))?
@@ -525,7 +588,10 @@ fn main() -> Result<()> {
             "gemm_bf16_fast": gemm_bf16_fast,
         }
     });
-    println!("=== magistral_timing ===\n{}", serde_json::to_string_pretty(&timing_json)?);
+    println!(
+        "=== magistral_timing ===\n{}",
+        serde_json::to_string_pretty(&timing_json)?
+    );
 
     Ok(())
 }

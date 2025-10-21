@@ -8,7 +8,9 @@ fn main() -> Result<()> {
     // Scale (E8M0): 121
     // Expected dequantized: [0.015625, 0.03125, 0.046875, -0.03125, -0.03125, 0.0234375, 0.0625, -0.03125, ...]
 
-    let block_bytes: Vec<u8> = vec![66, 197, 60, 198, 140, 69, 17, 237, 137, 198, 9, 1, 149, 4, 176, 37];
+    let block_bytes: Vec<u8> = vec![
+        66, 197, 60, 198, 140, 69, 17, 237, 137, 198, 9, 1, 149, 4, 176, 37,
+    ];
     let scale_byte: u8 = 121;
 
     println!("Testing on CUDA...");
@@ -22,13 +24,25 @@ fn main() -> Result<()> {
     let blocks = blocks_cpu.to_device(&cuda_device)?;
     let scales = scales_cpu.to_device(&cuda_device)?;
 
-    println!("  blocks device: {:?}, shape: {:?}", blocks.device(), blocks.dims());
-    println!("  scales device: {:?}, shape: {:?}", scales.device(), scales.dims());
+    println!(
+        "  blocks device: {:?}, shape: {:?}",
+        blocks.device(),
+        blocks.dims()
+    );
+    println!(
+        "  scales device: {:?}, shape: {:?}",
+        scales.device(),
+        scales.dims()
+    );
 
     // Dequantize to shape [1, 32]
     let dequant = candle_core::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [1, 32])?;
 
-    println!("  dequant device: {:?}, shape: {:?}", dequant.device(), dequant.dims());
+    println!(
+        "  dequant device: {:?}, shape: {:?}",
+        dequant.device(),
+        dequant.dims()
+    );
 
     // Get the values
     let values = dequant.to_vec2::<half::bf16>()?;
@@ -36,10 +50,10 @@ fn main() -> Result<()> {
 
     // Expected from Python
     let expected: Vec<f32> = vec![
-        0.015625, 0.03125, 0.046875, -0.03125, -0.03125, 0.0234375, 0.0625, -0.03125,
-        -0.03125, -0.0, 0.046875, 0.03125, 0.0078125, 0.0078125, -0.046875, -0.0625,
-        -0.0078125, -0.0, 0.0625, -0.03125, -0.0078125, 0.0, 0.0078125, 0.0,
-        0.046875, -0.0078125, 0.03125, 0.0, 0.0, -0.0234375, 0.046875, 0.015625
+        0.015625, 0.03125, 0.046875, -0.03125, -0.03125, 0.0234375, 0.0625, -0.03125, -0.03125,
+        -0.0, 0.046875, 0.03125, 0.0078125, 0.0078125, -0.046875, -0.0625, -0.0078125, -0.0,
+        0.0625, -0.03125, -0.0078125, 0.0, 0.0078125, 0.0, 0.046875, -0.0078125, 0.03125, 0.0, 0.0,
+        -0.0234375, 0.046875, 0.015625,
     ];
 
     println!("\nCUDA dequantized values:");
@@ -51,8 +65,10 @@ fn main() -> Result<()> {
     for i in 0..8 {
         let diff = (row0[i] - expected[i]).abs();
         let status = if diff < 0.0001 { "✓" } else { "✗" };
-        println!("[{}] CUDA: {:.8}, Python: {:.8}, diff: {:.8} {}",
-                 i, row0[i], expected[i], diff, status);
+        println!(
+            "[{}] CUDA: {:.8}, Python: {:.8}, diff: {:.8} {}",
+            i, row0[i], expected[i], diff, status
+        );
     }
 
     // Check all values
@@ -65,8 +81,10 @@ fn main() -> Result<()> {
         }
         if diff > 0.0001 {
             mismatches += 1;
-            println!("MISMATCH [{}]: CUDA={:.8}, Python={:.8}, diff={:.8}",
-                     i, row0[i], expected[i], diff);
+            println!(
+                "MISMATCH [{}]: CUDA={:.8}, Python={:.8}, diff={:.8}",
+                i, row0[i], expected[i], diff
+            );
         }
     }
 

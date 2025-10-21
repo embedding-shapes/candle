@@ -1,18 +1,12 @@
-use candle::{DType, Device, Result, Tensor, D, IndexOp};
+use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_transformers::models::gpt_oss::rotary::{GptOssRopeConfig, GptOssRotaryEmbedding};
 
 fn apply_rotary_reference(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     // x: (b, h, q, d), cos/sin: (q, d/2)
     let (_b, _h, q, d) = x.dims4()?;
     let d2 = d / 2;
-    let cos = cos
-        .narrow(0, 0, q)?
-        .unsqueeze(0)?
-        .unsqueeze(1)?; // (1,1,q,d/2)
-    let sin = sin
-        .narrow(0, 0, q)?
-        .unsqueeze(0)?
-        .unsqueeze(1)?; // (1,1,q,d/2)
+    let cos = cos.narrow(0, 0, q)?.unsqueeze(0)?.unsqueeze(1)?; // (1,1,q,d/2)
+    let sin = sin.narrow(0, 0, q)?.unsqueeze(0)?.unsqueeze(1)?; // (1,1,q,d/2)
     let x1 = x.narrow(D::Minus1, 0, d2)?;
     let x2 = x.narrow(D::Minus1, d2, d2)?;
     let first = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
@@ -38,14 +32,22 @@ fn make_reference_cos_sin(
         .map(|i| rope_theta.powf(i as f32 / dim as f32))
         .collect();
     let inv_freq_extrapolation: Vec<f32> = pos_freqs.iter().map(|&v| 1.0 / v).collect();
-    let inv_freq_interpolation: Vec<f32> = inv_freq_extrapolation.iter().map(|&v| v / factor).collect();
+    let inv_freq_interpolation: Vec<f32> =
+        inv_freq_extrapolation.iter().map(|&v| v / factor).collect();
 
-    fn find_correction_dim(num_rot: f32, dim: usize, base: f32, max_position_embeddings: usize) -> f32 {
-        (dim as f32 * (max_position_embeddings as f32 / (num_rot * 2.0 * std::f32::consts::PI)).ln())
+    fn find_correction_dim(
+        num_rot: f32,
+        dim: usize,
+        base: f32,
+        max_position_embeddings: usize,
+    ) -> f32 {
+        (dim as f32
+            * (max_position_embeddings as f32 / (num_rot * 2.0 * std::f32::consts::PI)).ln())
             / (2.0 * base.ln())
     }
     let mut low = find_correction_dim(beta_fast, dim, rope_theta, original_max_position_embeddings);
-    let mut high = find_correction_dim(beta_slow, dim, rope_theta, original_max_position_embeddings);
+    let mut high =
+        find_correction_dim(beta_slow, dim, rope_theta, original_max_position_embeddings);
     if truncate {
         low = low.floor();
         high = high.ceil();
@@ -76,7 +78,11 @@ fn make_reference_cos_sin(
 
     // Apply HF-style YARN attention scaling directly to tables.
     // Default mscale (no mscale/mscale_all_dim fields): 1 if factor<=1 else 0.1*ln(factor)+1
-    let mscale = if factor <= 1.0 { 1.0 } else { 0.1 * factor.ln() + 1.0 };
+    let mscale = if factor <= 1.0 {
+        1.0
+    } else {
+        0.1 * factor.ln() + 1.0
+    };
     let sin = (freqs.sin()? * mscale as f64)?.to_dtype(DType::F32)?;
     let cos = (freqs.cos()? * mscale as f64)?.to_dtype(DType::F32)?;
     Ok((cos, sin))
@@ -99,19 +105,12 @@ fn gpt_oss_yarn_correctness_small() -> Result<()> {
     let q = 4;
     let d = head_dim;
     let q_in = Tensor::arange(0f32, (b * q * h * d) as f32, &dev)?.reshape((b, h, q, d))?;
-    let k_in = (Tensor::arange(0f32, (b * q * h * d) as f32, &dev)?.reshape((b, h, q, d))? * 0.5f64)?;
+    let k_in =
+        (Tensor::arange(0f32, (b * q * h * d) as f32, &dev)?.reshape((b, h, q, d))? * 0.5f64)?;
 
     // Reference cos/sin
     let (cos_ref, sin_ref) = make_reference_cos_sin(
-        head_dim,
-        max_t,
-        rope_theta,
-        factor,
-        beta_fast,
-        beta_slow,
-        orig,
-        false,
-        &dev,
+        head_dim, max_t, rope_theta, factor, beta_fast, beta_slow, orig, false, &dev,
     )?;
 
     // Apply reference
@@ -119,7 +118,9 @@ fn gpt_oss_yarn_correctness_small() -> Result<()> {
     let k_ref = apply_rotary_reference(&k_in, &cos_ref, &sin_ref)?;
 
     // Our implementation
-    let cfg = GptOssRopeConfig::new(head_dim, max_t, rope_theta, factor, beta_fast, beta_slow, orig);
+    let cfg = GptOssRopeConfig::new(
+        head_dim, max_t, rope_theta, factor, beta_fast, beta_slow, orig,
+    );
     let rope = GptOssRotaryEmbedding::new_yarn(DType::F32, &dev, &cfg)?;
     let (q_out, k_out) = rope.apply_rotary_emb_qk(&q_in, &k_in, 0)?;
 
@@ -128,8 +129,14 @@ fn gpt_oss_yarn_correctness_small() -> Result<()> {
     let sin_e = rope.sin_table().narrow(0, 0, q)?;
     let cos_r = cos_ref.narrow(0, 0, q)?;
     let sin_r = sin_ref.narrow(0, 0, q)?;
-    let cos_diff = (cos_e.clone() - &cos_r)?.abs()?.max_all()?.to_scalar::<f32>()?;
-    let sin_diff = (sin_e.clone() - &sin_r)?.abs()?.max_all()?.to_scalar::<f32>()?;
+    let cos_diff = (cos_e.clone() - &cos_r)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    let sin_diff = (sin_e.clone() - &sin_r)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
     // Compare
     let diff_q = (q_ref - &q_out)?.abs()?.max_all()?.to_scalar::<f32>()?;
     let diff_k = (k_ref - &k_out)?.abs()?.max_all()?.to_scalar::<f32>()?;
@@ -176,27 +183,51 @@ fn gpt_oss_yarn_correctness_small() -> Result<()> {
         let s_r0 = sin_r.i((0, ..1))?.flatten_all()?;
         println!(
             "cos_e[0][:8]={:?}",
-            c_e0.to_vec1::<f32>()?.into_iter().take(8).collect::<Vec<_>>()
+            c_e0.to_vec1::<f32>()?
+                .into_iter()
+                .take(8)
+                .collect::<Vec<_>>()
         );
         println!(
             "cos_r[0][:8]={:?}",
-            c_r0.to_vec1::<f32>()?.into_iter().take(8).collect::<Vec<_>>()
+            c_r0.to_vec1::<f32>()?
+                .into_iter()
+                .take(8)
+                .collect::<Vec<_>>()
         );
         println!(
             "sin_e[0][:8]={:?}",
-            s_e0.to_vec1::<f32>()?.into_iter().take(8).collect::<Vec<_>>()
+            s_e0.to_vec1::<f32>()?
+                .into_iter()
+                .take(8)
+                .collect::<Vec<_>>()
         );
         println!(
             "sin_r[0][:8]={:?}",
-            s_r0.to_vec1::<f32>()?.into_iter().take(8).collect::<Vec<_>>()
+            s_r0.to_vec1::<f32>()?
+                .into_iter()
+                .take(8)
+                .collect::<Vec<_>>()
         );
         println!("cos_e (q x d2) = {:?}", cos_e.to_vec2::<f32>()?);
         println!("cos_r (q x d2) = {:?}", cos_r.to_vec2::<f32>()?);
         println!("sin_e (q x d2) = {:?}", sin_e.to_vec2::<f32>()?);
         println!("sin_r (q x d2) = {:?}", sin_r.to_vec2::<f32>()?);
     }
-    assert!(diff_q < 1e-4, "max abs diff q = {} (cos max diff {}, sin max diff {})", diff_q, cos_diff, sin_diff);
-    assert!(diff_k < 1e-4, "max abs diff k = {} (cos max diff {}, sin max diff {})", diff_k, cos_diff, sin_diff);
+    assert!(
+        diff_q < 1e-4,
+        "max abs diff q = {} (cos max diff {}, sin max diff {})",
+        diff_q,
+        cos_diff,
+        sin_diff
+    );
+    assert!(
+        diff_k < 1e-4,
+        "max abs diff k = {} (cos max diff {}, sin max diff {})",
+        diff_k,
+        cos_diff,
+        sin_diff
+    );
     Ok(())
 }
 
@@ -211,7 +242,9 @@ fn gpt_oss_yarn_long_positions_stability() -> Result<()> {
     let beta_slow = 1.0f32;
     let orig = 4096usize;
 
-    let cfg = GptOssRopeConfig::new(head_dim, max_t, rope_theta, factor, beta_fast, beta_slow, orig);
+    let cfg = GptOssRopeConfig::new(
+        head_dim, max_t, rope_theta, factor, beta_fast, beta_slow, orig,
+    );
     let rope = GptOssRotaryEmbedding::new_yarn(DType::F32, &dev, &cfg)?;
     let cos = rope.cos_table().clone();
     let sin = rope.sin_table().clone();

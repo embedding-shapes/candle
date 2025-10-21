@@ -20,21 +20,39 @@ fn t24_hf_tokenizer_special_tokens_roundtrip() -> Result<()> {
     let tok_path = snap.join("tokenizer.json");
     if !tok_path.exists() {
         // Optional skip if snapshot not present.
-        eprintln!("tokenizer.json not found at {} — skipping", tok_path.display());
+        eprintln!(
+            "tokenizer.json not found at {} — skipping",
+            tok_path.display()
+        );
         return Ok(());
     }
     let tokenizer = Tokenizer::from_file(&tok_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
 
-    for s in ["<|start|>", "<|message|>", "<|end|>", "<|return|>", "<|call|>", "<|channel|>"] {
+    for s in [
+        "<|start|>",
+        "<|message|>",
+        "<|end|>",
+        "<|return|>",
+        "<|call|>",
+        "<|channel|>",
+    ] {
         let enc = tokenizer
-            .encode(EncodeInput::Single(s.to_string().into()), /*add_special_tokens=*/false)
+            .encode(
+                EncodeInput::Single(s.to_string().into()),
+                /*add_special_tokens=*/ false,
+            )
             .map_err(|e| anyhow::anyhow!("encode failed for {s}: {e}"))?;
         let ids = enc.get_ids();
-        assert_eq!(ids.len(), 1, "special {s} should encode to exactly 1 id, got {:?}", ids);
+        assert_eq!(
+            ids.len(),
+            1,
+            "special {s} should encode to exactly 1 id, got {:?}",
+            ids
+        );
         let ids_u32 = [ids[0]];
         let dec = tokenizer
-            .decode(&ids_u32, /*skip_special_tokens=*/false)
+            .decode(&ids_u32, /*skip_special_tokens=*/ false)
             .map_err(|e| anyhow::anyhow!("decode failed for {s}: {e}"))?;
         assert_eq!(dec, s, "round-trip mismatch for {s}");
     }

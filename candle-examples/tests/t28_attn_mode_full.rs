@@ -16,10 +16,9 @@ fn t28_attn_mode_full_always() -> Result<()> {
         max_position_embeddings: 1024,
         sliding_window: Some(128),
     };
-    for i in 0..cfg.num_hidden_layers { 
+    for i in 0..cfg.num_hidden_layers {
         let mode = select_attn_mode_for_layer(&cfg, i);
         assert!(matches!(mode, AttnMode::Full));
     }
     Ok(())
 }
-

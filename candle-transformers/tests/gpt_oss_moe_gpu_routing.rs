@@ -56,7 +56,8 @@ fn t60_moe_routing_gpu_matches_reference() -> Result<()> {
     let top_k = 2usize;
 
     // Helper to generate deterministic values.
-    let gen_val = |idx: usize| -> f32 { ((idx as u64 * 1664525 + seed) % 9973) as f32 * 1e-3 - 4.0 };
+    let gen_val =
+        |idx: usize| -> f32 { ((idx as u64 * 1664525 + seed) % 9973) as f32 * 1e-3 - 4.0 };
 
     // Router weights/bias.
     let mut router_w = Vec::with_capacity(n_experts * hidden);
@@ -91,10 +92,7 @@ fn t60_moe_routing_gpu_matches_reference() -> Result<()> {
             Tensor::from_vec(gate_w, (2 * inter, hidden), &dev)?,
             Some(Tensor::from_vec(gate_b, (2 * inter,), &dev)?),
         );
-        let down = Linear::new(
-            Tensor::from_vec(down_w, (hidden, inter), &dev)?,
-            None,
-        );
+        let down = Linear::new(Tensor::from_vec(down_w, (hidden, inter), &dev)?, None);
         let limit = 7.0f32;
         let alpha = 1.702f32;
         experts.push(ExpertMlp::new(gate_up, down, limit, alpha));

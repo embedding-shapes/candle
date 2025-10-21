@@ -10,7 +10,8 @@ const INDEX_FILE: &str = "model.safetensors.index.json";
 fn expand_tilde(p: &str) -> std::io::Result<std::path::PathBuf> {
     use std::path::{Path, PathBuf};
     if let Some(rest) = p.strip_prefix("~/") {
-        let home = std::env::var("HOME").map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let home =
+            std::env::var("HOME").map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         Ok(Path::new(&home).join(rest))
     } else {
         Ok(PathBuf::from(p))
@@ -32,8 +33,15 @@ fn gpt_oss_qkv_projection_orientation_layer0_cuda() -> Result<()> {
     }
 
     // Load config for expected dims and heads.
-    let cfg: GptOssConfig = serde_json::from_slice(&std::fs::read(snap.join("config.json"))?).unwrap();
-    eprintln!("config: hidden={} n_q={} n_kv={} head_dim={}", cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim());
+    let cfg: GptOssConfig =
+        serde_json::from_slice(&std::fs::read(snap.join("config.json"))?).unwrap();
+    eprintln!(
+        "config: hidden={} n_q={} n_kv={} head_dim={}",
+        cfg.hidden_size,
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.head_dim()
+    );
     let hidden = cfg.hidden_size;
     let head_dim = cfg.head_dim();
     let q_out = cfg.num_attention_heads * head_dim;
@@ -41,13 +49,19 @@ fn gpt_oss_qkv_projection_orientation_layer0_cuda() -> Result<()> {
 
     // Build VarBuilder over local shards in BF16 on CPU (mmap), move tensors as needed.
     #[derive(serde::Deserialize)]
-    struct Idx { weight_map: BTreeMap<String, String> }
+    struct Idx {
+        weight_map: BTreeMap<String, String>,
+    }
     let idx_parsed: Idx = serde_json::from_slice(&std::fs::read(&idx).unwrap()).unwrap();
     let mut files_set = std::collections::BTreeSet::new();
-    for f in idx_parsed.weight_map.values() { files_set.insert(f.clone()); }
-    let mut model_files: Vec<std::path::PathBuf> = files_set.into_iter().map(|f| snap.join(f)).collect();
+    for f in idx_parsed.weight_map.values() {
+        files_set.insert(f.clone());
+    }
+    let mut model_files: Vec<std::path::PathBuf> =
+        files_set.into_iter().map(|f| snap.join(f)).collect();
     model_files.sort();
-    let vb_cpu = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, DType::BF16, &Device::Cpu)? };
+    let vb_cpu =
+        unsafe { VarBuilder::from_mmaped_safetensors(&model_files, DType::BF16, &Device::Cpu)? };
 
     // Load layer 0 q/k/v projection weights
     let l0 = 0usize;
@@ -55,9 +69,27 @@ fn gpt_oss_qkv_projection_orientation_layer0_cuda() -> Result<()> {
     let wq_cpu = pp("q_proj").get((q_out, hidden), "weight")?;
     let wk_cpu = pp("k_proj").get((kv_out, hidden), "weight")?;
     let wv_cpu = pp("v_proj").get((kv_out, hidden), "weight")?;
-    eprintln!("wq: dtype={:?} dev={:?} shape={:?} stride={:?}", wq_cpu.dtype(), wq_cpu.device(), wq_cpu.dims(), wq_cpu.stride());
-    eprintln!("wk: dtype={:?} dev={:?} shape={:?} stride={:?}", wk_cpu.dtype(), wk_cpu.device(), wk_cpu.dims(), wk_cpu.stride());
-    eprintln!("wv: dtype={:?} dev={:?} shape={:?} stride={:?}", wv_cpu.dtype(), wv_cpu.device(), wv_cpu.dims(), wv_cpu.stride());
+    eprintln!(
+        "wq: dtype={:?} dev={:?} shape={:?} stride={:?}",
+        wq_cpu.dtype(),
+        wq_cpu.device(),
+        wq_cpu.dims(),
+        wq_cpu.stride()
+    );
+    eprintln!(
+        "wk: dtype={:?} dev={:?} shape={:?} stride={:?}",
+        wk_cpu.dtype(),
+        wk_cpu.device(),
+        wk_cpu.dims(),
+        wk_cpu.stride()
+    );
+    eprintln!(
+        "wv: dtype={:?} dev={:?} shape={:?} stride={:?}",
+        wv_cpu.dtype(),
+        wv_cpu.device(),
+        wv_cpu.dims(),
+        wv_cpu.stride()
+    );
     assert_eq!(wq_cpu.dtype(), DType::BF16);
     assert_eq!(wk_cpu.dtype(), DType::BF16);
     assert_eq!(wv_cpu.dtype(), DType::BF16);
@@ -70,7 +102,10 @@ fn gpt_oss_qkv_projection_orientation_layer0_cuda() -> Result<()> {
     eprintln!("seed={}", seed);
     let mut idxs = Vec::with_capacity(8);
     let mut x = seed;
-    for _ in 0..8 { x = x.wrapping_mul(2862933555777941757).wrapping_add(3037000493); idxs.push((x as usize) % hidden); }
+    for _ in 0..8 {
+        x = x.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+        idxs.push((x as usize) % hidden);
+    }
     eprintln!("one_hot_indices={:?}", idxs);
 
     // Move weights to GPU in F32 for strict arithmetic equality on one-hot
@@ -80,9 +115,17 @@ fn gpt_oss_qkv_projection_orientation_layer0_cuda() -> Result<()> {
 
     for &i in &idxs {
         // x = one_hot(i) in R^{hidden}
-        let mut host = vec![0f32; hidden]; host[i] = 1.0;
+        let mut host = vec![0f32; hidden];
+        host[i] = 1.0;
         let x = Tensor::from_vec(host, (1, hidden), &dev)?;
-        eprintln!("x: dtype={:?} dev={:?} shape={:?} stride={:?} i={}", x.dtype(), x.device(), x.dims(), x.stride(), i);
+        eprintln!(
+            "x: dtype={:?} dev={:?} shape={:?} stride={:?} i={}",
+            x.dtype(),
+            x.device(),
+            x.dims(),
+            x.stride(),
+            i
+        );
 
         // q_candle = x @ Wq.T; expected = column_i(Wq)
         let q_candle = x.matmul(&wq.t()?)?; // (1, q_out)
@@ -94,8 +137,22 @@ fn gpt_oss_qkv_projection_orientation_layer0_cuda() -> Result<()> {
         let q_diff = (&q_c - &q_e)?.abs()?;
         let q_linf = q_diff.max_all()?.to_scalar::<f32>()?;
         let q_l2 = q_diff.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
-        eprintln!("Q: i={} L_inf={:.3e} L2={:.3e} dtype={:?}→{:?} dims_c={:?} dims_e={:?}", i, q_linf, q_l2, wq_cpu.dtype(), q_c_dtype, q_c_dims, q_e.dims());
-        assert!(q_linf <= 1e-6, "q orientation mismatch at i={}: L_inf={}", i, q_linf);
+        eprintln!(
+            "Q: i={} L_inf={:.3e} L2={:.3e} dtype={:?}→{:?} dims_c={:?} dims_e={:?}",
+            i,
+            q_linf,
+            q_l2,
+            wq_cpu.dtype(),
+            q_c_dtype,
+            q_c_dims,
+            q_e.dims()
+        );
+        assert!(
+            q_linf <= 1e-6,
+            "q orientation mismatch at i={}: L_inf={}",
+            i,
+            q_linf
+        );
 
         // k
         let k_candle = x.matmul(&wk.t()?)?; // (1, kv_out)
@@ -106,7 +163,12 @@ fn gpt_oss_qkv_projection_orientation_layer0_cuda() -> Result<()> {
         let k_linf = k_diff.max_all()?.to_scalar::<f32>()?;
         let k_l2 = k_diff.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
         eprintln!("K: i={} L_inf={:.3e} L2={:.3e}", i, k_linf, k_l2);
-        assert!(k_linf <= 1e-6, "k orientation mismatch at i={}: L_inf={}", i, k_linf);
+        assert!(
+            k_linf <= 1e-6,
+            "k orientation mismatch at i={}: L_inf={}",
+            i,
+            k_linf
+        );
 
         // v
         let v_candle = x.matmul(&wv.t()?)?; // (1, kv_out)
@@ -117,14 +179,21 @@ fn gpt_oss_qkv_projection_orientation_layer0_cuda() -> Result<()> {
         let v_linf = v_diff.max_all()?.to_scalar::<f32>()?;
         let v_l2 = v_diff.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
         eprintln!("V: i={} L_inf={:.3e} L2={:.3e}", i, v_linf, v_l2);
-        assert!(v_linf <= 1e-6, "v orientation mismatch at i={}: L_inf={}", i, v_linf);
+        assert!(
+            v_linf <= 1e-6,
+            "v orientation mismatch at i={}: L_inf={}",
+            i,
+            v_linf
+        );
     }
     Ok(())
 }
 
 #[cfg(not(feature = "cuda"))]
 #[test]
-fn gpt_oss_qkv_projection_orientation_layer0_cuda_skipped() { eprintln!("skipped: build without 'cuda' feature"); }
+fn gpt_oss_qkv_projection_orientation_layer0_cuda_skipped() {
+    eprintln!("skipped: build without 'cuda' feature");
+}
 
 #[cfg(feature = "cuda")]
 #[test]
@@ -155,8 +224,20 @@ fn gpt_oss_gqa_mapping_64_to_8_cuda() -> Result<()> {
     }
     let k_bhd = Tensor::from_vec(k_host, (b, n_kv, tk, d), &dev)?.to_dtype(DType::BF16)?;
     let v_bhd = Tensor::from_vec(v_host, (b, n_kv, tk, d), &dev)?.to_dtype(DType::BF16)?;
-    eprintln!("k_bhd: dtype={:?} dev={:?} shape={:?} stride={:?}", k_bhd.dtype(), k_bhd.device(), k_bhd.dims(), k_bhd.stride());
-    eprintln!("v_bhd: dtype={:?} dev={:?} shape={:?} stride={:?}", v_bhd.dtype(), v_bhd.device(), v_bhd.dims(), v_bhd.stride());
+    eprintln!(
+        "k_bhd: dtype={:?} dev={:?} shape={:?} stride={:?}",
+        k_bhd.dtype(),
+        k_bhd.device(),
+        k_bhd.dims(),
+        k_bhd.stride()
+    );
+    eprintln!(
+        "v_bhd: dtype={:?} dev={:?} shape={:?} stride={:?}",
+        v_bhd.dtype(),
+        v_bhd.device(),
+        v_bhd.dims(),
+        v_bhd.stride()
+    );
 
     // Repeat to Q heads
     let k_rep = candle_transformers::utils::repeat_kv(k_bhd.clone(), n_rep)?; // (b, n_q, tk, d)
@@ -176,9 +257,26 @@ fn gpt_oss_gqa_mapping_64_to_8_cuda() -> Result<()> {
         let exp_v = v_bhd.i((0, kv_idx, .., ..))?.to_dtype(DType::F32)?;
         let dv = (got_v - &exp_v)?.abs()?;
         let dv_linf = dv.max_all()?.to_scalar::<f32>()?;
-        if h < 3 || h > n_q - 3 { eprintln!("h={} kv_idx={} dk_inf={:.3e} dv_inf={:.3e}", h, kv_idx, dk_linf, dv_linf); }
-        assert!(dk_linf <= 1e-6, "K mapping mismatch at head {} -> kv {}: L_inf={}", h, kv_idx, dk_linf);
-        assert!(dv_linf <= 1e-6, "V mapping mismatch at head {} -> kv {}: L_inf={}", h, kv_idx, dv_linf);
+        if h < 3 || h > n_q - 3 {
+            eprintln!(
+                "h={} kv_idx={} dk_inf={:.3e} dv_inf={:.3e}",
+                h, kv_idx, dk_linf, dv_linf
+            );
+        }
+        assert!(
+            dk_linf <= 1e-6,
+            "K mapping mismatch at head {} -> kv {}: L_inf={}",
+            h,
+            kv_idx,
+            dk_linf
+        );
+        assert!(
+            dv_linf <= 1e-6,
+            "V mapping mismatch at head {} -> kv {}: L_inf={}",
+            h,
+            kv_idx,
+            dv_linf
+        );
     }
 
     // Also validate reshape contracts: q.view(Hq,d), k.view(Hkv,d), v.view(Hkv,d) are consistent with the mapping
@@ -190,11 +288,16 @@ fn gpt_oss_gqa_mapping_64_to_8_cuda() -> Result<()> {
     let _q_view = q_flat.reshape((b, 1, n_q, hdim))?;
     let _k_view = k_flat.reshape((b, 1, n_kv, hdim))?;
     let _v_view = v_flat.reshape((b, 1, n_kv, hdim))?;
-    eprintln!("reshape contracts ok: q=({},{}), k=({},{}), v=({},{}), n_rep={}", n_q, hdim, n_kv, hdim, n_kv, hdim, n_rep);
+    eprintln!(
+        "reshape contracts ok: q=({},{}), k=({},{}), v=({},{}), n_rep={}",
+        n_q, hdim, n_kv, hdim, n_kv, hdim, n_rep
+    );
 
     Ok(())
 }
 
 #[cfg(not(feature = "cuda"))]
 #[test]
-fn gpt_oss_gqa_mapping_64_to_8_cuda_skipped() { eprintln!("skipped: build without 'cuda' feature"); }
+fn gpt_oss_gqa_mapping_64_to_8_cuda_skipped() {
+    eprintln!("skipped: build without 'cuda' feature");
+}

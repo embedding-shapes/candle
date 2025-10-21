@@ -32,7 +32,11 @@ fn t21_expert_mlp_interleaved_split() -> Result<()> {
 
     // Reference using interleaving: gate=[10,30,50], up=[20,40,60]
     let gate = [10.0f32.min(limit), 30.0f32.min(limit), 50.0f32.min(limit)];
-    let up = [20.0f32.clamp(-limit, limit), 40.0f32.clamp(-limit, limit), 60.0f32.clamp(-limit, limit)];
+    let up = [
+        20.0f32.clamp(-limit, limit),
+        40.0f32.clamp(-limit, limit),
+        60.0f32.clamp(-limit, limit),
+    ];
     let mut acc = 0.0f32;
     for i in 0..inter {
         let g = gate[i];
@@ -45,4 +49,3 @@ fn t21_expert_mlp_interleaved_split() -> Result<()> {
     assert!(diff < 1e-4, "expected {acc}, got {got}, diff {diff}");
     Ok(())
 }
-

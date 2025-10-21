@@ -20,7 +20,10 @@ const SNAPSHOT: &str = "~/.cache/huggingface/hub/models--openai--gpt-oss-20b/sna
 fn t04_tokenizer_parity_with_python() -> Result<()> {
     // Build the rendered prompt via Harmony + Jinja + tokenizer.json (Rust path)
     let snapshot = expand_tilde(SNAPSHOT);
-    let msg = Message::from_role_and_content(Role::User, "Explain what MXFP4 quantization is".to_string());
+    let msg = Message::from_role_and_content(
+        Role::User,
+        "Explain what MXFP4 quantization is".to_string(),
+    );
     let ids_rust = render_then_encode(&snapshot, &[msg], true /* add_generation_prompt */)
         .context("render_then_encode failed")?;
     assert!(!ids_rust.is_empty(), "prompt tokens should not be empty");
@@ -52,7 +55,8 @@ print(json.dumps(ids))
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("python failed: {}", stderr);
     }
-    let py_ids: Vec<u32> = serde_json::from_slice(&output.stdout).context("invalid python json output")?;
+    let py_ids: Vec<u32> =
+        serde_json::from_slice(&output.stdout).context("invalid python json output")?;
 
     assert_eq!(ids_rust, py_ids, "tokenizer parity mismatch with Python");
     Ok(())
@@ -61,7 +65,10 @@ print(json.dumps(ids))
 #[test]
 fn t05_prompt_tail_contains_assistant_only() -> Result<()> {
     let snapshot = expand_tilde(SNAPSHOT);
-    let msg = Message::from_role_and_content(Role::User, "Explain what MXFP4 quantization is".to_string());
+    let msg = Message::from_role_and_content(
+        Role::User,
+        "Explain what MXFP4 quantization is".to_string(),
+    );
     let ids = render_then_encode(&snapshot, &[msg], true)?;
 
     let tok_path = snapshot.join("tokenizer.json");
@@ -88,7 +95,9 @@ fn t06_stop_tokens_exact_set_and_no_end() -> Result<()> {
     let tok_path = snapshot.join("tokenizer.json");
     let tk = tokenizers::Tokenizer::from_file(&tok_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
-    let id_eot = tk.token_to_id("<|endoftext|>").context("missing <|endoftext|>")?;
+    let id_eot = tk
+        .token_to_id("<|endoftext|>")
+        .context("missing <|endoftext|>")?;
     let id_ret = tk.token_to_id("<|return|>").context("missing <|return|>")?;
     let id_call = tk.token_to_id("<|call|>").context("missing <|call|>")?;
     let id_end = tk.token_to_id("<|end|>").context("missing <|end|>")?;

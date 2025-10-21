@@ -40,4 +40,3 @@ fn extract_stops_before_control_tokens() {
     let got = extract_final_assistant_text_from_decoded(decoded).expect("must extract");
     assert_eq!(got, "Answer here.");
 }
-

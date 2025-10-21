@@ -1,5 +1,8 @@
 use anyhow::Result;
-use openai_harmony::{chat::{Message, Role}, load_harmony_encoding, HarmonyEncodingName};
+use openai_harmony::{
+    chat::{Message, Role},
+    load_harmony_encoding, HarmonyEncodingName,
+};
 
 // T21 Harmony encode/decode: round-trip for the example’s prompt format.
 // Validates that rendering the conversation (user prompt -> completion tokens)

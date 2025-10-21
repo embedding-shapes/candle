@@ -1,4 +1,4 @@
-use candle::{Device, DType, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 use candle_transformers::models::gpt_oss::eager_attn_with_sinks;
 
 // T19: Eager causal mask correctness (triangular)
@@ -49,7 +49,11 @@ fn gpt_oss_eager_causal_mask_triangular() -> Result<()> {
         for dd in 0..(h * d) {
             let got = out_host[0][i][dd];
             let diff = (got - expected[i]).abs();
-            assert!(diff < 1e-4, "i={i} d={dd}: got={got} expected={}", expected[i]);
+            assert!(
+                diff < 1e-4,
+                "i={i} d={dd}: got={got} expected={}",
+                expected[i]
+            );
         }
     }
 

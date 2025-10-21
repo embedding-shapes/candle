@@ -1874,6 +1874,15 @@ pub fn select_attn_mode_for_layer(cfg: &GptOssConfigMinimal, layer_idx: usize) -
 const MXFP4_BLOCK_ELEMS: usize = 32; // k=32 elements per block on the last dim.
 const MXFP4_BLOCK_BYTES: usize = 16; // packed two nibbles per byte.
 
+fn dequantize_mxfp4_linear(
+    blocks: &Tensor,
+    scales: &Tensor,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<Tensor> {
+    candle::mxfp4::dequant_mxfp4_to_bf16(blocks, scales, [out_dim, in_dim])
+}
+
 /// Try to resolve the MXFP4 pair names for a given base, supporting both dot and underscore
 /// variants ("base.blocks"/"base.scales" or "base_blocks"/"base_scales"). Returns the fully
 /// qualified names including any VarBuilder path.
@@ -1948,6 +1957,7 @@ pub fn load_linear_maybe_mxfp4(
         }
         let blocks = blocks.contiguous()?;
         let scales = scales.contiguous()?;
+        let weight = dequantize_mxfp4_linear(&blocks, &scales, out_dim, in_dim)?.contiguous()?;
 
         // Optionally load bias (kept BF16 as-is). Support dot and underscore naming.
         let bias_t = if bias {
@@ -1965,7 +1975,7 @@ pub fn load_linear_maybe_mxfp4(
             None
         };
 
-        return Ok(Linear::from_mxfp4(blocks, scales, in_dim, out_dim, bias_t));
+        return Ok(Linear::new(weight, bias_t));
     }
 
     // Fallback: standard BF16 linear loading under "{base}.weight" and optional bias.
@@ -2050,6 +2060,7 @@ pub fn load_expert_linear_mxfp4_grouped(
     }
     let blocks = blocks.contiguous()?;
     let scales = scales.contiguous()?;
+    let weight = dequantize_mxfp4_linear(&blocks, &scales, out_dim, in_dim)?.contiguous()?;
 
     // Debug: Print raw block bytes for expert 3, row 0, block 0
     if matches!(std::env::var("CANDLE_DUMP_L1").ok().as_deref(), Some("1"))
@@ -2084,17 +2095,16 @@ pub fn load_expert_linear_mxfp4_grouped(
         && expert_idx == 3
         && base.contains("gate_up")
     {
-        let weight_dbg = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
         eprintln!(
             "[MXFP4] Expert 3 gate_up_proj weight shape after dequant: {:?}",
-            weight_dbg.dims()
+            weight.dims()
         );
         eprintln!(
             "[MXFP4] Expected: ({}, {}) [out_dim, in_dim] for candle::Linear",
             out_dim, in_dim
         );
 
-        let w_f32 = weight_dbg.to_dtype(DType::F32)?;
+        let w_f32 = weight.clone().to_dtype(DType::F32)?;
         let w_vec = w_f32.to_vec2::<f32>()?;
         if w_vec.len() >= 2 {
             eprintln!(
@@ -2148,7 +2158,7 @@ pub fn load_expert_linear_mxfp4_grouped(
         }
     }
 
-    Ok(Linear::from_mxfp4(blocks, scales, in_dim, out_dim, bias_t))
+    Ok(Linear::new(weight, bias_t))
 }
 
 /// Load ALL experts' Linear layers at once from grouped MXFP4 tensors, dequantizing in a single
@@ -2200,6 +2210,14 @@ pub fn load_all_experts_linear_mxfp4_grouped(
     if !scales_g.device().same_device(vb.device()) {
         scales_g = scales_g.to_device(vb.device())?;
     }
+    let blocks_g = blocks_g.contiguous()?;
+    let scales_g = scales_g.contiguous()?;
+
+    let blocks_flat = blocks_g.reshape((n_experts * out_dim, nblocks, MXFP4_BLOCK_BYTES))?;
+    let scales_flat = scales_g.reshape((n_experts * out_dim, nblocks))?;
+    let dense_flat =
+        dequantize_mxfp4_linear(&blocks_flat, &scales_flat, n_experts * out_dim, in_dim)?;
+    let dense_all = dense_flat.reshape((n_experts, out_dim, in_dim))?;
 
     // Load optional grouped bias ONCE if present
     let bias_all = if bias {
@@ -2220,14 +2238,13 @@ pub fn load_all_experts_linear_mxfp4_grouped(
     // Slice into per-expert Linear layers
     let mut experts = Vec::with_capacity(n_experts);
     for e in 0..n_experts {
-        let blocks = blocks_g.narrow(0, e, 1)?.squeeze(0)?.contiguous()?;
-        let scales = scales_g.narrow(0, e, 1)?.squeeze(0)?.contiguous()?;
         let bias_t = if let Some(ref b) = bias_all {
             Some(b.narrow(0, e, 1)?.squeeze(0)?)
         } else {
             None
         };
-        experts.push(Linear::from_mxfp4(blocks, scales, in_dim, out_dim, bias_t));
+        let weight = dense_all.narrow(0, e, 1)?.squeeze(0)?.contiguous()?;
+        experts.push(Linear::new(weight, bias_t));
     }
 
     Ok(experts)

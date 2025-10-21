@@ -1,4 +1,4 @@
-use candle::{Device, Result, Tensor, DType};
+use candle::{DType, Device, Result, Tensor};
 
 // T11 Eager sink correctness: Construct small q/k/v and a sink vector; confirm eager-with-sink
 // output equals a baseline that explicitly concatenates sink to logits then drops it.
@@ -21,8 +21,11 @@ fn eager_sink_correctness() -> Result<()> {
     let baseline = {
         let scores = (q.clone() * scale as f64)?.matmul(&k.clone().t()?)?; // (bh, tq, tk)
         let scores_with_sink = Tensor::cat(&[&scores, &sink.unsqueeze(2)?], 2)?; // (bh, tq, tk+1)
-        let probs_with_sink = candle_nn::ops::softmax_last_dim(&scores_with_sink.to_dtype(DType::F32)?)?;
-        let probs = probs_with_sink.narrow(2, 0, k.dim(1)?)?.to_dtype(q.dtype())?;
+        let probs_with_sink =
+            candle_nn::ops::softmax_last_dim(&scores_with_sink.to_dtype(DType::F32)?)?;
+        let probs = probs_with_sink
+            .narrow(2, 0, k.dim(1)?)?
+            .to_dtype(q.dtype())?;
         probs.matmul(&v)
     }?;
 

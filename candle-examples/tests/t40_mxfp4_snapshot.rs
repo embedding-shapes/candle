@@ -6,7 +6,10 @@ const SNAPSHOT_DIR: &str = "~/.cache/huggingface/hub/models--openai--gpt-oss-20b
 
 fn p(s: &str) -> std::path::PathBuf {
     if let Some(rest) = s.strip_prefix("~/") {
-        std::env::var("HOME").map(std::path::PathBuf::from).unwrap().join(rest)
+        std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap()
+            .join(rest)
     } else {
         std::path::PathBuf::from(s)
     }
@@ -16,12 +19,17 @@ fn p(s: &str) -> std::path::PathBuf {
 fn t40_mxfp4_decode_stats_match_python_fixture() -> Result<()> {
     let dev = Device::cuda_if_available(0)?;
     // Map just the first shard files; helper resolves all from index
-    let files = candle_examples::hub_load_local_safetensors(p(SNAPSHOT_DIR), "model.safetensors.index.json")?;
+    let files = candle_examples::hub_load_local_safetensors(
+        p(SNAPSHOT_DIR),
+        "model.safetensors.index.json",
+    )?;
     let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&files, DType::BF16, &dev)? };
 
     // Layer 0 gate_up_proj (grouped MXFP4), expert 0
     let mlp_vb = vb.pp("model.layers.0.mlp");
-    let scales = mlp_vb.to_dtype(DType::U8).get((32, 5760, 90), "experts.gate_up_proj_scales")?;
+    let scales = mlp_vb
+        .to_dtype(DType::U8)
+        .get((32, 5760, 90), "experts.gate_up_proj_scales")?;
     let out_dim = scales.dim(1)?;
     assert_eq!(out_dim, 5760);
     // gate_up has 2*intermediate out; but grouped loader expects in/out dims per projection
@@ -37,7 +45,7 @@ fn t40_mxfp4_decode_stats_match_python_fixture() -> Result<()> {
         32,
     )?;
     let w = lin.weight().to_dtype(DType::F32)?; // (out, in)
-    // Compare stats for first 8 rows of the weight on first 2880 columns to Python fixture
+                                                // Compare stats for first 8 rows of the weight on first 2880 columns to Python fixture
     let full = w.narrow(1, 0, hidden)?; // (out, 2880)
     let mut stats = Vec::new();
     for r in 0..8usize {
@@ -58,8 +66,14 @@ fn t40_mxfp4_decode_stats_match_python_fixture() -> Result<()> {
     for (i, (m, s)) in stats.iter().enumerate() {
         let mr = rows[i].get("mean").unwrap().as_f64().unwrap() as f32;
         let sr = rows[i].get("std").unwrap().as_f64().unwrap() as f32;
-        assert!((m - mr).abs() < 1e-4, "row {i} mean mismatch: got {m}, ref {mr}");
-        assert!((s - sr).abs() < 5e-4, "row {i} std mismatch: got {s}, ref {sr}");
+        assert!(
+            (m - mr).abs() < 1e-4,
+            "row {i} mean mismatch: got {m}, ref {mr}"
+        );
+        assert!(
+            (s - sr).abs() < 5e-4,
+            "row {i} std mismatch: got {s}, ref {sr}"
+        );
     }
     Ok(())
 }

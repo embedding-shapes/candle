@@ -1,12 +1,14 @@
 use anyhow::{Context as _, Result};
-use candle::{DType, IndexOp, Tensor, D};
 use candle::Module as _;
+use candle::{DType, IndexOp, Tensor, D};
 use candle_nn::VarBuilder;
-use candle_transformers::models::gpt_oss::config::GptOssConfig;
-use candle_transformers::utils;
 use candle_transformers::models::deepseek2::TopKLastDimOp as _;
+use candle_transformers::models::gpt_oss::config::GptOssConfig;
 use candle_transformers::models::gpt_oss::model::GptOssModel;
-use candle_transformers::models::gpt_oss::{select_attn_mode_for_layer, AttnMode, GptOssConfigMinimal};
+use candle_transformers::models::gpt_oss::{
+    select_attn_mode_for_layer, AttnMode, GptOssConfigMinimal,
+};
+use candle_transformers::utils;
 use gpt_oss_tokenizer::render_then_encode;
 use openai_harmony::chat::{Message, Role};
 use std::path::PathBuf;
@@ -34,15 +36,25 @@ fn t41_bisect_first_layer_embed_and_layer0_out() -> Result<()> {
 
     // Resolve snapshot and messages -> tokens.
     let snapshot = expand_tilde(SNAPSHOT);
-    let user = Message::from_role_and_content(Role::User, "Explain what MXFP4 quantization is".to_string());
-    let input_ids: Vec<u32> = render_then_encode(&snapshot, &[user], true)
-        .context("render_then_encode failed")?;
+    let user = Message::from_role_and_content(
+        Role::User,
+        "Explain what MXFP4 quantization is".to_string(),
+    );
+    let input_ids: Vec<u32> =
+        render_then_encode(&snapshot, &[user], true).context("render_then_encode failed")?;
     assert!(input_ids.len() >= 4, "unexpectedly short prompt");
 
     // Candle device/dtype and model load
     let device = candle_examples::device(false /* cpu */)?;
-    assert!(device.is_cuda(), "CUDA device required for this parity test");
-    let dtype = if device.supports_bf16() { DType::BF16 } else { DType::F16 };
+    assert!(
+        device.is_cuda(),
+        "CUDA device required for this parity test"
+    );
+    let dtype = if device.supports_bf16() {
+        DType::BF16
+    } else {
+        DType::F16
+    };
 
     let cfg_path = snapshot.join("config.json");
     let cfg_bytes = std::fs::read(&cfg_path)
@@ -54,9 +66,16 @@ fn t41_bisect_first_layer_embed_and_layer0_out() -> Result<()> {
         let idx_bytes = std::fs::read(&model_index)
             .with_context(|| format!("failed to read model index: {}", model_index.display()))?;
         #[derive(serde::Deserialize)]
-        struct Idx { weight_map: std::collections::BTreeMap<String, String> }
-        let idx: Idx = serde_json::from_slice(&idx_bytes).context("invalid model.safetensors.index.json")?;
-        let files = idx.weight_map.values().cloned().collect::<std::collections::BTreeSet<_>>();
+        struct Idx {
+            weight_map: std::collections::BTreeMap<String, String>,
+        }
+        let idx: Idx =
+            serde_json::from_slice(&idx_bytes).context("invalid model.safetensors.index.json")?;
+        let files = idx
+            .weight_map
+            .values()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         files.iter().map(|f| snapshot.join(f)).collect()
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, &device)? };
@@ -82,7 +101,7 @@ fn t41_bisect_first_layer_embed_and_layer0_out() -> Result<()> {
     // Pre-attn norm
     let layer0 = &mut model.layers[0];
     let x_norm = layer0.input_layernorm.forward(&xs_embed)?; // (1,T,H)
-    // QKV projections
+                                                             // QKV projections
     let q = x_norm.apply(&layer0.attn.q_proj)?; // (1,T,n_q*hd)
     let k = x_norm.apply(&layer0.attn.k_proj)?; // (1,T,n_kv*hd)
     let v = x_norm.apply(&layer0.attn.v_proj)?; // (1,T,n_kv*hd)
@@ -96,9 +115,9 @@ fn t41_bisect_first_layer_embed_and_layer0_out() -> Result<()> {
     let q = q_bhtd.transpose(1, 2)?; // (1,t,n_q,d)
     let k_step = k_bhtd; // (1,n_kv,t,d)
     let v_step = v.transpose(1, 2)?; // (1,n_kv,t,d)
-    // KV cache append for layer 0
+                                     // KV cache append for layer 0
     let (k_all, v_all) = model.kv_caches[0].append(&k_step.contiguous()?, &v_step.contiguous()?)?; // (1,n_kv,tk,d)
-    // Repeat for GQA
+                                                                                                   // Repeat for GQA
     let n_rep = n_q / n_kv;
     let k_rep = utils::repeat_kv(k_all.clone(), n_rep)?; // (1,n_q,tk,d)
     let v_rep = utils::repeat_kv(v_all.clone(), n_rep)?; // (1,n_q,tk,d)
@@ -119,13 +138,30 @@ fn t41_bisect_first_layer_embed_and_layer0_out() -> Result<()> {
     // Eager attention with sinks to keep deterministic path in tests.
     let sinks = Some(&layer0.attn.sinks);
     let y = match attn_mode {
-        AttnMode::Full => candle_transformers::models::gpt_oss::eager_attn_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, t > 1, sinks)?,
-        AttnMode::Sliding { left, right } => candle_transformers::models::gpt_oss::eager_attn_windowed_with_sinks(&q, &k_btkhd, &v_btkhd, softmax_scale, Some(left), Some(right), sinks)?,
+        AttnMode::Full => candle_transformers::models::gpt_oss::eager_attn_with_sinks(
+            &q,
+            &k_btkhd,
+            &v_btkhd,
+            softmax_scale,
+            t > 1,
+            sinks,
+        )?,
+        AttnMode::Sliding { left, right } => {
+            candle_transformers::models::gpt_oss::eager_attn_windowed_with_sinks(
+                &q,
+                &k_btkhd,
+                &v_btkhd,
+                softmax_scale,
+                Some(left),
+                Some(right),
+                sinks,
+            )?
+        }
     }; // (1,t,n_q,d)
     let y = y.reshape((1, t, n_q * head_dim))?;
     let y = y.apply(&layer0.attn.o_proj)?; // (1,t,H)
     let xs1 = (&xs_embed + &y)?; // residual
-    // Post-attn norm + MoE
+                                 // Post-attn norm + MoE
     let x_norm2 = layer0.post_attention_layernorm.forward(&xs1)?; // (1,t,H)
     let mlp_out = layer0.experts.forward(&x_norm2)?; // (1,t,H)
     let xs_after = (&xs1 + &mlp_out)?; // (1,t,H)
@@ -182,11 +218,19 @@ h.remove()
     }
     let out = String::from_utf8_lossy(&output.stdout);
     #[derive(serde::Deserialize)]
-    struct PyRes { emb_last: Vec<f32>, post_attn_in_last: Vec<f32>, layer0_last: Vec<f32> }
+    struct PyRes {
+        emb_last: Vec<f32>,
+        post_attn_in_last: Vec<f32>,
+        layer0_last: Vec<f32>,
+    }
     let py: PyRes = serde_json::from_str(&out).context("invalid python json for hidden_states")?;
 
     // Quick stats compare: mean/std and first 8 elems.
-    fn stats(v: &[f32]) -> (f32, f32) { let m = v.iter().copied().sum::<f32>()/(v.len() as f32); let var = v.iter().map(|x| (x-m)*(x-m)).sum::<f32>()/(v.len() as f32); (m, var.sqrt()) }
+    fn stats(v: &[f32]) -> (f32, f32) {
+        let m = v.iter().copied().sum::<f32>() / (v.len() as f32);
+        let var = v.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / (v.len() as f32);
+        (m, var.sqrt())
+    }
     let (m_c_emb, s_c_emb) = stats(&last_embed_v);
     let (m_p_emb, s_p_emb) = stats(&py.emb_last);
     // Candle post-attn pre-MLP
@@ -209,13 +253,39 @@ h.remove()
     let probs_rust = top_probs.reshape((4,))?.to_vec1::<f32>()?;
 
     // Tolerances (these are quite strict but allow tiny numeric drift)
-    assert!((m_c_emb - m_p_emb).abs() < 1e-3, "embed mean mismatch: rust={m_c_emb} py={m_p_emb}");
-    assert!((s_c_emb - s_p_emb).abs() < 1e-3, "embed std mismatch: rust={s_c_emb} py={s_p_emb}");
+    assert!(
+        (m_c_emb - m_p_emb).abs() < 1e-3,
+        "embed mean mismatch: rust={m_c_emb} py={m_p_emb}"
+    );
+    assert!(
+        (s_c_emb - s_p_emb).abs() < 1e-3,
+        "embed std mismatch: rust={s_c_emb} py={s_p_emb}"
+    );
     // Embed parity
-    assert!((m_c_l0pre - m_p_l0pre).abs() < 5e-3, "post-attn-in mean mismatch: rust={m_c_l0pre} py={m_p_l0pre}");
-    assert!((s_c_l0pre - s_p_l0pre).abs() < 5e-3, "post-attn-in std mismatch: rust={s_c_l0pre} py={m_p_l0pre}");
-    for i in 0..8 { assert!((last_embed_v[i] - py.emb_last[i]).abs() < 5e-3, "embed elem[{i}] mismatch: {} vs {}", last_embed_v[i], py.emb_last[i]); }
-    for i in 0..8 { assert!((xs1_last_v[i] - py.post_attn_in_last[i]).abs() < 2e-2, "post-attn-in elem[{i}] mismatch: {} vs {}", xs1_last_v[i], py.post_attn_in_last[i]); }
+    assert!(
+        (m_c_l0pre - m_p_l0pre).abs() < 5e-3,
+        "post-attn-in mean mismatch: rust={m_c_l0pre} py={m_p_l0pre}"
+    );
+    assert!(
+        (s_c_l0pre - s_p_l0pre).abs() < 5e-3,
+        "post-attn-in std mismatch: rust={s_c_l0pre} py={m_p_l0pre}"
+    );
+    for i in 0..8 {
+        assert!(
+            (last_embed_v[i] - py.emb_last[i]).abs() < 5e-3,
+            "embed elem[{i}] mismatch: {} vs {}",
+            last_embed_v[i],
+            py.emb_last[i]
+        );
+    }
+    for i in 0..8 {
+        assert!(
+            (xs1_last_v[i] - py.post_attn_in_last[i]).abs() < 2e-2,
+            "post-attn-in elem[{i}] mismatch: {} vs {}",
+            xs1_last_v[i],
+            py.post_attn_in_last[i]
+        );
+    }
 
     // Python router parity: compute and compare indices/probabilities
     let script_router = {
@@ -264,21 +334,47 @@ with torch.no_grad():
     }
     let out_router_json = String::from_utf8_lossy(&out_router.stdout);
     #[derive(serde::Deserialize)]
-    struct PyRouter { idx: Vec<i64>, probs: Vec<f32> }
-    let pr: PyRouter = serde_json::from_str(&out_router_json).context("invalid python json for router")?;
+    struct PyRouter {
+        idx: Vec<i64>,
+        probs: Vec<f32>,
+    }
+    let pr: PyRouter =
+        serde_json::from_str(&out_router_json).context("invalid python json for router")?;
 
     // Compare indices and probs (unordered compare ok; both are top-4 largest)
     for j in 0..4 {
-        assert_eq!(idx_rust[j] as i64, pr.idx[j], "router top-idx[{j}] mismatch: rust={} py={}", idx_rust[j], pr.idx[j]);
-        assert!((probs_rust[j] - pr.probs[j]).abs() < 2e-3, "router prob[{j}] mismatch: rust={} py={}", probs_rust[j], pr.probs[j]);
+        assert_eq!(
+            idx_rust[j] as i64, pr.idx[j],
+            "router top-idx[{j}] mismatch: rust={} py={}",
+            idx_rust[j], pr.idx[j]
+        );
+        assert!(
+            (probs_rust[j] - pr.probs[j]).abs() < 2e-3,
+            "router prob[{j}] mismatch: rust={} py={}",
+            probs_rust[j],
+            pr.probs[j]
+        );
     }
 
     // Full layer0 parity
     let (m_c_l0, s_c_l0) = stats(&last_after_v);
     let (m_p_l0, s_p_l0) = stats(&py.layer0_last);
-    assert!((m_c_l0 - m_p_l0).abs() < 5e-3, "layer0 mean mismatch: rust={m_c_l0} py={m_p_l0}");
-    assert!((s_c_l0 - s_p_l0).abs() < 5e-3, "layer0 std mismatch: rust={s_c_l0} py={s_p_l0}");
-    for i in 0..8 { assert!((last_after_v[i] - py.layer0_last[i]).abs() < 2e-2, "layer0 elem[{i}] mismatch: {} vs {}", last_after_v[i], py.layer0_last[i]); }
+    assert!(
+        (m_c_l0 - m_p_l0).abs() < 5e-3,
+        "layer0 mean mismatch: rust={m_c_l0} py={m_p_l0}"
+    );
+    assert!(
+        (s_c_l0 - s_p_l0).abs() < 5e-3,
+        "layer0 std mismatch: rust={s_c_l0} py={s_p_l0}"
+    );
+    for i in 0..8 {
+        assert!(
+            (last_after_v[i] - py.layer0_last[i]).abs() < 2e-2,
+            "layer0 elem[{i}] mismatch: {} vs {}",
+            last_after_v[i],
+            py.layer0_last[i]
+        );
+    }
 
     Ok(())
 }

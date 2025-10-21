@@ -165,7 +165,9 @@ pub fn hub_load_local_safetensors<P: AsRef<std::path::Path>>(
     // on input order when there are collisions, so keep ordering stable.
     let mut uniq: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for v in weight_map.values() {
-        if let Some(s) = v.as_str() { uniq.insert(s); }
+        if let Some(s) = v.as_str() {
+            uniq.insert(s);
+        }
     }
     let safetensors_files: Vec<_> = uniq.into_iter().map(|v| path.join(v)).collect();
     Ok(safetensors_files)

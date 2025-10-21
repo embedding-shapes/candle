@@ -2,8 +2,8 @@
 //!
 
 use candle::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
-use std::ops::{Div, Mul};
 use rayon::prelude::*;
+use std::ops::{Div, Mul};
 
 /// Applies the softmax function to the input tensor, rescaling the element so that elements on
 /// a slice of fixed index on dimension `dim` are between 0 and 1 and sum to 1.
@@ -1051,8 +1051,8 @@ pub fn attention_with_sink(
     let scores_with_sink = Tensor::cat(&[&scores, &sink_col], 2)?;
 
     // Softmax over tokens + sink in fp32, then drop sink column
-    let probs_with_sink = softmax_last_dim(&scores_with_sink.to_dtype(DType::F32)?)?
-        .to_dtype(q.dtype())?;
+    let probs_with_sink =
+        softmax_last_dim(&scores_with_sink.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
     let probs = probs_with_sink.narrow(2, 0, tk)?; // remove sink column
 
     // Output: (bh, tq, dv)

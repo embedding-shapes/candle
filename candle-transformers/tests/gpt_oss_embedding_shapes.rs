@@ -14,7 +14,9 @@ fn embedding_and_lm_head_rows_match() -> Result<(), Box<dyn std::error::Error>> 
     let base = expand_tilde("~/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee");
     let shard = base.join("model-00002-of-00002.safetensors");
     let mm = unsafe { MmapedFile::new(&shard) }?;
-    let st = mm.deserialize().map_err(|e| format!("deserialize {}: {}", shard.display(), e))?;
+    let st = mm
+        .deserialize()
+        .map_err(|e| format!("deserialize {}: {}", shard.display(), e))?;
 
     let e = st.tensor("model.embed_tokens.weight")?;
     let l = st.tensor("lm_head.weight")?;
@@ -23,7 +25,10 @@ fn embedding_and_lm_head_rows_match() -> Result<(), Box<dyn std::error::Error>> 
     let l_shape = l.shape();
     assert_eq!(e_shape.len(), 2);
     assert_eq!(l_shape.len(), 2);
-    assert_eq!(e_shape[0], l_shape[0], "embedding rows must match lm_head rows");
+    assert_eq!(
+        e_shape[0], l_shape[0],
+        "embedding rows must match lm_head rows"
+    );
 
     // Both should be BF16
     let e_dt = format!("{:?}", e.dtype());

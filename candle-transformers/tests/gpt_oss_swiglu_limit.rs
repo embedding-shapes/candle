@@ -1,6 +1,6 @@
-use candle::{Device, Result, Tensor, Module};
-use candle_transformers::models::gpt_oss::experts::ExpertMlp;
+use candle::{Device, Module, Result, Tensor};
 use candle_nn::Linear;
+use candle_transformers::models::gpt_oss::experts::ExpertMlp;
 
 // T20: ExpertMlp applies GPT-OSS clamped SwiGLU with residual tweak correctly
 #[test]

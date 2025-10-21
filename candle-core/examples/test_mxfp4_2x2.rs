@@ -25,8 +25,16 @@ fn main() -> Result<()> {
     let blocks = blocks_cpu.to_device(&cuda_device)?;
     let scales = scales_cpu.to_device(&cuda_device)?;
 
-    println!("  blocks shape: {:?}, device: {:?}", blocks.dims(), blocks.device());
-    println!("  scales shape: {:?}, device: {:?}", scales.dims(), scales.device());
+    println!(
+        "  blocks shape: {:?}, device: {:?}",
+        blocks.dims(),
+        blocks.device()
+    );
+    println!(
+        "  scales shape: {:?}, device: {:?}",
+        scales.dims(),
+        scales.device()
+    );
 
     // Dequantize to shape [2, 64] (2 rows, 2 blocks * 32 elements = 64 columns)
     let dequant = candle_core::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [2, 64])?;
@@ -54,8 +62,10 @@ fn main() -> Result<()> {
     for i in 0..8 {
         let diff = (row0[i] - expected_r0_b0[i]).abs();
         let status = if diff < 0.0001 { "✓" } else { "✗" };
-        println!("[{}] CUDA: {:.8}, Expected: {:.8}, diff: {:.8} {}",
-                 i, row0[i], expected_r0_b0[i], diff, status);
+        println!(
+            "[{}] CUDA: {:.8}, Expected: {:.8}, diff: {:.8} {}",
+            i, row0[i], expected_r0_b0[i], diff, status
+        );
     }
 
     Ok(())

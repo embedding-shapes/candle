@@ -46,9 +46,13 @@ fn load_model_from_cfg_json(cfg_json: &str) -> Result<()> {
     // Build minimal VarBuilder with only embedding, norm and lm_head; 0 layers.
     let dev = {
         #[cfg(feature = "cuda")]
-        { Device::new_cuda(0)? }
+        {
+            Device::new_cuda(0)?
+        }
         #[cfg(not(feature = "cuda"))]
-        { Device::Cpu }
+        {
+            Device::Cpu
+        }
     };
     let tmap = minimal_weight_map(cfg.vocab_size, cfg.hidden_size, &dev);
     let vb = candle_nn::VarBuilder::from_tensors(tmap, DType::BF16, &dev);

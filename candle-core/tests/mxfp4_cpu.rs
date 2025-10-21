@@ -16,11 +16,12 @@ fn quantize_block_e2m1(values: &[f32]) -> (u8, [u8; 16]) {
     let mut best_packed = [0u8; 16];
 
     // Heuristic center exponent.
-    let max_abs = values
-        .iter()
-        .map(|v| v.abs())
-        .fold(0f32, |a, b| a.max(b));
-    let mut center = if max_abs > 0.0 { (max_abs / 6.0).log2().floor() as i32 } else { 0 };
+    let max_abs = values.iter().map(|v| v.abs()).fold(0f32, |a, b| a.max(b));
+    let mut center = if max_abs > 0.0 {
+        (max_abs / 6.0).log2().floor() as i32
+    } else {
+        0
+    };
     if center < -32 {
         center = -32;
     }

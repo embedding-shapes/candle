@@ -121,8 +121,10 @@ mod tests {
         let (org, repo) = repo_id.split_once('/')?;
         let hub = hub_root();
         let candidates = [
-            hub.join(format!("models--{}--{}", org, repo)).join("snapshots"),
-            hub.join(format!("models--{}--{}", org, title_case_repo(repo))).join("snapshots"),
+            hub.join(format!("models--{}--{}", org, repo))
+                .join("snapshots"),
+            hub.join(format!("models--{}--{}", org, title_case_repo(repo)))
+                .join("snapshots"),
         ];
         let mut snaps: Vec<PathBuf> = vec![];
         for root in candidates.iter() {

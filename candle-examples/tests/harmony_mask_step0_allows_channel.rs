@@ -24,7 +24,9 @@ fn fsm_allowed_ids(decoded_so_far: &str) -> BTreeSet<usize> {
     let allow_syms = allowed_specials_for_next(decoded_so_far);
     let mut ids: BTreeSet<usize> = BTreeSet::new();
     for s in allow_syms {
-        if let Some(id) = map.get(s) { ids.insert(*id as usize); }
+        if let Some(id) = map.get(s) {
+            ids.insert(*id as usize);
+        }
     }
     ids
 }
@@ -40,12 +42,17 @@ fn argmax(v: &[f32]) -> usize {
     let mut best_i = 0usize;
     let mut best_v = f32::NEG_INFINITY;
     for (i, &x) in v.iter().enumerate() {
-        if x > best_v { best_v = x; best_i = i; }
+        if x > best_v {
+            best_v = x;
+            best_i = i;
+        }
     }
     best_i
 }
 
-fn build_logits(base: f32) -> Vec<f32> { vec![base; VOCAB] }
+fn build_logits(base: f32) -> Vec<f32> {
+    vec![base; VOCAB]
+}
 
 fn softmax_mask_probabilities(
     logits: &[f32],
@@ -54,12 +61,19 @@ fn softmax_mask_probabilities(
 ) -> Result<Vec<f32>> {
     // Build tensor on chosen device, softmax, then zero masked ids just like the sampler closure.
     let t = Tensor::from_vec(logits.to_vec(), VOCAB, device)?;
-    eprintln!("dtype={:?} device={:?} shape=({})", DType::F32, device, VOCAB);
+    eprintln!(
+        "dtype={:?} device={:?} shape=({})",
+        DType::F32,
+        device,
+        VOCAB
+    );
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::All { temperature: 1.0 });
     let mut captured: Option<Vec<f32>> = None;
     let _ = sampler.sample_f(&t, |prs: &mut [f32]| {
         for &i in to_mask {
-            if i < prs.len() { prs[i] = 0.0; }
+            if i < prs.len() {
+                prs[i] = 0.0;
+            }
         }
         captured = Some(prs.to_vec());
     })?;
@@ -75,7 +89,9 @@ fn harmony_mask_step0_allows_channel() -> Result<()> {
 
     // Global forbid set: suppress specials by default, re-enable via FSM.
     let mut global_forbid: BTreeSet<usize> = BTreeSet::new();
-    for &id in &[ID_CHANNEL, ID_MESSAGE, ID_RETURN, ID_CALL, ID_END] { global_forbid.insert(id); }
+    for &id in &[ID_CHANNEL, ID_MESSAGE, ID_RETURN, ID_CALL, ID_END] {
+        global_forbid.insert(id);
+    }
     let to_mask: BTreeSet<usize> = global_forbid.difference(&allow_ids).copied().collect();
 
     // Build logits vector per spec.
@@ -100,24 +116,43 @@ fn harmony_mask_step0_allows_channel() -> Result<()> {
     );
 
     // Assertions per spec intent adapted for probability-level masking.
-    assert!(allow_ids.contains(&ID_CHANNEL), "<|channel|> must be in allow set");
+    assert!(
+        allow_ids.contains(&ID_CHANNEL),
+        "<|channel|> must be in allow set"
+    );
     assert_eq!(pm[ID_CHANNEL], pm[ID_CHANNEL], "channel prob finite");
-    assert_eq!(pm[ID_MESSAGE], 0.0, "<|message|> must be masked to zero at step 0");
-    assert_eq!(pm[ID_RETURN], 0.0, "<|return|> must be masked to zero at step 0");
-    assert_eq!(pm[ID_CALL], 0.0, "<|call|> must be masked to zero at step 0");
+    assert_eq!(
+        pm[ID_MESSAGE], 0.0,
+        "<|message|> must be masked to zero at step 0"
+    );
+    assert_eq!(
+        pm[ID_RETURN], 0.0,
+        "<|return|> must be masked to zero at step 0"
+    );
+    assert_eq!(
+        pm[ID_CALL], 0.0,
+        "<|call|> must be masked to zero at step 0"
+    );
     assert_eq!(pm[ID_END], 0.0, "<|end|> must be masked to zero at step 0");
     // A few normal tokens must remain allowed (retain non-zero mass but lose to channel).
     for &tid in &[11usize, 13usize, 25usize] {
         assert!(pm[tid] >= 0.0, "normal token {} must remain allowed", tid);
     }
-    assert_eq!(post_argmax, ID_CHANNEL, "<|channel|> must remain top-1 after masking at step 0");
+    assert_eq!(
+        post_argmax, ID_CHANNEL,
+        "<|channel|> must remain top-1 after masking at step 0"
+    );
 
     // Negative control: set channel low, a normal token high; ensure normal token wins.
     let mut l2 = build_logits(-10.0);
     l2[ID_CHANNEL] = -10.0;
     l2[11] = 9.0;
     let p2 = softmax_mask_probabilities(&l2, &to_mask, &device)?;
-    assert_eq!(argmax(&p2), 11usize, "normal token 11 must win when channel is low");
+    assert_eq!(
+        argmax(&p2),
+        11usize,
+        "normal token 11 must win when channel is low"
+    );
 
     // State transition: AfterChannel(final) → require <|message|>, channel must be masked.
     let decoded2 = "<|start|>assistant<|channel|>final";
@@ -126,8 +161,15 @@ fn harmony_mask_step0_allows_channel() -> Result<()> {
     let mut l3 = build_logits(-10.0);
     l3[ID_MESSAGE] = 10.0;
     let p3 = softmax_mask_probabilities(&l3, &to_mask2, &device)?;
-    assert_eq!(argmax(&p3), ID_MESSAGE, "<|message|> must be top-1 after channel");
-    assert_eq!(p3[ID_CHANNEL], 0.0, "<|channel|> must be masked after channel token");
+    assert_eq!(
+        argmax(&p3),
+        ID_MESSAGE,
+        "<|message|> must be top-1 after channel"
+    );
+    assert_eq!(
+        p3[ID_CHANNEL], 0.0,
+        "<|channel|> must be masked after channel token"
+    );
 
     Ok(())
 }

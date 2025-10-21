@@ -1,4 +1,4 @@
-use candle::{Device, Result, Tensor, DType};
+use candle::{DType, Device, Result, Tensor};
 
 // Validates RMSNorm formula on CUDA: v / sqrt(mean(v^2) + eps) * g
 // Prints detailed diagnostics: dtype, device, shapes, strides, inputs/outputs, and error metrics.
@@ -9,7 +9,10 @@ fn cpu_reference(v: &[f32], g: &[f32], eps: f32) -> Vec<f32> {
     let n = v.len() as f32;
     let sum2: f32 = v.iter().map(|&x| x * x).sum();
     let denom = (sum2 / n + eps).sqrt();
-    v.iter().zip(g.iter()).map(|(&x, &gg)| x / denom * gg).collect()
+    v.iter()
+        .zip(g.iter())
+        .map(|(&x, &gg)| x / denom * gg)
+        .collect()
 }
 
 fn l2_diff(a: &[f32], b: &[f32]) -> f64 {
@@ -52,8 +55,18 @@ fn rmsnorm_cuda_epsilon_location_micro() -> Result<()> {
     // Diagnostics: tensor metadata.
     println!("seed: fixed/static inputs");
     println!("device: {:?}", dev);
-    println!("v: dtype={:?} shape={:?} stride={:?}", v.dtype(), v.shape(), v.stride());
-    println!("g: dtype={:?} shape={:?} stride={:?}", g.dtype(), g.shape(), g.stride());
+    println!(
+        "v: dtype={:?} shape={:?} stride={:?}",
+        v.dtype(),
+        v.shape(),
+        v.stride()
+    );
+    println!(
+        "g: dtype={:?} shape={:?} stride={:?}",
+        g.dtype(),
+        g.shape(),
+        g.stride()
+    );
     println!("v_host: {:?}", v_host);
     println!("g_host: {:?}", g_host);
 

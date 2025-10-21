@@ -16,8 +16,8 @@ use serde::Deserialize;
 use candle::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::mistral3::{config::Mistral3Config, model::Mistral3Cache};
 use candle_transformers::models::mistral3::model::Model as Mistral3;
+use candle_transformers::models::mistral3::{config::Mistral3Config, model::Mistral3Cache};
 use tekken::Tekkenizer;
 
 // Configurable constants at top
@@ -28,7 +28,12 @@ const PIXTRAL_STD: [f32; 3] = [0.26862954, 0.2613026, 0.2757771];
 const IMAGE_RES: usize = 1540;
 
 // Minimal, self-contained Pixtral preproc helpers to mirror the main example.
-fn compute_resized_dims_from_wh(orig_w: u32, orig_h: u32, max_side: usize, divisor: usize) -> (usize, usize) {
+fn compute_resized_dims_from_wh(
+    orig_w: u32,
+    orig_h: u32,
+    max_side: usize,
+    divisor: usize,
+) -> (usize, usize) {
     let divisor = divisor.max(1);
     let max_side = max_side.max(divisor);
     let (wf, hf) = (orig_w as f32, orig_h as f32);
@@ -47,17 +52,29 @@ fn compute_resized_dims_from_wh(orig_w: u32, orig_h: u32, max_side: usize, divis
     (round_mul(nh, divisor), round_mul(nw, divisor))
 }
 
-fn load_image_pixtral(path: &str, h: usize, w: usize, mean: &[f32; 3], std: &[f32; 3]) -> Result<Tensor> {
+fn load_image_pixtral(
+    path: &str,
+    h: usize,
+    w: usize,
+    mean: &[f32; 3],
+    std: &[f32; 3],
+) -> Result<Tensor> {
     use candle::{Device, Tensor};
-    if h == 0 || w == 0 { return Err(E::msg("invalid target size")); }
-    let img = image::ImageReader::open(path)?.decode().map_err(candle::Error::wrap)?
+    if h == 0 || w == 0 {
+        return Err(E::msg("invalid target size"));
+    }
+    let img = image::ImageReader::open(path)?
+        .decode()
+        .map_err(candle::Error::wrap)?
         .resize(w as u32, h as u32, image::imageops::FilterType::CatmullRom)
         .to_rgb8();
     let data = img.into_raw();
     let data = Tensor::from_vec(data, (h, w, 3), &Device::Cpu)?.permute((2, 0, 1))?;
     let mean = Tensor::new(mean, &Device::Cpu)?.reshape((3, 1, 1))?;
     let std = Tensor::new(std, &Device::Cpu)?.reshape((3, 1, 1))?;
-    Ok(((data.to_dtype(DType::F32)? / 255.)?).broadcast_sub(&mean)?.broadcast_div(&std)?)
+    Ok(((data.to_dtype(DType::F32)? / 255.)?)
+        .broadcast_sub(&mean)?
+        .broadcast_div(&std)?)
 }
 
 #[derive(Parser, Debug)]
@@ -205,7 +222,10 @@ fn run_python_meta(args: &Args) -> Result<PyMeta> {
         s.push_str(&String::from_utf8_lossy(&output.stderr));
         s.push_str("\npython stdout: \n");
         s.push_str(&String::from_utf8_lossy(&output.stdout));
-        return Err(E::msg(format!("python run failed: {}\n{}", output.status, s)));
+        return Err(E::msg(format!(
+            "python run failed: {}\n{}",
+            output.status, s
+        )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout.trim();
@@ -228,7 +248,11 @@ fn jaccard_words(a: &str, b: &str) -> f64 {
     }
     let inter = sa.intersection(&sb).count() as f64;
     let union = sa.union(&sb).count() as f64;
-    if union == 0.0 { 0.0 } else { inter / union }
+    if union == 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
 }
 
 fn main() -> Result<()> {
@@ -244,12 +268,14 @@ fn main() -> Result<()> {
     let tekken_file = repo.get("tekken.json")?;
     let system_prompt_file = repo.get("SYSTEM_PROMPT.txt")?;
     let config_file = repo.get("config.json")?;
-    let weight_files = candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?;
+    let weight_files =
+        candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?;
 
     // Tokenizer and special ids
     let tokenizer = Tekkenizer::from_file(&tekken_file).map_err(E::msg)?;
     let sp = load_special_ids(&tekken_file)?;
-    let system_prompt = std::fs::read_to_string(&system_prompt_file).context("read SYSTEM_PROMPT.txt")?;
+    let system_prompt =
+        std::fs::read_to_string(&system_prompt_file).context("read SYSTEM_PROMPT.txt")?;
 
     // Build our input ids
     let input_ids_vec = build_input_ids(&tokenizer, &sp, &system_prompt, &args.prompt, true)?;
@@ -267,22 +293,36 @@ fn main() -> Result<()> {
     // Compare tokenization length (allow minor deviation)
     let len_diff = (py.input_ids_len as isize - input_ids_vec.len() as isize).abs();
     if len_diff > 8 {
-        println!("WARNING: token length differs by {} (allowed small deviation)", len_diff);
+        println!(
+            "WARNING: token length differs by {} (allowed small deviation)",
+            len_diff
+        );
     }
-    assert!(rust_img_count == 1, "expected exactly one [IMG] token in rust");
+    assert!(
+        rust_img_count == 1,
+        "expected exactly one [IMG] token in rust"
+    );
 
     // Device and model
     let device = candle_examples::device(args.cpu)?;
-    let dtype = if device.supports_bf16() { DType::BF16 } else { DType::F32 };
-    let config: Mistral3Config = serde_json::from_slice(&std::fs::read(&config_file)?)
-        .context("parse config.json")?;
+    let dtype = if device.supports_bf16() {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    let config: Mistral3Config =
+        serde_json::from_slice(&std::fs::read(&config_file)?).context("parse config.json")?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
     let mut model = Mistral3::new(&config, vb)?;
 
     // Image preprocessing: use the same Pixtral pipeline as the main example
     let patch = {
         let p = config.vision_config.inner.patch_size as usize;
-        if p == 0 { 14 } else { p }
+        if p == 0 {
+            14
+        } else {
+            p
+        }
     };
     let s = config.spatial_merge_size.max(1);
     let (ow, oh) = image::image_dimensions(&args.image).map_err(candle::Error::wrap)?;
@@ -304,14 +344,20 @@ fn main() -> Result<()> {
     // Prepare generation
     let input_ids = Tensor::new(input_ids_vec.as_slice(), &device)?.unsqueeze(0)?;
     let mut cache = Mistral3Cache::default();
-    let mut logits_processor = LogitsProcessor::new(args.seed, Some(args.temperature), Some(args.top_p));
+    let mut logits_processor =
+        LogitsProcessor::new(args.seed, Some(args.temperature), Some(args.top_p));
     let mut tokens: Vec<u32> = input_ids.to_vec2::<u32>()?.remove(0);
     let initial_len = tokens.len();
 
     let image_sizes: Vec<(u32, u32)> = vec![(h as u32, w as u32)];
     for step in 0..args.new_tokens {
         let (inp, index_pos, pixel_opt, sizes_opt) = if step == 0 {
-            (input_ids.clone(), 0usize, Some(&image), Some(image_sizes.as_slice()))
+            (
+                input_ids.clone(),
+                0usize,
+                Some(&image),
+                Some(image_sizes.as_slice()),
+            )
         } else {
             let last = *tokens.last().unwrap();
             let pos = initial_len + step - 1;
@@ -322,7 +368,14 @@ fn main() -> Result<()> {
                 None,
             )
         };
-        let logits = model.forward(&inp, pixel_opt, sizes_opt, &mut cache, index_pos, &config.vision_feature_layer)?;
+        let logits = model.forward(
+            &inp,
+            pixel_opt,
+            sizes_opt,
+            &mut cache,
+            index_pos,
+            &config.vision_feature_layer,
+        )?;
         let logits = if logits.dims().len() == 3 {
             logits.i((.., logits.dim(1)? - 1, ..))?
         } else {
@@ -331,7 +384,9 @@ fn main() -> Result<()> {
         let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
         let next_token = logits_processor.sample(&logits)?;
         tokens.push(next_token);
-        if next_token == sp.eos { break; }
+        if next_token == sp.eos {
+            break;
+        }
     }
 
     let new_tokens = &tokens[initial_len..];
@@ -339,7 +394,10 @@ fn main() -> Result<()> {
         .decode(new_tokens, tekken::SpecialTokenPolicy::Ignore)
         .map_err(|e| E::msg(format!("tekken decode: {e}")))?;
 
-    println!("\npython text: {}\n---\nrust   text: {}\n", py.text, rust_text);
+    println!(
+        "\npython text: {}\n---\nrust   text: {}\n",
+        py.text, rust_text
+    );
     let jac = jaccard_words(&py.text, &rust_text);
     println!("word Jaccard similarity (>=4 chars): {:.3}", jac);
     if jac < 0.10 {

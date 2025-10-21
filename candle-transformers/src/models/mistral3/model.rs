@@ -1,4 +1,4 @@
-use candle::{IndexOp, Module, Result, Tensor, DType};
+use candle::{DType, IndexOp, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 use std::time::Instant;
 
@@ -164,18 +164,10 @@ impl Model {
         let need = positions.len();
         let (have, eh) = image_embeds.dims2()?;
         if eh != h {
-            candle::bail!(
-                "hidden size mismatch: inputs {}, image_embeds {}",
-                h,
-                eh
-            );
+            candle::bail!("hidden size mismatch: inputs {}, image_embeds {}", h, eh);
         }
         if have < need {
-            candle::bail!(
-                "not enough image embeddings: have {}, need {}",
-                have,
-                need
-            );
+            candle::bail!("not enough image embeddings: have {}, need {}", have, need);
         }
 
         // Align dtypes/devices: cast image_embeds to inputs dtype
@@ -206,10 +198,7 @@ impl Model {
                 .reshape((b, s, 1))?
                 .to_dtype(inputs_embeds.dtype())?;
 
-            let emb_brd = emb
-                .unsqueeze(0)?
-                .unsqueeze(0)?
-                .broadcast_as((b, s, h))?;
+            let emb_brd = emb.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((b, s, h))?;
 
             let inv = (1.0 - &mask)?;
             result = (result.broadcast_mul(&inv)? + emb_brd.broadcast_mul(&mask)?)?;
@@ -255,7 +244,8 @@ impl Model {
                     );
                 }
 
-                inputs_embeds = Self::replace_image_tokens(&inputs_embeds, &image_embeds, &positions)?;
+                inputs_embeds =
+                    Self::replace_image_tokens(&inputs_embeds, &image_embeds, &positions)?;
                 cache.image_processed = true;
                 eprintln!(
                     "TIMING magistral:image_embed_insert total_ms={} positions={}",
@@ -291,9 +281,9 @@ impl Model {
             Some(mask)
         };
         let t_lm = Instant::now();
-        let out = self
-            .language_model
-            .forward_embeds(&inputs_embeds, attn_mask.as_ref(), index_pos)?;
+        let out =
+            self.language_model
+                .forward_embeds(&inputs_embeds, attn_mask.as_ref(), index_pos)?;
         let dt_lm = t_lm.elapsed();
         if index_pos == 0 {
             eprintln!(
@@ -367,17 +357,20 @@ mod tests {
     fn positions_and_replacement_work() -> Result<()> {
         let dev = Device::Cpu;
         // inputs_embeds: (2, 5, 4)
-        let inputs = Tensor::arange(0f32, 2.0 * 5.0 * 4.0, &dev)?
-            .reshape((2, 5, 4))?;
+        let inputs = Tensor::arange(0f32, 2.0 * 5.0 * 4.0, &dev)?.reshape((2, 5, 4))?;
 
         // positions: (0,1) and (1,3)
         let positions = vec![(0usize, 1usize), (1usize, 3usize)];
 
         // image_embeds: 2 x 4
-        let image_embeds = Tensor::from_vec(vec![
-            1.0, 1.1, 1.2, 1.3, // for (0,1)
-            2.0, 2.1, 2.2, 2.3, // for (1,3)
-        ], (2, 4), &dev)?;
+        let image_embeds = Tensor::from_vec(
+            vec![
+                1.0, 1.1, 1.2, 1.3, // for (0,1)
+                2.0, 2.1, 2.2, 2.3, // for (1,3)
+            ],
+            (2, 4),
+            &dev,
+        )?;
 
         let replaced = Model::replace_image_tokens(&inputs, &image_embeds, &positions)?;
         // Verify shape unchanged
@@ -403,8 +396,7 @@ mod tests {
         let input_ids = Tensor::from_vec(
             vec![
                 // batch 0
-                5i64, 10, 6, 7, 8,
-                // batch 1
+                5i64, 10, 6, 7, 8, // batch 1
                 9, 3, 2, 10, 1,
             ],
             (2, 5),
@@ -426,7 +418,14 @@ mod tests {
         // input_ids with no [IMG] tokens
         let input_ids = Tensor::from_vec(vec![1i64, 2, 3, 4], (1, 4), &dev)?;
         let mut cache = Mistral3Cache::default();
-        let logits = model.forward(&input_ids, None, None, &mut cache, 0, &cfg.vision_feature_layer)?;
+        let logits = model.forward(
+            &input_ids,
+            None,
+            None,
+            &mut cache,
+            0,
+            &cfg.vision_feature_layer,
+        )?;
 
         let dims = logits.dims();
         assert_eq!(*dims.last().unwrap(), cfg.text_config.inner.vocab_size);

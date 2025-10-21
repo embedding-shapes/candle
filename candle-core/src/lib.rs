@@ -70,11 +70,11 @@ pub mod layout;
 pub mod metal_backend;
 #[cfg(feature = "mkl")]
 mod mkl;
+pub mod mxfp4;
 pub mod npy;
 pub mod op;
 pub mod pickle;
 pub mod quantized;
-pub mod mxfp4;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;

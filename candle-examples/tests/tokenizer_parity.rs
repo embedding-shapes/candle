@@ -1,12 +1,17 @@
 use anyhow::Result;
-use gpt_oss_tokenizer::{render_then_encode, load_stop_token_ids, lookup_special_ids, load_special_ids_from_map};
+use gpt_oss_tokenizer::{
+    load_special_ids_from_map, load_stop_token_ids, lookup_special_ids, render_then_encode,
+};
 use openai_harmony::chat::{Message, Role};
 
 const SNAPSHOT_DIR: &str = "~/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee";
 
 fn p(s: &str) -> std::path::PathBuf {
     if let Some(rest) = s.strip_prefix("~/") {
-        std::env::var("HOME").map(std::path::PathBuf::from).unwrap().join(rest)
+        std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap()
+            .join(rest)
     } else {
         std::path::PathBuf::from(s)
     }
@@ -23,16 +28,35 @@ fn t30_tokenizer_parity_three_cases() -> Result<()> {
     let ids_ref: Vec<u32> = {
         let f = std::fs::File::open(fixtures.join("chat_simple.json"))?;
         let v: serde_json::Value = serde_json::from_reader(f)?;
-        v.get("input_ids").unwrap().as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect()
+        v.get("input_ids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect()
     };
-    let tokens = render_then_encode(&dir, &[Message::from_role_and_content(Role::User, "Explain what MXFP4 quantization is")], true)?;
+    let tokens = render_then_encode(
+        &dir,
+        &[Message::from_role_and_content(
+            Role::User,
+            "Explain what MXFP4 quantization is",
+        )],
+        true,
+    )?;
     assert_eq!(tokens, ids_ref, "simple parity failed");
 
     // Case 2: system+dev+user
     let ids_ref: Vec<u32> = {
         let f = std::fs::File::open(fixtures.join("chat_system_dev.json"))?;
         let v: serde_json::Value = serde_json::from_reader(f)?;
-        v.get("input_ids").unwrap().as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect()
+        v.get("input_ids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect()
     };
     let msgs = vec![
         Message::from_role_and_content(Role::System, "You are a helpful assistant."),
@@ -46,7 +70,13 @@ fn t30_tokenizer_parity_three_cases() -> Result<()> {
     let ids_ref: Vec<u32> = {
         let f = std::fs::File::open(fixtures.join("chat_two_turns.json"))?;
         let v: serde_json::Value = serde_json::from_reader(f)?;
-        v.get("input_ids").unwrap().as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect()
+        v.get("input_ids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect()
     };
     let msgs = vec![
         Message::from_role_and_content(Role::User, "Hi"),

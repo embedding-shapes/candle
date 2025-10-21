@@ -31,7 +31,11 @@ fn decode_fp4_e2m1(n: u8) -> f32 {
 
 #[inline]
 fn pow2_e8m0(u: u8) -> f32 {
-    if u == 0xFF { f32::NAN } else { (2f32).powi((u as i32) - 127) }
+    if u == 0xFF {
+        f32::NAN
+    } else {
+        (2f32).powi((u as i32) - 127)
+    }
 }
 
 fn l2_linf(a: &[f32], b: &[f32]) -> (f32, f32) {
@@ -41,7 +45,9 @@ fn l2_linf(a: &[f32], b: &[f32]) -> (f32, f32) {
     for i in 0..a.len() {
         let d = (a[i] - b[i]).abs();
         l2 += d * d;
-        if d > linf { linf = d; }
+        if d > linf {
+            linf = d;
+        }
     }
     (l2.sqrt(), linf)
 }
@@ -53,13 +59,15 @@ fn t_mxfp4_block_scale_parity() -> Result<()> {
 
     // Construct FP4 codes sequence length 32 with values 1..15 repeating, then 1,2
     let mut codes = [0u8; G];
-    for i in 0..G { codes[i] = 1 + (i % 15) as u8; }
+    for i in 0..G {
+        codes[i] = 1 + (i % 15) as u8;
+    }
 
     // Pack two nibbles per byte: even index -> low nibble, odd -> high nibble
     let mut packed = [0u8; 16];
     for j in 0..16 {
-        let c0 = codes[2*j] & 0x0f;      // low nibble
-        let c1 = codes[2*j + 1] & 0x0f;  // high nibble
+        let c0 = codes[2 * j] & 0x0f; // low nibble
+        let c1 = codes[2 * j + 1] & 0x0f; // high nibble
         packed[j] = c0 | (c1 << 4);
     }
 
@@ -68,7 +76,7 @@ fn t_mxfp4_block_scale_parity() -> Result<()> {
     let cols = G;
     let nblocks = 1usize;
     let blocks = Tensor::from_vec(packed.to_vec(), (rows, nblocks, 16), &dev)?; // U8 on CUDA
-    let scales = Tensor::from_vec(vec![129u8], (rows, nblocks), &dev)?;         // E8M0=129 => 4.0
+    let scales = Tensor::from_vec(vec![129u8], (rows, nblocks), &dev)?; // E8M0=129 => 4.0
 
     // Run CUDA dequant to BF16
     let out = candle_core::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [rows, cols])?;
@@ -83,12 +91,15 @@ fn t_mxfp4_block_scale_parity() -> Result<()> {
         let byte = packed[j];
         let lo = byte & 0x0f;
         let hi = byte >> 4;
-        let c0 = 2*j;
+        let c0 = 2 * j;
         let c1 = c0 + 1;
         exp_real[c0] = decode_fp4_e2m1(lo) * scale;
         exp_real[c1] = decode_fp4_e2m1(hi) * scale;
     }
-    let exp_bf16: Vec<f32> = exp_real.iter().map(|v| bf16::from_f32(*v).to_f32()).collect();
+    let exp_bf16: Vec<f32> = exp_real
+        .iter()
+        .map(|v| bf16::from_f32(*v).to_f32())
+        .collect();
 
     // Logs: dtypes/devices/shapes/strides and sample values
     println!("blocks dtype u8 device cuda:0 shape [1,1,16] strides [16,16,1]");
@@ -101,13 +112,31 @@ fn t_mxfp4_block_scale_parity() -> Result<()> {
 
     // Stats
     let mean = |v: &[f32]| v.iter().copied().sum::<f32>() / v.len() as f32;
-    let std = |v: &[f32], m: f32| (v.iter().map(|x| (x - m).powi(2)).sum::<f32>() / v.len() as f32).sqrt();
-    let (emin, emax) = exp_bf16.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), &x| (mn.min(x), mx.max(x)));
-    let (amin, amax) = act.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), &x| (mn.min(x), mx.max(x)));
-    let em = mean(&exp_bf16); let es = std(&exp_bf16, em);
-    let am = mean(&act); let asd = std(&act, am);
-    println!("Expected stats: mean={:.6} std={:.6} min={:.6} max={:.6}", em, es, emin, emax);
-    println!("Actual   stats: mean={:.6} std={:.6} min={:.6} max={:.6}", am, asd, amin, amax);
+    let std = |v: &[f32], m: f32| {
+        (v.iter().map(|x| (x - m).powi(2)).sum::<f32>() / v.len() as f32).sqrt()
+    };
+    let (emin, emax) = exp_bf16
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), &x| {
+            (mn.min(x), mx.max(x))
+        });
+    let (amin, amax) = act
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), &x| {
+            (mn.min(x), mx.max(x))
+        });
+    let em = mean(&exp_bf16);
+    let es = std(&exp_bf16, em);
+    let am = mean(&act);
+    let asd = std(&act, am);
+    println!(
+        "Expected stats: mean={:.6} std={:.6} min={:.6} max={:.6}",
+        em, es, emin, emax
+    );
+    println!(
+        "Actual   stats: mean={:.6} std={:.6} min={:.6} max={:.6}",
+        am, asd, amin, amax
+    );
 
     // Compare
     let (l2, linf) = l2_linf(&exp_bf16, &act);

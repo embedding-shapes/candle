@@ -61,7 +61,10 @@ fn hub_load_local_safetensors<P: AsRef<std::path::Path>>(
             safetensors_files.insert(file);
         }
     }
-    let safetensors_files: Vec<_> = safetensors_files.into_iter().map(|v| path.join(v)).collect();
+    let safetensors_files: Vec<_> = safetensors_files
+        .into_iter()
+        .map(|v| path.join(v))
+        .collect();
     Ok(safetensors_files)
 }
 
@@ -72,8 +75,15 @@ fn gpt_oss_step0_logits_chain_parity() -> Result<()> {
         Ok(d) => d,
         Err(_) => return Ok(()),
     };
-    let mut dtype = if device.supports_bf16() { DType::BF16 } else { DType::F16 };
-    if matches!(std::env::var("CANDLE_FORCE_BF16").ok().as_deref(), Some("1") | Some("true") | Some("TRUE")) {
+    let mut dtype = if device.supports_bf16() {
+        DType::BF16
+    } else {
+        DType::F16
+    };
+    if matches!(
+        std::env::var("CANDLE_FORCE_BF16").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    ) {
         dtype = DType::BF16;
     }
     eprintln!("device={:?} dtype={:?}", device, dtype);
@@ -89,16 +99,31 @@ fn gpt_oss_step0_logits_chain_parity() -> Result<()> {
     let input_ids = render_then_encode(&snap, &[msg], true)?;
     // Debug inputs
     eprintln!("seed=0 prompt='{}'", PROMPT);
-    eprintln!("prompt_ids_len={} first32={:?}", input_ids.len(), &input_ids.iter().take(32).collect::<Vec<_>>());
-    let decoded = hf_tok.decode(&input_ids, /*skip_special_tokens=*/ false).unwrap();
-    eprintln!("decoded_tail_last_64={}", &decoded[decoded.len().saturating_sub(64)..]);
-    assert!(decoded.contains("<|start|>assistant"), "render must end with <|start|>assistant");
+    eprintln!(
+        "prompt_ids_len={} first32={:?}",
+        input_ids.len(),
+        &input_ids.iter().take(32).collect::<Vec<_>>()
+    );
+    let decoded = hf_tok
+        .decode(&input_ids, /*skip_special_tokens=*/ false)
+        .unwrap();
+    eprintln!(
+        "decoded_tail_last_64={}",
+        &decoded[decoded.len().saturating_sub(64)..]
+    );
+    assert!(
+        decoded.contains("<|start|>assistant"),
+        "render must end with <|start|>assistant"
+    );
 
     // Load config + model weights exactly like the example.
     let cfg_bytes = std::fs::read(snap.join("config.json"))?;
     let cfg: GptOssConfig = serde_json::from_slice(&cfg_bytes)?;
     let model_files = hub_load_local_safetensors(&snap, "model.safetensors.index.json")?;
-    assert!(!model_files.is_empty(), "no safetensors shards found under snapshot");
+    assert!(
+        !model_files.is_empty(),
+        "no safetensors shards found under snapshot"
+    );
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, &device)? };
     let mut model = GptOssModel::load(vb, &cfg)?;
 
@@ -131,7 +156,9 @@ fn gpt_oss_step0_logits_chain_parity() -> Result<()> {
         "<|constrain|>",
         "<|start|>",
     ] {
-        if let Some(id) = hf_tok.token_to_id(s) { global_forbid.insert(id); }
+        if let Some(id) = hf_tok.token_to_id(s) {
+            global_forbid.insert(id);
+        }
     }
     let id_channel = hf_tok.token_to_id("<|channel|>").unwrap() as usize; // 200005
     let id_message = hf_tok.token_to_id("<|message|>").unwrap() as usize; // 200008
@@ -148,9 +175,15 @@ fn gpt_oss_step0_logits_chain_parity() -> Result<()> {
     let allow_syms = allowed_specials_for_next(&decoded);
     let mut allow_ids: std::collections::BTreeSet<u32> = Default::default();
     for s in allow_syms.iter() {
-        if let Some(id) = hf_tok.token_to_id(s) { allow_ids.insert(id); }
+        if let Some(id) = hf_tok.token_to_id(s) {
+            allow_ids.insert(id);
+        }
     }
-    let to_mask: Vec<u32> = global_forbid.iter().copied().filter(|id| !allow_ids.contains(id)).collect();
+    let to_mask: Vec<u32> = global_forbid
+        .iter()
+        .copied()
+        .filter(|id| !allow_ids.contains(id))
+        .collect();
     eprintln!(
         "fsm_state=AfterAssistant allow_size={} forbid_size={} allow_has_channel={} allow_syms={:?}",
         allow_ids.len(), global_forbid.len(), allow_ids.contains(&(id_channel as u32)), allow_syms
@@ -162,7 +195,9 @@ fn gpt_oss_step0_logits_chain_parity() -> Result<()> {
     let _ = sampler.sample_f(&last_f32, |prs: &mut [f32]| {
         for id in &to_mask {
             let i = *id as usize;
-            if i < prs.len() { prs[i] = 0.0; }
+            if i < prs.len() {
+                prs[i] = 0.0;
+            }
         }
         captured_post = Some(prs.to_vec());
     })?;
@@ -176,7 +211,10 @@ fn gpt_oss_step0_logits_chain_parity() -> Result<()> {
     // Log trace for the single critical id
     eprintln!(
         "trace=[('temp', {:.6}, {}), ('mask', {:.6}, {})]",
-        probs_pre_v[id_channel], argmax(&probs_pre_v), post[id_channel], id_post
+        probs_pre_v[id_channel],
+        argmax(&probs_pre_v),
+        post[id_channel],
+        id_post
     );
     eprintln!(
         "id_channel={} pre={:.6} post={:.6} masked?={} | id_message={} post={:.6} | id_return={} post={:.6} | id_call={} post={:.6} | id_end={} post={:.6}",
@@ -185,19 +223,39 @@ fn gpt_oss_step0_logits_chain_parity() -> Result<()> {
     );
     // Normal token invariants
     for &tid in &[11usize, 13usize, 25usize, 220usize] {
-        assert_eq!(post[tid], probs_pre_v[tid], "normal token {} must be unchanged by special masking", tid);
+        assert_eq!(
+            post[tid], probs_pre_v[tid],
+            "normal token {} must be unchanged by special masking",
+            tid
+        );
     }
 
     // Stop token policy parity check
     let stop_ids = load_stop_token_ids(&snap)?;
     eprintln!("stop_token_ids={:?}", stop_ids);
-    assert!(stop_ids.contains(&(id_return as u32)) && stop_ids.contains(&(id_call as u32)), "stop set must contain <|return|> and <|call|>");
+    assert!(
+        stop_ids.contains(&(id_return as u32)) && stop_ids.contains(&(id_call as u32)),
+        "stop set must contain <|return|> and <|call|>"
+    );
 
     // Assertions per the spec
-    assert_eq!(id_raw, id_channel, "raw argmax must be <|channel|> (id {})", id_channel);
-    assert!(post[id_channel].is_finite() && post[id_channel] > 0.0, "channel must remain unmasked and finite");
-    assert_eq!(id_post, id_channel, "post-mask argmax must remain <|channel|>");
-    assert_eq!(post[id_message], 0.0, "<|message|> must be masked at step 0");
+    assert_eq!(
+        id_raw, id_channel,
+        "raw argmax must be <|channel|> (id {})",
+        id_channel
+    );
+    assert!(
+        post[id_channel].is_finite() && post[id_channel] > 0.0,
+        "channel must remain unmasked and finite"
+    );
+    assert_eq!(
+        id_post, id_channel,
+        "post-mask argmax must remain <|channel|>"
+    );
+    assert_eq!(
+        post[id_message], 0.0,
+        "<|message|> must be masked at step 0"
+    );
     assert_eq!(post[id_return], 0.0, "<|return|> must be masked at step 0");
     assert_eq!(post[id_call], 0.0, "<|call|> must be masked at step 0");
     assert_eq!(post[id_end], 0.0, "<|end|> must be masked at step 0");

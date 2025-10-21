@@ -10,7 +10,10 @@ fn bf16_rand(shape: (usize, usize), dev: &Device) -> Tensor {
     for i in 0..v.len() {
         v[i] = ((i % 13) as f32) * 0.01 - 0.06;
     }
-    Tensor::from_vec(v, shape, dev).unwrap().to_dtype(DType::BF16).unwrap()
+    Tensor::from_vec(v, shape, dev)
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap()
 }
 
 fn u8_pattern(shape: (usize, usize, usize), dev: &Device) -> Tensor {
@@ -49,8 +52,14 @@ fn t19_minimal_forward_shape_dtype() -> Result<()> {
     let mut tmap: HashMap<String, Tensor> = HashMap::new();
 
     // Embedding and norm
-    tmap.insert("model.embed_tokens.weight".into(), bf16_rand((cfg.vocab_size, cfg.hidden_size), &dev));
-    tmap.insert("model.norm.weight".into(), bf16_rand((1, cfg.hidden_size), &dev).reshape(cfg.hidden_size)?);
+    tmap.insert(
+        "model.embed_tokens.weight".into(),
+        bf16_rand((cfg.vocab_size, cfg.hidden_size), &dev),
+    );
+    tmap.insert(
+        "model.norm.weight".into(),
+        bf16_rand((1, cfg.hidden_size), &dev).reshape(cfg.hidden_size)?,
+    );
 
     // Layer 0 attention weights
     let l0 = 0usize;
@@ -65,14 +74,32 @@ fn t19_minimal_forward_shape_dtype() -> Result<()> {
         format!("model.layers.{l0}.post_attention_layernorm.weight"),
         bf16_rand((1, cfg.hidden_size), &dev).reshape(cfg.hidden_size)?,
     );
-    tmap.insert(format!("model.layers.{l0}.self_attn.q_proj.weight"), bf16_rand((q_out, cfg.hidden_size), &dev));
-    tmap.insert(format!("model.layers.{l0}.self_attn.k_proj.weight"), bf16_rand((kv_out, cfg.hidden_size), &dev));
-    tmap.insert(format!("model.layers.{l0}.self_attn.v_proj.weight"), bf16_rand((kv_out, cfg.hidden_size), &dev));
-    tmap.insert(format!("model.layers.{l0}.self_attn.o_proj.weight"), bf16_rand((cfg.hidden_size, q_out), &dev));
-    tmap.insert(format!("model.layers.{l0}.self_attn.sinks"), bf16_rand((1, cfg.num_attention_heads), &dev).reshape(cfg.num_attention_heads)?);
+    tmap.insert(
+        format!("model.layers.{l0}.self_attn.q_proj.weight"),
+        bf16_rand((q_out, cfg.hidden_size), &dev),
+    );
+    tmap.insert(
+        format!("model.layers.{l0}.self_attn.k_proj.weight"),
+        bf16_rand((kv_out, cfg.hidden_size), &dev),
+    );
+    tmap.insert(
+        format!("model.layers.{l0}.self_attn.v_proj.weight"),
+        bf16_rand((kv_out, cfg.hidden_size), &dev),
+    );
+    tmap.insert(
+        format!("model.layers.{l0}.self_attn.o_proj.weight"),
+        bf16_rand((cfg.hidden_size, q_out), &dev),
+    );
+    tmap.insert(
+        format!("model.layers.{l0}.self_attn.sinks"),
+        bf16_rand((1, cfg.num_attention_heads), &dev).reshape(cfg.num_attention_heads)?,
+    );
 
     // Router
-    tmap.insert(format!("model.layers.{l0}.mlp.router.weight"), bf16_rand((cfg.num_local_experts, cfg.hidden_size), &dev));
+    tmap.insert(
+        format!("model.layers.{l0}.mlp.router.weight"),
+        bf16_rand((cfg.num_local_experts, cfg.hidden_size), &dev),
+    );
 
     // Experts: supply MXFP4 blocks+scales per expert with correct shapes
     let nblocks_gate = cfg.hidden_size / 32;
@@ -97,7 +124,10 @@ fn t19_minimal_forward_shape_dtype() -> Result<()> {
     }
 
     // LM head
-    tmap.insert("lm_head.weight".into(), bf16_rand((cfg.vocab_size, cfg.hidden_size), &dev));
+    tmap.insert(
+        "lm_head.weight".into(),
+        bf16_rand((cfg.vocab_size, cfg.hidden_size), &dev),
+    );
 
     let vb = candle_nn::VarBuilder::from_tensors(tmap, DType::BF16, &dev);
     let model = GptOssModel::load(vb, &cfg)?;

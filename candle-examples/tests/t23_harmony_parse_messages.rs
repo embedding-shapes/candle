@@ -1,5 +1,8 @@
 use anyhow::Result;
-use openai_harmony::{chat::{Message, Role}, load_harmony_encoding, HarmonyEncodingName};
+use openai_harmony::{
+    chat::{Message, Role},
+    load_harmony_encoding, HarmonyEncodingName,
+};
 
 // T23 Harmony parse: ensure assistant header requires <|channel|> then text under <|message|>,
 // and that parsing yields the expected assistant message with channel "final".
@@ -30,7 +33,9 @@ fn t23_harmony_parse_messages_with_channel() -> Result<()> {
     assert_eq!(last.channel.as_deref(), Some("final"));
     let mut content = String::new();
     for c in &last.content {
-        if let openai_harmony::chat::Content::Text(t) = c { content.push_str(&t.text); }
+        if let openai_harmony::chat::Content::Text(t) = c {
+            content.push_str(&t.text);
+        }
     }
     assert!(content.contains("hello"));
     Ok(())

@@ -27,9 +27,9 @@ fn test_expert3_matmul_simple_input() -> Result<()> {
     // Load Expert 3 gate_up_proj weights
     let layer0_vb = vb.pp("model.layers.0.mlp");
     let gate_up = gpt_oss::load_expert_linear_mxfp4_grouped(
-        2880,  // in_dim
-        5760,  // out_dim
-        true,  // has bias
+        2880, // in_dim
+        5760, // out_dim
+        true, // has bias
         layer0_vb,
         "experts.gate_up_proj",
         3,  // expert_idx = 3

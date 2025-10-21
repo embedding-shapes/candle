@@ -53,7 +53,10 @@ fn main() -> Result<()> {
     println!("Expected bytes:       [66, 197, 60, 198, 140, 69, 17, 237, 137, 198, 9, 1, 149, 4, 176, 37]");
     println!("Expected scale:       121");
 
-    let bytes_match = blocks_u8[0][0] == [66, 197, 60, 198, 140, 69, 17, 237, 137, 198, 9, 1, 149, 4, 176, 37];
+    let bytes_match = blocks_u8[0][0]
+        == [
+            66, 197, 60, 198, 140, 69, 17, 237, 137, 198, 9, 1, 149, 4, 176, 37,
+        ];
     let scale_match = scales_u8[0][0] == 121;
 
     if bytes_match && scale_match {
@@ -69,10 +72,14 @@ fn main() -> Result<()> {
     let weight = candle_core::mxfp4::dequant_mxfp4_to_bf16(
         &blocks,
         &scales,
-        [INTERMEDIATE_SIZE, HIDDEN_SIZE]
+        [INTERMEDIATE_SIZE, HIDDEN_SIZE],
     )?;
 
-    println!("Dequantized weight shape: {:?}, dtype: {:?}", weight.dims(), weight.dtype());
+    println!(
+        "Dequantized weight shape: {:?}, dtype: {:?}",
+        weight.dims(),
+        weight.dtype()
+    );
 
     // Convert to f32 for comparison
     let weight_f32 = weight.to_dtype(DType::F32)?;
@@ -80,7 +87,9 @@ fn main() -> Result<()> {
 
     println!("\nRow 0, first 8 values:");
     println!("Rust:     {:?}", &weight_vec[0][0..8]);
-    println!("Expected: [0.015625, 0.03125, 0.046875, -0.03125, -0.03125, 0.0234375, 0.0625, -0.03125]");
+    println!(
+        "Expected: [0.015625, 0.03125, 0.046875, -0.03125, -0.03125, 0.0234375, 0.0625, -0.03125]"
+    );
 
     let expected_row0: Vec<f32> = vec![
         0.015625, 0.03125, 0.046875, -0.03125, -0.03125, 0.0234375, 0.0625, -0.03125,

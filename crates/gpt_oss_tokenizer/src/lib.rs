@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use minijinja::{context, Environment};
-use openai_harmony::chat::{Message as HarmonyMessage, Role as HarmonyRole, Content};
+use openai_harmony::chat::{Content, Message as HarmonyMessage, Role as HarmonyRole};
 use serde::Serialize;
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -65,17 +65,23 @@ pub fn render_then_encode<P: AsRef<Path>>(
         for c in &m.content {
             match c {
                 Content::Text(tc) => {
-                    if !text.is_empty() { text.push_str(""); }
+                    if !text.is_empty() {
+                        text.push_str("");
+                    }
                     text.push_str(&tc.text);
                 }
                 Content::SystemContent(sc) => {
                     // Serialize structured system content as JSON fallback.
-                    if !text.is_empty() { text.push_str(""); }
+                    if !text.is_empty() {
+                        text.push_str("");
+                    }
                     let s = serde_json::to_string(sc).unwrap_or_default();
                     text.push_str(&s);
                 }
                 Content::DeveloperContent(dc) => {
-                    if !text.is_empty() { text.push_str(""); }
+                    if !text.is_empty() {
+                        text.push_str("");
+                    }
                     let s = serde_json::to_string(dc).unwrap_or_default();
                     text.push_str(&s);
                 }
@@ -83,7 +89,11 @@ pub fn render_then_encode<P: AsRef<Path>>(
         }
         let content = Some(text);
         let thinking = None;
-        jmsgs.push(JinjaMessage { role, content, thinking });
+        jmsgs.push(JinjaMessage {
+            role,
+            content,
+            thinking,
+        });
     }
 
     // Render template using minijinja
@@ -95,13 +105,14 @@ pub fn render_then_encode<P: AsRef<Path>>(
     });
     env.add_template("chat_template", &template_src)?;
     let tmpl = env.get_template("chat_template")?;
-    let rendered = tmpl.render(context! { messages => jmsgs, add_generation_prompt => add_generation_prompt })
+    let rendered = tmpl
+        .render(context! { messages => jmsgs, add_generation_prompt => add_generation_prompt })
         .context("failed to render chat template")?;
 
     // Encode with tokenizer; special tokens appear verbatim in the rendered string
     // and are registered as added tokens in tokenizer.json, so a regular encode preserves them.
     let enc = tokenizer
-        .encode(rendered, /*add_special_tokens=*/false)
+        .encode(rendered, /*add_special_tokens=*/ false)
         .map_err(|e| anyhow::anyhow!("tokenizer.encode failed: {e}"))?;
     Ok(enc.get_ids().to_vec())
 }
@@ -117,25 +128,31 @@ pub fn load_stop_token_ids<P: AsRef<Path>>(snapshot_dir: P) -> Result<Vec<u32>> 
         pad_token_id: Option<u32>,
     }
     let path = snapshot_dir.as_ref().join(GENERATION_CONFIG_FILE);
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let cfg: GenCfg = serde_json::from_slice(&bytes).context("invalid generation_config.json")?;
 
     let mut ids = Vec::new();
     if let Some(eos) = cfg.eos_token_id {
         match eos {
             serde_json::Value::Number(n) => {
-                if let Some(v) = n.as_u64() { ids.push(v as u32) }
+                if let Some(v) = n.as_u64() {
+                    ids.push(v as u32)
+                }
             }
             serde_json::Value::Array(arr) => {
                 for v in arr {
-                    if let Some(n) = v.as_u64() { ids.push(n as u32) }
+                    if let Some(n) = v.as_u64() {
+                        ids.push(n as u32)
+                    }
                 }
             }
             _ => {}
         }
     }
-    if let Some(pad) = cfg.pad_token_id { ids.push(pad) }
+    if let Some(pad) = cfg.pad_token_id {
+        ids.push(pad)
+    }
     ids.sort_unstable();
     ids.dedup();
     Ok(ids)
@@ -146,10 +163,18 @@ pub fn lookup_special_ids<P: AsRef<Path>>(snapshot_dir: P) -> Result<(u32, u32, 
     let tokenizer_path = snapshot_dir.as_ref().join(TOKENIZER_FILE);
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
-    let bos = tokenizer.token_to_id("<|startoftext|>").context("missing BOS token id")?;
-    let pad = tokenizer.token_to_id("<|endoftext|>").context("missing PAD token id")?;
-    let ret = tokenizer.token_to_id("<|return|>").context("missing <|return|> id")?;
-    let call = tokenizer.token_to_id("<|call|>").context("missing <|call|> id")?;
+    let bos = tokenizer
+        .token_to_id("<|startoftext|>")
+        .context("missing BOS token id")?;
+    let pad = tokenizer
+        .token_to_id("<|endoftext|>")
+        .context("missing PAD token id")?;
+    let ret = tokenizer
+        .token_to_id("<|return|>")
+        .context("missing <|return|> id")?;
+    let call = tokenizer
+        .token_to_id("<|call|>")
+        .context("missing <|call|> id")?;
     Ok((bos, pad, ret, call))
 }
 
