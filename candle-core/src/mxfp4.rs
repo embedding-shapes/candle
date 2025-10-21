@@ -397,6 +397,120 @@ pub fn matmul_mxfp4_bf16_cuda(
 }
 
 #[cfg(feature = "cuda")]
+pub fn matmul_mxfp4_bf16_mmq_cuda(
+    act: &Tensor,
+    blocks: &Tensor,
+    scales: &Tensor,
+    rows: usize,
+    out_dim: usize,
+    nblocks: usize,
+    in_dim: usize,
+) -> Result<Tensor> {
+    use crate::{cuda_backend::WrapErr, op::BackpropOp, storage::Storage, CudaDevice, CudaStorage};
+    use cudarc::driver::PushKernelArg;
+
+    let dev: &CudaDevice = act.device().as_cuda_device()?;
+
+    // Extract activation tensor (same as existing function)
+    let act_base = if act.is_contiguous() {
+        act.clone()
+    } else {
+        act.contiguous()?
+    };
+    let (act_storage, act_layout) = act_base.storage_and_layout();
+    let act_offset = act_layout.start_offset();
+    let act_view_base = match &*act_storage {
+        Storage::Cuda(s) => s.as_cuda_slice::<bf16>()?,
+        _ => bail!("expected CUDA storage for activations"),
+    };
+    let act_view = act_view_base.slice(act_offset..);
+    let act_strides = act_layout.stride();
+    if act_strides.len() != 2 || act_strides[1] != 1 {
+        bail!("matmul_mxfp4_bf16_mmq_cuda expects row-major activations (stride[1] == 1)")
+    }
+    let act_row_stride = act_strides[0];
+
+    // Extract blocks tensor
+    let blocks_base = if blocks.is_contiguous() {
+        blocks.clone()
+    } else {
+        blocks.contiguous()?
+    };
+    let (blocks_storage, blocks_layout) = blocks_base.storage_and_layout();
+    let blocks_offset = blocks_layout.start_offset();
+    let blocks_view_base = match &*blocks_storage {
+        Storage::Cuda(s) => s.as_cuda_slice::<u8>()?,
+        _ => bail!("expected CUDA storage for MXFP4 blocks"),
+    };
+    let blocks_view = blocks_view_base.slice(blocks_offset..);
+
+    // Extract scales tensor
+    let scales_base = if scales.is_contiguous() {
+        scales.clone()
+    } else {
+        scales.contiguous()?
+    };
+    let (scales_storage, scales_layout) = scales_base.storage_and_layout();
+    let scales_offset = scales_layout.start_offset();
+    let scales_view_base = match &*scales_storage {
+        Storage::Cuda(s) => s.as_cuda_slice::<u8>()?,
+        _ => bail!("expected CUDA storage for MXFP4 scales"),
+    };
+    let scales_view = scales_view_base.slice(scales_offset..);
+
+    // Allocate output buffer
+    let mut out_slice = unsafe { dev.alloc::<bf16>(rows * out_dim)? };
+
+    // MMQ tile configuration (must match kernel constants)
+    const MMQ_Y: usize = 4;   // Rows per tile
+    const MMQ_X: usize = 64;  // Columns per tile
+    const NWARPS: usize = 4;  // 4 warps per block
+
+    // Calculate grid dimensions for tiling
+    let grid_x = (rows + MMQ_Y - 1) / MMQ_Y;        // Row tiles
+    let grid_y = (out_dim + MMQ_X - 1) / MMQ_X;     // Column tiles
+
+    // Load and launch MMQ kernel
+    let func = dev.get_or_load_func("matmul_mxfp4_bf16_mmq", &candle_kernels::QUANTIZED)?;
+
+    // Shared memory: weight_qs[MMQ_X * 65] + weight_scales[MMQ_X * 32]
+    // = 64 * 65 * 4 + 64 * 32 * 4 = 16640 + 8192 = 24832 bytes
+    let shared_mem_bytes = (MMQ_X * 65 * 4 + MMQ_X * 32 * 4) as u32;
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (grid_x as u32, grid_y as u32, 1),
+        block_dim: (32, NWARPS as u32, 1),  // 32 threads × 4 warps = 128 threads
+        shared_mem_bytes,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(&act_view);
+    builder.arg(&blocks_view);
+    builder.arg(&scales_view);
+    builder.arg(&mut out_slice);
+    crate::builder_arg!(
+        builder,
+        rows as i32,
+        out_dim as i32,
+        nblocks as i32,
+        in_dim as i32,
+        act_row_stride as i32,
+        out_dim as i32  // out_row_stride
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    // Wrap output in tensor
+    let out_storage = CudaStorage::wrap_cuda_slice(out_slice, dev.clone());
+    let tensor = crate::tensor::from_storage(
+        crate::storage::Storage::Cuda(out_storage),
+        (rows, out_dim),
+        BackpropOp::none(),
+        false,
+    );
+    Ok(tensor)
+}
+
+#[cfg(feature = "cuda")]
 /// Fused expert activation for GPT-OSS
 /// Input: gate_up [batch, 2*expert_dim] interleaved (even=gate, odd=up)
 /// Output: [batch, expert_dim] = (up+1) * gate * sigmoid(alpha*gate) with asymmetric clamping
@@ -492,7 +606,17 @@ pub fn matmul_mxfp4_bf16(act: &Tensor, blocks: &Tensor, scales: &Tensor) -> Resu
         Device::Cuda(_) => {
             #[cfg(feature = "cuda")]
             {
-                return matmul_mxfp4_bf16_cuda(act, blocks, scales, rows, out_dim, nblocks, in_dim);
+                // Check if MMQ kernel should be used (via environment variable)
+                let use_mmq = matches!(
+                    std::env::var("CANDLE_MXFP4_USE_MMQ").ok().as_deref(),
+                    Some("1") | Some("true") | Some("TRUE")
+                );
+
+                if use_mmq {
+                    return matmul_mxfp4_bf16_mmq_cuda(act, blocks, scales, rows, out_dim, nblocks, in_dim);
+                } else {
+                    return matmul_mxfp4_bf16_cuda(act, blocks, scales, rows, out_dim, nblocks, in_dim);
+                }
             }
             #[cfg(not(feature = "cuda"))]
             {

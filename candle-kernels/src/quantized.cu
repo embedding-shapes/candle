@@ -6,7 +6,7 @@
 #include<math.h>
 
 #ifndef MATMUL_MXFP4_TILE_K_BLOCKS
-#define MATMUL_MXFP4_TILE_K_BLOCKS 32
+#define MATMUL_MXFP4_TILE_K_BLOCKS 64
 #endif
 
 #define GGML_UNUSED(x) (void)(x)
@@ -96,6 +96,105 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
     return c + a8[0]*b8[0] + a8[1]*b8[1] + a8[2]*b8[2] + a8[3]*b8[3];
 #endif // __CUDA_ARCH__ >= MIN_CC_DP4A
 }
+
+// MXFP4 lookup table for FP4 -> INT8 conversion (e2m1 values doubled)
+// Used with __dp4a for efficient int8 dot products
+// Ref: llama.cpp ggml-common.h:1094
+__device__ __constant__ int8_t kvalues_mxfp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+};
+
+// Extract 32-bit int from byte array at 4-byte aligned position
+// Used for reading packed FP4 nibbles from MXFP4 blocks
+// Ref: llama.cpp vecdotq.cuh:7
+static __device__ __forceinline__ int get_int_b1(const void * x, const int & i32) {
+    const uint8_t * x8 = (const uint8_t *) x;
+    int x32  = x8[4*i32 + 0] <<  0;
+    x32     |= x8[4*i32 + 1] <<  8;
+    x32     |= x8[4*i32 + 2] << 16;
+    x32     |= x8[4*i32 + 3] << 24;
+    return x32;
+}
+
+// Ultra-efficient 4-bit nibble lookup using __byte_perm instruction
+// Takes 8 nibbles (4-bit indices) packed in q4, returns int2 with:
+//   .x = bytes at even indices (0,2,4,6)
+//   .y = bytes at odd indices (1,3,5,7)
+// This is CRITICAL for MMQ performance - enables fast MXFP4 dequantization
+// Ref: llama.cpp vecdotq.cuh:34-94
+static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, const int8_t * table) {
+#if defined(__HIP_PLATFORM_AMD__)
+    // AMD ROCm implementation using __builtin_amdgcn_perm
+    const uint32_t *values = (const uint32_t *)table;
+    const uint32_t q_even = q4;
+    const uint32_t q_odd  = (q4 >> 4);
+
+    // Lookup in lower half (indices 0-7)
+    uint32_t v_even_low = __builtin_amdgcn_perm(values[1], values[0], q_even & 0x07070707);
+    uint32_t v_odd_low = __builtin_amdgcn_perm(values[1], values[0], q_odd & 0x07070707);
+
+    // Lookup in upper half (indices 8-15)
+    uint32_t v_even_high = __builtin_amdgcn_perm(values[3], values[2], q_even & 0x07070707);
+    uint32_t v_odd_high = __builtin_amdgcn_perm(values[3], values[2], q_odd & 0x07070707);
+
+    // Select based on MSB of each index nibble
+    uint32_t mask_even = 0x03020100 | ((q_even & 0x08080808) >> 1);
+    uint32_t res_x = __builtin_amdgcn_perm(v_even_high, v_even_low, mask_even);
+    uint32_t mask_odd = 0x03020100 | ((q_odd & 0x08080808) >> 1);
+    uint32_t res_y = __builtin_amdgcn_perm(v_odd_high, v_odd_low, mask_odd);
+
+    return make_int2(res_x, res_y);
+#else
+    // NVIDIA CUDA implementation using __byte_perm
+    // __byte_perm selects bytes using 3-bit indices (lower 16 bits of 3rd arg)
+    // To handle the 4th bit, we do two __byte_perm calls for low/high halves,
+    // then select between them based on the 4th bit
+    const uint32_t * table32 = (const uint32_t *) table;
+
+    uint32_t tmp[2];
+    const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
+
+#pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t shift = 16 * i;
+
+        // Select from low 64 bits of table using low 3 bits
+        const uint32_t low  = __byte_perm(table32[0], table32[1], q4 >> shift);
+        // Select from high 64 bits of table using low 3 bits
+        const uint32_t high = __byte_perm(table32[2], table32[3], q4 >> shift);
+        // Select between low and high based on 4th bit
+        tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
+    }
+
+    // tmp contains bytes in same order as nibbles in q4
+    // Now reorder to put even/odd indices into separate ints
+    return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
+#endif
+}
+
+// Convert E8M0 scale (8-bit exponent, 0 mantissa bits) to float32
+// E8M0 stores just the exponent byte of IEEE 754, used as block-wise scale in MXFP4
+// Special case: x=0 maps to 2^-127 (smallest normal float32)
+// Otherwise: directly use x as exponent bits (shift left 23 to FP32 position)
+// Ref: llama.cpp common.cuh:604
+static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
+    // Manual conversion: E8M0 byte becomes exponent bits of float32
+    uint32_t bits;
+    if (x == 0) {
+        bits = 0x00400000;  // 2^-127 (smallest positive normal float)
+    } else {
+        bits = (uint32_t) x << 23;  // Move exponent to bits [30:23]
+    }
+
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+// MXFP4 constants (ref: llama.cpp ggml-common.h)
+#define QK_MXFP4  32  // 32 FP4 values per block
+#define QR_MXFP4  2   // Ratio (related to expansion when dequantizing)
+#define QI_MXFP4  4   // 4-way interleaving in quantized representation (QK_MXFP4/(4*QR_MXFP4))
 
 
 #define  MMQ_X_Q4_0_RDNA2  64
@@ -2618,6 +2717,229 @@ extern "C" __global__ void mxfp4_unpack(
     const uint8_t v = in[idx];
     hi[idx] = v >> 4;
     lo[idx] = v & 0x0f;
+}
+
+// ============================================================================
+// MMQ (Multi-row Matrix Quantized) MXFP4 Tile Loading
+// ============================================================================
+// Loads and dequantizes MXFP4 weights into shared memory for efficient MMQ matmul.
+// Adapted from llama.cpp mmq.cuh:699-762 for Candle's separate blocks/scales layout.
+//
+// Key differences from llama.cpp:
+// - Candle stores blocks [out_dim, nblocks, 16] and scales [out_dim, nblocks] separately
+// - llama.cpp uses struct block_mxfp4 { uint8_t e; uint8_t qs[16]; } (interleaved)
+//
+// This function cooperatively loads mmq_y rows × 32 elements per block tile into shared memory.
+// Each thread handles specific nibble positions using warp-level cooperation.
+//
+// Template parameters:
+//   mmq_y: Number of rows to load per tile (e.g., 64)
+//
+// Memory layout after loading:
+//   weight_qs_shared[row][col]: INT8 dequantized values (65-col stride for bank conflict avoidance)
+//   weight_scales_shared[row][block_idx]: FP32 scales
+//
+// Ref: llama.cpp mmq.cuh load_tiles_mxfp4
+template <int mmq_y>
+static __device__ __forceinline__ void load_tiles_mxfp4(
+    const uint8_t* __restrict__ blocks,          // Candle: [out_dim, nblocks, 16]
+    const uint8_t* __restrict__ scales,          // Candle: [out_dim, nblocks]
+    int* __restrict__ weight_qs_shared,          // Output: INT8 values [mmq_y][65]
+    float* __restrict__ weight_scales_shared,    // Output: FP32 scales [mmq_y][32]
+    const int row_offset,                        // Starting row in weight matrix
+    const int block_offset,                      // Starting block in K dimension
+    const int nblocks                            // Total blocks per row (stride)
+) {
+    const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    const int kbx = tid / QI_MXFP4;    // Which MXFP4 block (0-7 for 32 threads)
+    const int kqsx = tid % QI_MXFP4;   // Which nibble position within block (0-3)
+
+    // Each thread loads elements for mmq_y rows
+    // Using strided access for warp cooperation
+    for (int row_local = threadIdx.y; row_local < mmq_y; row_local += blockDim.y) {
+        const int row_global = row_offset + row_local;
+        const int block_global = block_offset + kbx;
+
+        // Calculate pointers to this block's data in Candle's layout
+        // blocks: [out_dim, nblocks, 16] → blocks[row_global * nblocks * 16 + block_global * 16]
+        // scales: [out_dim, nblocks]     → scales[row_global * nblocks + block_global]
+        const uint8_t* block_data = blocks + (row_global * nblocks + block_global) * 16;
+        const uint8_t  block_scale = scales[row_global * nblocks + block_global];
+
+        // Load packed nibbles and dequantize using lookup table
+        const int aux_q4 = get_int_b1(block_data, kqsx);  // Load 4 bytes = 8 nibbles
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);  // Lookup → INT8
+
+        // Store INT8 values to shared memory
+        // Layout: [row_local][col] with 65-column stride (padding for bank conflicts)
+        const int k0 = kbx * 8 + kqsx;  // Starting column for this thread
+        weight_qs_shared[row_local * 65 + k0 + 0]        = v.x;  // Even nibbles
+        weight_qs_shared[row_local * 65 + k0 + QI_MXFP4] = v.y;  // Odd nibbles
+
+        // Load E8M0 scale (one thread per block)
+        if (kqsx == 0) {
+            const float scale = ggml_cuda_e8m0_to_fp32(block_scale) * 0.5f;
+            weight_scales_shared[row_local * 32 + kbx] = scale;
+        }
+    }
+
+    __syncthreads();  // Ensure all threads finish loading before proceeding
+}
+
+// ============================================================================
+// MMQ MXFP4 Vector Dot Product with BF16 Activations
+// ============================================================================
+// Computes dot product between INT8 weights (from shared memory) and BF16 activations.
+// This is a simplified version for Phase 5 that works with BF16 activations.
+//
+// Future optimization (Phase 8): Quantize activations to INT8 and use DP4A for 4×speedup.
+//
+// Parameters:
+//   weight_qs: Packed INT8 values (4 int8 per int32) from shared memory
+//   act: BF16 activation vector
+//   weight_scale: FP32 scale for this block
+//   len: Number of elements (must be multiple of 4)
+//
+// Returns: FP32 dot product result (weight • act) * scale
+static __device__ __forceinline__ float vec_dot_mxfp4_bf16(
+    const int* weight_qs,           // INT8 from shared memory (packed)
+    const __nv_bfloat16* act,       // BF16 activations
+    const float weight_scale,       // FP32 scale
+    int len                         // Number of elements (typically 32)
+) {
+    float sum = 0.0f;
+
+    // Process 4 elements at a time (unpacking INT8 from packed int32)
+    for (int i = 0; i < len / 4; ++i) {
+        const int w_packed = weight_qs[i];  // 4×INT8 packed in int32
+
+        // Unpack INT8 values
+        const int8_t w0 = (int8_t)((w_packed >>  0) & 0xFF);
+        const int8_t w1 = (int8_t)((w_packed >>  8) & 0xFF);
+        const int8_t w2 = (int8_t)((w_packed >> 16) & 0xFF);
+        const int8_t w3 = (int8_t)((w_packed >> 24) & 0xFF);
+
+        // Convert BF16 activations to FP32 and accumulate
+        sum += (float)w0 * __bfloat162float(act[i*4 + 0]);
+        sum += (float)w1 * __bfloat162float(act[i*4 + 1]);
+        sum += (float)w2 * __bfloat162float(act[i*4 + 2]);
+        sum += (float)w3 * __bfloat162float(act[i*4 + 3]);
+    }
+
+    return sum * weight_scale;
+}
+
+// ============================================================================
+// MMQ MXFP4 BF16 Matrix Multiplication Kernel
+// ============================================================================
+// Full tiled matmul using Multi-row Matrix Quantized (MMQ) approach.
+// Processes tiles of output matrix using shared memory for efficient reuse.
+//
+// Key optimizations:
+// 1. Tiled weight loading with cooperative threads (load_tiles_mxfp4)
+// 2. Shared memory reuse across K dimension
+// 3. INT8 dequantization with lookup table (kvalues_mxfp4)
+// 4. Bank conflict avoidance (65-column stride)
+//
+// Grid: (num_row_tiles, num_col_tiles)  where each tile is mmq_y × mmq_x
+// Block: (32, nwarps)  typically (32, 4) = 128 threads
+//
+// Parameters match existing matmul_mxfp4_bf16 for easy drop-in replacement
+extern "C" __global__ void matmul_mxfp4_bf16_mmq(
+    const __nv_bfloat16* __restrict__ act,    // [rows, in_dim]
+    const uint8_t* __restrict__ blocks,       // [out_dim, nblocks, 16]
+    const uint8_t* __restrict__ scales,       // [out_dim, nblocks]
+    __nv_bfloat16* __restrict__ out,          // [rows, out_dim]
+    const int rows,
+    const int out_dim,
+    const int nblocks,
+    const int in_dim,
+    const int act_row_stride,
+    const int out_row_stride
+) {
+    // Tile configuration
+    constexpr int mmq_y = 4;   // Process 4 output rows per tile (start conservative)
+    constexpr int mmq_x = 64;  // Process 64 output columns per tile
+
+    // Shared memory for weight tiles
+    // weight_qs[mmq_x][65]: INT8 values (65 for bank conflict avoidance)
+    // weight_scales[mmq_x][32]: FP32 scales (32 elements per block)
+    __shared__ int weight_qs[mmq_x * 65];           // 16.6 KB
+    __shared__ float weight_scales[mmq_x * 32];     // 8.2 KB
+    // Total: ~25 KB (well under 48KB limit)
+
+    // Thread/block indices
+    const int tile_row = blockIdx.x * mmq_y;
+    const int tile_col = blockIdx.y * mmq_x;
+
+    // Thread-local accumulators for multiple outputs
+    // Each thread computes results for 2 output elements
+    float acc[2][2] = {{0.0f}};  // [row_local][col_local]
+
+    // Loop over K dimension (input dimension) in blocks
+    for (int kb = 0; kb < nblocks; ++kb) {
+        // Cooperatively load weight tile into shared memory
+        // All threads participate in loading mmq_x columns × 1 block
+        load_tiles_mxfp4<mmq_x>(
+            blocks,
+            scales,
+            weight_qs,
+            weight_scales,
+            tile_col,           // Starting output column
+            kb,                 // Current K block
+            nblocks             // Stride
+        );
+
+        // __syncthreads() is called inside load_tiles_mxfp4
+
+        // Compute partial dot products
+        // Each thread handles specific output elements
+        const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+        const int col_local = tid % mmq_x;  // Which output column within tile
+        const int row_local = tid / mmq_x;  // Which output row within tile (0-3 for mmq_y=4)
+
+        if (row_local < mmq_y) {
+            const int row_global = tile_row + row_local;
+            const int col_global = tile_col + col_local;
+
+            if (row_global < rows && col_global < out_dim) {
+                // Pointer to this row's activations for current K block
+                const __nv_bfloat16* act_ptr = act + row_global * act_row_stride + kb * QK_MXFP4;
+
+                // Pointer to this column's weights in shared memory
+                const int* weight_ptr = weight_qs + col_local * 65;  // 65-stride
+                const float weight_scale = weight_scales[col_local * 32 + 0];  // Scale for this block
+
+                // Compute dot product for this K block
+                const float partial = vec_dot_mxfp4_bf16(
+                    weight_ptr,
+                    act_ptr,
+                    weight_scale,
+                    QK_MXFP4  // 32 elements per block
+                );
+
+                // Accumulate
+                acc[row_local % 2][col_local % 2] += partial;
+            }
+        }
+
+        __syncthreads();  // Before loading next tile
+    }
+
+    // Write results
+    const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    const int col_local = tid % mmq_x;
+    const int row_local = tid / mmq_x;
+
+    if (row_local < mmq_y) {
+        const int row_global = tile_row + row_local;
+        const int col_global = tile_col + col_local;
+
+        if (row_global < rows && col_global < out_dim) {
+            const float result = acc[row_local % 2][col_local % 2];
+            out[row_global * out_row_stride + col_global] = __float2bfloat16(result);
+        }
+    }
 }
 
 extern "C" __global__ void matmul_mxfp4_bf16(
