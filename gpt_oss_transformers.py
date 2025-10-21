@@ -1,12 +1,14 @@
 import json
 import os
+import threading
+import time
 from pathlib import Path
 from typing import List, Dict, Any
 
 import argparse
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from tokenizers import Tokenizer as HFTokenizer
 
 # Constants (paths and knobs)
@@ -19,6 +21,11 @@ MODEL_INDEX_FILE = "model.safetensors.index.json"
 MAX_NEW_TOKENS = 200
 TEMPERATURE = 1.0
 ENV_DUMP_L1 = "CANDLE_DUMP_L1"  # truthy => dump first-layer debug vectors (parity with Rust)
+
+
+def cuda_sync() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def load_local_safetensors(snapshot: Path) -> List[Path]:
@@ -111,6 +118,7 @@ def main() -> None:
     parser.add_argument("--dump-layer-states", action="store_true", help="Dump per-layer last-token states to layers_step0_last.npy and exit")
     parser.add_argument("--dump-final-hidden", action="store_true", help="Print JSON with last-token vectors: post_mlp_last and post_norm_last, then exit")
     parser.add_argument("--dump-l0-qkv", action="store_true", help="Print JSON with layer-0 last-token Q/K/V (pre and post-RoPE) plus softmax scale and sinks")
+    program_start = time.perf_counter()
     args = parser.parse_args()
     # Messages (Harmony-style content). Keep identical to Rust example.
     messages: List[Dict[str, Any]] = [
@@ -194,10 +202,15 @@ def main() -> None:
     print(f"special ids: {spec_ids}")
 
     # Load model on GPU
+    cuda_sync()
+    model_load_start = time.perf_counter()
+    time_to_model_load_start = model_load_start - program_start
     model = AutoModelForCausalLM.from_pretrained(
         str(SNAPSHOT_DIR), torch_dtype=dtype, device_map={"": 0}, local_files_only=True
     )
     model.eval()
+    cuda_sync()
+    model_load_duration = time.perf_counter() - model_load_start
 
     # Optional: synchronized first-layer debug hooks (post-norm and post-attn-residual)
     def _truthy_env(name: str) -> bool:
@@ -453,9 +466,10 @@ def main() -> None:
             print(json.dumps(out_obj))
         return
 
+    input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
+
     # Top-10 next-token candidates at step 0
     with torch.no_grad():
-        input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
         logits = model(input_ids=input_tensor).logits  # (1, T, V)
         last = logits[0, -1].float()
         probs = torch.nn.functional.softmax(last, dim=-1)
@@ -473,25 +487,81 @@ def main() -> None:
         else:
             print("  special '<|channel|>' not present in tokenizer")
 
-    # Generate
-    gen = model.generate(
-        torch.tensor([input_ids], dtype=torch.long, device=device),
-        do_sample=True,
-        temperature=TEMPERATURE,
-        max_new_tokens=MAX_NEW_TOKENS,
-        eos_token_id=stop_ids if stop_ids else None,
-        use_cache=True,
-    )
-    out_ids = gen[0].detach().cpu().tolist()
-    decoded_full = tk_fast.decode(out_ids, skip_special_tokens=False)
-    print("\n" + decoded_full)
-    final = extract_final_assistant_text_from_decoded(decoded_full)
-    if final is not None:
-        print(final.strip())
+    streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=False)
+    generation_kwargs = {
+        "input_ids": input_tensor,
+        "do_sample": True,
+        "temperature": TEMPERATURE,
+        "max_new_tokens": MAX_NEW_TOKENS,
+        "eos_token_id": stop_ids if stop_ids else None,
+        "streamer": streamer,
+        "use_cache": True,
+    }
+
+    result_holder: Dict[str, torch.Tensor] = {}
+
+    def _run_generate() -> None:
+        cuda_sync()
+        outputs = model.generate(**generation_kwargs)
+        cuda_sync()
+        result_holder["output_ids"] = outputs
+
+    cuda_sync()
+    generation_start = time.perf_counter()
+    gen_thread = threading.Thread(target=_run_generate)
+    gen_thread.start()
+
+    streamed_chunks: List[str] = []
+    response_stream_start: float | None = None
+    response_stream_end: float | None = None
+    prompt_processing_duration: float | None = None
+
+    for chunk in streamer:
+        cuda_sync()
+        now = time.perf_counter()
+        streamed_chunks.append(chunk)
+        if response_stream_start is None:
+            response_stream_start = now
+            prompt_processing_duration = now - generation_start
+        response_stream_end = now
+        print(chunk, end="", flush=True)
+
+    gen_thread.join()
+    cuda_sync()
+    generation_end = time.perf_counter()
+
+    if response_stream_start is None:
+        prompt_processing_duration = generation_end - generation_start
+        response_stream_duration = 0.0
     else:
-        # Fall back to skipping special tokens
+        response_stream_duration = (response_stream_end or generation_end) - response_stream_start
+
+    out_tensor = result_holder.get("output_ids")
+    if out_tensor is None:
+        raise RuntimeError("generation did not produce output tokens")
+    out_ids = out_tensor[0].detach().cpu().tolist()
+    generated_tokens = max(len(out_ids) - len(input_ids), 0)
+
+    prompt_processing_duration = prompt_processing_duration or 0.0
+    total_response_time = response_stream_duration
+    tokens_per_second = (generated_tokens / total_response_time) if total_response_time > 0.0 else 0.0
+
+    decoded_full = tk_fast.decode(out_ids, skip_special_tokens=False)
+    print()
+    print("perf metrics:")
+    print(f"- time_to_model_load_start: {time_to_model_load_start:.3f} s")
+    print(f"- model_load_duration: {model_load_duration:.3f} s")
+    print(f"- prompt_processing_duration: {prompt_processing_duration:.3f} s")
+    print(f"- response_stream_duration: {response_stream_duration:.3f} s")
+    print(f"- tokens_per_second: {tokens_per_second:.3f} tok/s over {generated_tokens} tokens")
+
+    print(f"full harmony decode: {decoded_full}")
+    final = extract_final_assistant_text_from_decoded(decoded_full)
+    if final is not None and final.strip():
+        print(f"assistant reply: {final.strip()}")
+    else:
         cleaned = tk_fast.decode(out_ids, skip_special_tokens=True)
-        print(cleaned.strip())
+        print(f"assistant reply: {cleaned.strip()}")
 
 
 if __name__ == "__main__":

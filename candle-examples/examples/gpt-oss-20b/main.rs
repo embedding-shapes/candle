@@ -1,5 +1,6 @@
 use anyhow::{bail, Context as _, Result};
 use clap::Parser;
+use std::time::{Duration, Instant};
 
 use candle::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
@@ -41,6 +42,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    let program_start = Instant::now();
     let args = Args::parse();
 
     // Resolve the local HF snapshot path (expand leading ~ for convenience).
@@ -146,8 +148,13 @@ fn main() -> Result<()> {
     }
 
     // Map weights and instantiate the model.
+    let model_load_start = Instant::now();
+    let time_to_model_load_start = model_load_start
+        .checked_duration_since(program_start)
+        .unwrap_or_else(|| Duration::from_secs(0));
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, dtype, &device)? };
     let mut model = GptOssModel::load(vb, &cfg).context("failed to load GPT-OSS model weights")?;
+    let model_load_duration = model_load_start.elapsed();
 
     // Debug: check lm_head weights
     {
@@ -191,11 +198,17 @@ fn main() -> Result<()> {
     }
     let stop_tokens: std::collections::BTreeSet<u32> = stop_ids.into_iter().collect();
 
+    let prompt_token_count = tokens.len();
+    let mut prompt_processing_duration = Duration::from_secs(0);
+    let mut response_write_start: Option<Instant> = None;
+    let mut response_write_end: Option<Instant> = None;
+
     // Decode loop using full forward with KV cache, RoPE (YARN), sinks and flash-attn.
     // Stream only the assistant final-channel content as it appears.
     let mut index_pos = 0usize; // global position in sequence
     let mut last_emitted_len = 0usize; // number of bytes already emitted from final-channel text
     for step in 0..args.sample_len {
+        let iter_forward_start = Instant::now();
         let (context_size, context_index) = if step > 0 { (1usize, index_pos) } else { (tokens.len(), 0usize) };
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
         let t = Tensor::from_vec(ctxt.to_vec(), (1, context_size), &device)?;
@@ -261,9 +274,19 @@ fn main() -> Result<()> {
         }
         // Sample next token. The model was trained on Harmony protocol and naturally
         // follows the correct sequence without forcing. Just sample with temperature.
+        if response_write_start.is_none() {
+            let now = Instant::now();
+            if step == 0 {
+                prompt_processing_duration = now
+                    .checked_duration_since(iter_forward_start)
+                    .unwrap_or_else(|| Duration::from_secs(0));
+            }
+            response_write_start = Some(now);
+        }
         let next = sampler.sample(&last)?;
         tokens.push(next);
         index_pos += context_size;
+        response_write_end = Some(Instant::now());
         // Streaming: decode and extract after each token; emit only the newly appended portion.
         if let Ok(decoded_full) = hf_tok.decode(&tokens, /*skip_special_tokens=*/ false) {
             if let Some(final_text) = extract_final_assistant_text_from_decoded(&decoded_full) {
@@ -275,37 +298,60 @@ fn main() -> Result<()> {
                     use std::io::Write as _;
                     std::io::stdout().flush().ok();
                     last_emitted_len = new_len;
+                    response_write_end = Some(Instant::now());
                 }
             }
         }
         if stop_tokens.contains(&next) { break; }
     }
 
-    // Always print the full Harmony string (request + response with control tokens)
-    if let Ok(decoded_full) = hf_tok.decode(&tokens, /*skip_special_tokens=*/ false) {
-        println!("\n{}", decoded_full);
-    }
+    let response_stream_duration = match (response_write_start, response_write_end) {
+        (Some(start), Some(end)) if end >= start => end.duration_since(start),
+        _ => Duration::from_secs(0),
+    };
 
-    // If we have streamed some content, terminate the line after raw print.
-    if last_emitted_len == 0 {
-        // Fallback: decode once and print extracted final portion if available,
-        // else decode with skip_special_tokens to ensure we never print control tokens.
-        if let Ok(decoded_full) = hf_tok.decode(&tokens, /*skip_special_tokens=*/ false) {
-            if let Some(reply) = extract_final_assistant_text_from_decoded(&decoded_full) {
-                println!("{}", reply.trim());
-            } else {
-                let sanitized = hf_tok
-                    .decode(&tokens, /*skip_special_tokens=*/ true)
-                    .unwrap_or_else(|_| String::from(""));
-                println!("{}", sanitized.trim());
-            }
-        } else {
-            let sanitized = hf_tok
+    let generated_tokens = tokens.len().saturating_sub(prompt_token_count);
+
+    let decoded_full = hf_tok
+        .decode(&tokens, /*skip_special_tokens=*/ false)
+        .unwrap_or_else(|_| String::from("<decode-error>"));
+    let final_reply = extract_final_assistant_text_from_decoded(&decoded_full)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            hf_tok
                 .decode(&tokens, /*skip_special_tokens=*/ true)
-                .unwrap_or_else(|_| String::from(""));
-            println!("{}", sanitized.trim());
-        }
-    }
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(String::new);
+
+    let prompt_processing_secs = prompt_processing_duration.as_secs_f64();
+    let response_stream_secs = response_stream_duration.as_secs_f64();
+    let time_to_model_load_start_secs = time_to_model_load_start.as_secs_f64();
+    let model_load_duration_secs = model_load_duration.as_secs_f64();
+    let tokens_per_second = if response_stream_secs > 0.0 {
+        generated_tokens as f64 / response_stream_secs
+    } else {
+        0.0
+    };
+
+    println!("\nperf metrics:");
+    println!(
+        "- time_to_model_load_start: {:.3} s",
+        time_to_model_load_start_secs
+    );
+    println!("- model_load_duration: {:.3} s", model_load_duration_secs);
+    println!("- prompt_processing_duration: {:.3} s", prompt_processing_secs);
+    println!("- response_stream_duration: {:.3} s", response_stream_secs);
+    println!(
+        "- tokens_per_second: {:.3} tok/s over {} tokens",
+        tokens_per_second,
+        generated_tokens
+    );
+
+    println!("full harmony decode: {}", decoded_full);
+    println!("assistant reply: {}", final_reply);
 
     Ok(())
 }
