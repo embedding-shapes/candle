@@ -1723,6 +1723,18 @@ pub fn load_expert_linear_mxfp4_grouped(
     let blocks = blocks_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb, 16)
     let scales = scales_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb)
 
+    // Debug: Print raw block bytes for expert 3, row 0, block 0
+    if matches!(std::env::var("CANDLE_DUMP_L1").ok().as_deref(), Some("1")) && expert_idx == 3 && base.contains("gate_up") {
+        eprintln!("[MXFP4_RAW] blocks shape before dequant: {:?}, device: {:?}", blocks.dims(), blocks.device());
+        eprintln!("[MXFP4_RAW] scales shape before dequant: {:?}, device: {:?}", scales.dims(), scales.device());
+        let blocks_u8 = blocks.to_vec3::<u8>()?;
+        let scales_u8 = scales.to_vec2::<u8>()?;
+        if blocks_u8.len() > 0 && blocks_u8[0].len() > 0 {
+            eprintln!("[MXFP4_RAW] Expert 3 row 0 block 0 bytes: {:?}", &blocks_u8[0][0]);
+            eprintln!("[MXFP4_RAW] Expert 3 row 0 block 0 scale: {}", scales_u8[0][0]);
+        }
+    }
+
     // Dequantize normally: this produces [out_dim, in_dim]
     let mut weight = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
 
