@@ -5,6 +5,10 @@
 #include<stdint.h>
 #include<math.h>
 
+#ifndef MATMUL_MXFP4_TILE_K_BLOCKS
+#define MATMUL_MXFP4_TILE_K_BLOCKS 32
+#endif
+
 #define GGML_UNUSED(x) (void)(x)
 #define GGML_CUDA_ASSUME(x)
 
@@ -2622,7 +2626,7 @@ extern "C" __global__ void matmul_mxfp4_bf16(
     constexpr int cols_per_warp = 4;
     constexpr int lanes_per_column = warp_size / cols_per_warp; // 8 lanes cooperate per column.
     constexpr int elems_per_lane = elems_per_block / lanes_per_column; // 4 values per lane.
-    constexpr int tile_k_blocks = 8; // decode 8*32 activations at a time.
+    constexpr int tile_k_blocks = MATMUL_MXFP4_TILE_K_BLOCKS; // decode tile_k_blocks*32 activations at a time.
 
     const int warps_per_block = blockDim.y;
     const int tile_cols = cols_per_warp * warps_per_block;

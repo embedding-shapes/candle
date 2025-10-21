@@ -300,7 +300,7 @@ pub fn matmul_mxfp4_bf16_cuda(
     let mut out_slice = unsafe { dev.alloc::<bf16>(rows * out_dim)? };
 
     const TILE_COLS: usize = 16;
-    const TILE_K_BLOCKS: usize = 8;
+    const TILE_K_BLOCKS: usize = candle_kernels::MATMUL_MXFP4_TILE_K_BLOCKS;
     let grid_y = (out_dim + TILE_COLS - 1) / TILE_COLS;
 
     let func = dev.get_or_load_func("matmul_mxfp4_bf16", &candle_kernels::QUANTIZED)?;

@@ -2,6 +2,8 @@ mod ptx {
     include!(concat!(env!("OUT_DIR"), "/ptx.rs"));
 }
 
+pub const MATMUL_MXFP4_TILE_K_BLOCKS: usize = 32;
+
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Id {
