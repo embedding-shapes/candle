@@ -163,7 +163,26 @@ pub mod experts {
             let up_plus = up.broadcast_add(&one_t)?;
             let fused = up_plus.broadcast_mul(&glu)?;
             let fused = fused.to_dtype(xs.dtype())?;
-            fused.apply(&self.down)
+
+            if dump_l1 && xs.dims2()?.0 > 0 {
+                let fused_f32 = fused.to_dtype(DType::F32)?;
+                let fused_vec = fused_f32.to_vec2::<f32>()?;
+                if !fused_vec.is_empty() {
+                    eprintln!("[L1 Expert] fused (before down) first 8: {:?}", &fused_vec[0][..8.min(fused_vec[0].len())]);
+                }
+            }
+
+            let result = fused.apply(&self.down)?;
+
+            if dump_l1 && xs.dims2()?.0 > 0 {
+                let result_f32 = result.to_dtype(DType::F32)?;
+                let result_vec = result_f32.to_vec2::<f32>()?;
+                if !result_vec.is_empty() {
+                    eprintln!("[L1 Expert] result (after down) first 8: {:?}", &result_vec[0][..8.min(result_vec[0].len())]);
+                }
+            }
+
+            Ok(result)
         }
     }
 
@@ -247,10 +266,32 @@ pub mod experts {
                     eprintln!("[L1 MLP] Expert {}: {} tokens, weights: {:?}", e_idx, ids.len(), &token_wts[e_idx]);
                 }
                 let y_sel = expert.forward(&x_sel)?;
+                if dump_l1 && ids.contains(&((probs_host.len() - 1) as u32)) {
+                    let y_sel_f32 = y_sel.to_dtype(DType::F32)?;
+                    let y_sel_vec = y_sel_f32.to_vec2::<f32>()?;
+                    let last_in_batch = ids.iter().position(|&id| id == ((probs_host.len() - 1) as u32)).unwrap();
+                    eprintln!("[L1 MLP] Expert {} last token output (before weight): {:?}", e_idx, &y_sel_vec[last_in_batch][..8]);
+                }
                 let y_sel = y_sel.broadcast_mul(&wts_t)?;
+                if dump_l1 && ids.contains(&((probs_host.len() - 1) as u32)) {
+                    let y_sel_f32 = y_sel.to_dtype(DType::F32)?;
+                    let y_sel_vec = y_sel_f32.to_vec2::<f32>()?;
+                    let last_in_batch = ids.iter().position(|&id| id == ((probs_host.len() - 1) as u32)).unwrap();
+                    let weight = token_wts[e_idx][last_in_batch];
+                    eprintln!("[L1 MLP] Expert {} last token output (after weight {}): {:?}", e_idx, weight, &y_sel_vec[last_in_batch][..8]);
+                }
                 ys = ys.index_add(&ids_t, &y_sel, 0)?;
             }
-            ys.reshape((b, t, h))
+            let result = ys.reshape((b, t, h))?;
+            if dump_l1 {
+                let result_f32 = result.to_dtype(DType::F32)?;
+                let result_vec = result_f32.to_vec3::<f32>()?;
+                if !result_vec.is_empty() && !result_vec[0].is_empty() {
+                    let last_idx = result_vec[0].len() - 1;
+                    eprintln!("[L1 MLP] Final aggregated last token [:8]: {:?}", &result_vec[0][last_idx][..8]);
+                }
+            }
+            Ok(result)
         }
     }
 }
@@ -1688,6 +1729,14 @@ pub fn load_expert_linear_mxfp4_grouped(
     if matches!(std::env::var("CANDLE_DUMP_L1").ok().as_deref(), Some("1")) && expert_idx == 3 && base.contains("gate_up") {
         eprintln!("[MXFP4] Expert 3 gate_up_proj weight shape after dequant: {:?}", weight.dims());
         eprintln!("[MXFP4] Expected: ({}, {}) [out_dim, in_dim] for candle::Linear", out_dim, in_dim);
+
+        // Print first 32 values of first two rows for comparison with Python
+        let w_f32 = weight.to_dtype(DType::F32)?;
+        let w_vec = w_f32.to_vec2::<f32>()?;
+        if w_vec.len() >= 2 {
+            eprintln!("[MXFP4] Expert 3 row 0 [:32]: {:?}", &w_vec[0][..32.min(w_vec[0].len())]);
+            eprintln!("[MXFP4] Expert 3 row 1 [:32]: {:?}", &w_vec[1][..32.min(w_vec[1].len())]);
+        }
     }
 
     if !weight.device().same_device(vb.device()) {
@@ -1709,6 +1758,16 @@ pub fn load_expert_linear_mxfp4_grouped(
     } else {
         None
     };
+
+    if matches!(std::env::var("CANDLE_DUMP_L1").ok().as_deref(), Some("1")) && expert_idx == 3 {
+        if let Some(ref b) = bias_t {
+            let b_f32 = b.to_dtype(DType::F32)?;
+            let b_vec = b_f32.to_vec1::<f32>()?;
+            eprintln!("[BIAS] {} expert 3 bias [:8]: {:?}", base, &b_vec[..8.min(b_vec.len())]);
+        } else {
+            eprintln!("[BIAS] {} expert 3: NO BIAS LOADED", base);
+        }
+    }
 
     Ok(Linear::new(weight, bias_t))
 }
