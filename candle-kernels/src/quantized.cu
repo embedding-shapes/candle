@@ -2811,6 +2811,32 @@ static __device__ __forceinline__ float vec_dot_mxfp4_simple(
     return sum * scale;
 }
 
+// Vector dot product for MMQ with pre-dequantized INT8 weights
+// This is the core computation for one K-block (32 elements) in MMQ
+// Inputs:
+//   - weight_int8: 32 INT8 values (already dequantized via kvalues_mxfp4)
+//   - act_bf16: 32 BF16 activation values
+//   - scale: FP32 scale factor (E8M0 converted to float)
+// Output: FP32 dot product result
+// Ref: llama.cpp uses similar approach with __dp4a for Q8_1 activations
+static __device__ __forceinline__ float vec_dot_mmq_mxfp4_bf16(
+    const int8_t* weight_int8,      // [32] INT8 weights from shared memory
+    const __nv_bfloat16* act_bf16,  // [32] BF16 activations
+    const float scale               // FP32 scale
+) {
+    float sum = 0.0f;
+
+    // Process all 32 elements of one K-block
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        const float w = (float)weight_int8[i];
+        const float a = __bfloat162float(act_bf16[i]);
+        sum += w * a;
+    }
+
+    return scale * sum;
+}
+
 // ============================================================================
 // MMQ MXFP4 BF16 Matrix Multiplication Kernel (Optimized)
 // ============================================================================
