@@ -468,9 +468,30 @@ def main() -> None:
 
     input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
 
-    # Top-10 next-token candidates at step 0
+    # Top-10 next-token candidates at step 0 with detailed timing breakdown
     with torch.no_grad():
+        cuda_sync()
+        t_forward_start = time.perf_counter()
+
+        # Time embedding lookup
+        t_embed_start = time.perf_counter()
+        embeddings = model.get_input_embeddings()(input_tensor)
+        cuda_sync()
+        t_embed_dur = time.perf_counter() - t_embed_start
+
+        # Time full forward pass (will include all layers + lm_head)
+        t_full_start = time.perf_counter()
         logits = model(input_ids=input_tensor).logits  # (1, T, V)
+        cuda_sync()
+        t_full_dur = time.perf_counter() - t_full_start
+
+        t_forward_total = time.perf_counter() - t_forward_start
+
+        print(f"[PROFILE] First forward pass timing breakdown:")
+        print(f"  - embedding lookup: {t_embed_dur*1000:.3f} ms")
+        print(f"  - full forward (all layers + lm_head): {t_full_dur*1000:.3f} ms")
+        print(f"  - total with syncs: {t_forward_total*1000:.3f} ms")
+
         last = logits[0, -1].float()
         probs = torch.nn.functional.softmax(last, dim=-1)
         topk = torch.topk(probs, k=10)
@@ -486,6 +507,12 @@ def main() -> None:
             print(f"  special '<|channel|>' id={ch_id} p={ch_prob:.6f}")
         else:
             print("  special '<|channel|>' not present in tokenizer")
+
+    # Set seed for deterministic sampling (matching Rust default)
+    SEED = 299792458
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
     streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=False)
     generation_kwargs = {

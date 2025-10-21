@@ -211,7 +211,18 @@ fn main() -> Result<()> {
         let iter_forward_start = Instant::now();
         let (context_size, context_index) = if step > 0 { (1usize, index_pos) } else { (tokens.len(), 0usize) };
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
+
+        // Profile first forward pass with detailed timing breakdown
+        let t_tensor_start = if step == 0 { Some(Instant::now()) } else { None };
         let t = Tensor::from_vec(ctxt.to_vec(), (1, context_size), &device)?;
+        let t_tensor_dur = t_tensor_start.map(|start| start.elapsed());
+
+        if step == 0 {
+            if let Some(dur) = t_tensor_dur {
+                eprintln!("[PROFILE] First forward pass timing breakdown:");
+                eprintln!("  - tensor creation: {:.3} ms", dur.as_secs_f64() * 1000.0);
+            }
+        }
         // Optional debug: check lm_head-only projection from embeddings to see vocab alignment.
         if step == 0 && std::env::var("CANDLE_DEBUG_HEAD_ONLY").ok().as_deref() == Some("1") {
             let test_logits = model.forward_logits_minimal(&t)?; // (1, context_size, vocab)
@@ -236,17 +247,27 @@ fn main() -> Result<()> {
             }
         }
 
+        let t_forward_start = if step == 0 { Some(Instant::now()) } else { None };
         let logits = model.forward(&t, context_index)?; // (1, context_size, vocab)
+        let t_forward_dur = t_forward_start.map(|start| start.elapsed());
+
         let last = logits.i((0, context_size - 1))?; // (vocab)
         if step == 0 {
+            if let Some(dur) = t_forward_dur {
+                eprintln!("  - full forward (all layers + lm_head): {:.3} ms", dur.as_secs_f64() * 1000.0);
+            }
             // Debug: check hidden states at various points
             // Get hidden right before lm_head (after final norm)
+            let t_hidden_start = Instant::now();
             let hidden_post_norm = model.forward_last_hidden_post_norm(&t, context_index)?;
             let hn_vec = hidden_post_norm.to_vec1::<f32>()?;
+            let t_hidden_dur = t_hidden_start.elapsed();
+            eprintln!("  - hidden state extraction: {:.3} ms", t_hidden_dur.as_secs_f64() * 1000.0);
             eprintln!("  Hidden (after final norm) last token [:8]: {:?}", &hn_vec[..8]);
         }
         if step == 0 {
             // Inspect the top-10 candidates for the first generated token
+            let t_postprocess_start = Instant::now();
             let last_f32 = last.to_dtype(DType::F32)?;
             let logits_vec = last_f32.to_vec1::<f32>()?;
             let probs = candle_nn::ops::softmax_last_dim(&last_f32)?;
@@ -254,6 +275,12 @@ fn main() -> Result<()> {
             let mut idx: Vec<usize> = (0..v.len()).collect();
             idx.sort_by(|&i, &j| v[j].partial_cmp(&v[i]).unwrap());
             let topn = 10usize.min(idx.len());
+            let t_postprocess_dur = t_postprocess_start.elapsed();
+            eprintln!("  - postprocessing (softmax + sort): {:.3} ms", t_postprocess_dur.as_secs_f64() * 1000.0);
+
+            let total_step0 = iter_forward_start.elapsed();
+            eprintln!("  - total step 0 time: {:.3} ms", total_step0.as_secs_f64() * 1000.0);
+
             let tok_path = snapshot_dir.join("tokenizer.json");
             if let Ok(tk) = tokenizers::Tokenizer::from_file(&tok_path) {
                 if let Some(ch_id) = tk.token_to_id("<|channel|>") {
