@@ -6,7 +6,7 @@
 #include<math.h>
 
 #ifndef MATMUL_MXFP4_TILE_K_BLOCKS
-#define MATMUL_MXFP4_TILE_K_BLOCKS 64
+#define MATMUL_MXFP4_TILE_K_BLOCKS 32
 #endif
 
 #define GGML_UNUSED(x) (void)(x)
@@ -2787,46 +2787,28 @@ static __device__ __forceinline__ void load_tiles_mxfp4(
 }
 
 // ============================================================================
-// MMQ MXFP4 Vector Dot Product with BF16 Activations
+// Simplified MMQ Vector Dot Product
 // ============================================================================
-// Computes dot product between INT8 weights (from shared memory) and BF16 activations.
-// This is a simplified version for Phase 5 that works with BF16 activations.
-//
-// Future optimization (Phase 8): Quantize activations to INT8 and use DP4A for 4×speedup.
-//
-// Parameters:
-//   weight_qs: Packed INT8 values (4 int8 per int32) from shared memory
-//   act: BF16 activation vector
-//   weight_scale: FP32 scale for this block
-//   len: Number of elements (must be multiple of 4)
-//
-// Returns: FP32 dot product result (weight • act) * scale
-static __device__ __forceinline__ float vec_dot_mxfp4_bf16(
-    const int* weight_qs,           // INT8 from shared memory (packed)
+// Direct computation without shared memory complexity
+static __device__ __forceinline__ float vec_dot_mxfp4_simple(
+    const uint8_t* block_ptr,       // FP4 packed weights
     const __nv_bfloat16* act,       // BF16 activations
-    const float weight_scale,       // FP32 scale
-    int len                         // Number of elements (typically 32)
+    const float scale,              // Combined scale
+    int len                         // Number of elements (32)
 ) {
     float sum = 0.0f;
 
-    // Process 4 elements at a time (unpacking INT8 from packed int32)
-    for (int i = 0; i < len / 4; ++i) {
-        const int w_packed = weight_qs[i];  // 4×INT8 packed in int32
-
-        // Unpack INT8 values
-        const int8_t w0 = (int8_t)((w_packed >>  0) & 0xFF);
-        const int8_t w1 = (int8_t)((w_packed >>  8) & 0xFF);
-        const int8_t w2 = (int8_t)((w_packed >> 16) & 0xFF);
-        const int8_t w3 = (int8_t)((w_packed >> 24) & 0xFF);
-
-        // Convert BF16 activations to FP32 and accumulate
-        sum += (float)w0 * __bfloat162float(act[i*4 + 0]);
-        sum += (float)w1 * __bfloat162float(act[i*4 + 1]);
-        sum += (float)w2 * __bfloat162float(act[i*4 + 2]);
-        sum += (float)w3 * __bfloat162float(act[i*4 + 3]);
+    #pragma unroll
+    for (int i = 0; i < len; ++i) {
+        const int byte_idx = i >> 1;
+        const uint8_t packed = block_ptr[byte_idx];
+        const uint8_t nibble = (i & 1) ? (packed >> 4) & 0x0f : packed & 0x0f;
+        const float w = (float)MXFP4_FP4_LUT[nibble];
+        const float a = __bfloat162float(act[i]);
+        sum += w * a;
     }
 
-    return sum * weight_scale;
+    return sum * scale;
 }
 
 // ============================================================================
@@ -2857,89 +2839,30 @@ extern "C" __global__ void matmul_mxfp4_bf16_mmq(
     const int act_row_stride,
     const int out_row_stride
 ) {
-    // Tile configuration
-    constexpr int mmq_y = 4;   // Process 4 output rows per tile (start conservative)
-    constexpr int mmq_x = 64;  // Process 64 output columns per tile
+    // Simplified working version: 1 thread = 1 output element
+    const int row = blockIdx.x;
+    const int col = blockIdx.y * blockDim.x + threadIdx.x;
 
-    // Shared memory for weight tiles
-    // weight_qs[mmq_x][65]: INT8 values (65 for bank conflict avoidance)
-    // weight_scales[mmq_x][32]: FP32 scales (32 elements per block)
-    __shared__ int weight_qs[mmq_x * 65];           // 16.6 KB
-    __shared__ float weight_scales[mmq_x * 32];     // 8.2 KB
-    // Total: ~25 KB (well under 48KB limit)
+    if (row >= rows || col >= out_dim) {
+        return;
+    }
 
-    // Thread/block indices
-    const int tile_row = blockIdx.x * mmq_y;
-    const int tile_col = blockIdx.y * mmq_x;
+    const __nv_bfloat16* act_ptr = act + row * act_row_stride;
+    const uint8_t* blocks_ptr = blocks + col * nblocks * 16;
+    const uint8_t* scales_ptr = scales + col * nblocks;
 
-    // Thread-local accumulators for multiple outputs
-    // Each thread computes results for 2 output elements
-    float acc[2][2] = {{0.0f}};  // [row_local][col_local]
+    float sum = 0.0f;
 
-    // Loop over K dimension (input dimension) in blocks
+    // Loop over K dimension blocks
     for (int kb = 0; kb < nblocks; ++kb) {
-        // Cooperatively load weight tile into shared memory
-        // All threads participate in loading mmq_x columns × 1 block
-        load_tiles_mxfp4<mmq_x>(
-            blocks,
-            scales,
-            weight_qs,
-            weight_scales,
-            tile_col,           // Starting output column
-            kb,                 // Current K block
-            nblocks             // Stride
-        );
+        const uint8_t* block_ptr = blocks_ptr + kb * 16;
+        const float scale = pow2_e8m0_device(scales_ptr[kb]) * 0.5f;
+        const __nv_bfloat16* act_block_ptr = act_ptr + kb * 32;
 
-        // __syncthreads() is called inside load_tiles_mxfp4
-
-        // Compute partial dot products
-        // Each thread handles specific output elements
-        const int tid = threadIdx.x + threadIdx.y * blockDim.x;
-        const int col_local = tid % mmq_x;  // Which output column within tile
-        const int row_local = tid / mmq_x;  // Which output row within tile (0-3 for mmq_y=4)
-
-        if (row_local < mmq_y) {
-            const int row_global = tile_row + row_local;
-            const int col_global = tile_col + col_local;
-
-            if (row_global < rows && col_global < out_dim) {
-                // Pointer to this row's activations for current K block
-                const __nv_bfloat16* act_ptr = act + row_global * act_row_stride + kb * QK_MXFP4;
-
-                // Pointer to this column's weights in shared memory
-                const int* weight_ptr = weight_qs + col_local * 65;  // 65-stride
-                const float weight_scale = weight_scales[col_local * 32 + 0];  // Scale for this block
-
-                // Compute dot product for this K block
-                const float partial = vec_dot_mxfp4_bf16(
-                    weight_ptr,
-                    act_ptr,
-                    weight_scale,
-                    QK_MXFP4  // 32 elements per block
-                );
-
-                // Accumulate
-                acc[row_local % 2][col_local % 2] += partial;
-            }
-        }
-
-        __syncthreads();  // Before loading next tile
+        sum += vec_dot_mxfp4_simple(block_ptr, act_block_ptr, scale, 32);
     }
 
-    // Write results
-    const int tid = threadIdx.x + threadIdx.y * blockDim.x;
-    const int col_local = tid % mmq_x;
-    const int row_local = tid / mmq_x;
-
-    if (row_local < mmq_y) {
-        const int row_global = tile_row + row_local;
-        const int col_global = tile_col + col_local;
-
-        if (row_global < rows && col_global < out_dim) {
-            const float result = acc[row_local % 2][col_local % 2];
-            out[row_global * out_row_stride + col_global] = __float2bfloat16(result);
-        }
-    }
+    out[row * out_row_stride + col] = __float2bfloat16(sum);
 }
 
 extern "C" __global__ void matmul_mxfp4_bf16(
