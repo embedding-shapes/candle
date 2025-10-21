@@ -396,6 +396,80 @@ pub fn matmul_mxfp4_bf16_cuda(
     Ok(tensor)
 }
 
+#[cfg(feature = "cuda")]
+/// Fused expert activation for GPT-OSS
+/// Input: gate_up [batch, 2*expert_dim] interleaved (even=gate, odd=up)
+/// Output: [batch, expert_dim] = (up+1) * gate * sigmoid(alpha*gate) with asymmetric clamping
+pub fn fused_expert_activation_cuda(
+    gate_up: &Tensor,
+    alpha: f32,
+    limit: f32,
+) -> Result<Tensor> {
+    use crate::{cuda_backend::WrapErr, op::BackpropOp, storage::Storage, CudaStorage};
+    use cudarc::driver::PushKernelArg;
+
+    let (batch, two_expert_dim) = gate_up.dims2()?;
+    let expert_dim = two_expert_dim / 2;
+
+    let dev = gate_up.device().as_cuda_device()?;
+
+    let gate_up_base = if gate_up.is_contiguous() {
+        gate_up.clone()
+    } else {
+        gate_up.contiguous()?
+    };
+    let (gate_up_storage, gate_up_layout) = gate_up_base.storage_and_layout();
+    let gate_up_offset = gate_up_layout.start_offset();
+    let gate_up_view_base = match &*gate_up_storage {
+        Storage::Cuda(s) => s.as_cuda_slice::<bf16>()?,
+        _ => bail!("expected CUDA storage for gate_up"),
+    };
+    let gate_up_view = gate_up_view_base.slice(gate_up_offset..);
+
+    let mut output = unsafe { dev.alloc::<half::bf16>(batch * expert_dim)? };
+
+    let func = dev.get_or_load_func("fused_expert_activation_bf16", &candle_kernels::QUANTIZED)?;
+
+    let threads_per_block = 256;
+    let num_blocks = (batch * expert_dim + threads_per_block - 1) / threads_per_block;
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (num_blocks as u32, 1, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(&gate_up_view);
+    builder.arg(&mut output);
+    crate::builder_arg!(
+        builder,
+        batch as i32,
+        expert_dim as i32,
+        alpha,
+        limit
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    let out_storage = CudaStorage::wrap_cuda_slice(output, dev.clone());
+    let tensor = crate::tensor::from_storage(
+        crate::storage::Storage::Cuda(out_storage),
+        (batch, expert_dim),
+        crate::op::BackpropOp::none(),
+        false,
+    );
+    Ok(tensor)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn fused_expert_activation_cuda(
+    _gate_up: &Tensor,
+    _alpha: f32,
+    _limit: f32,
+) -> Result<Tensor> {
+    bail!("fused_expert_activation_cuda requires cuda feature")
+}
+
 pub fn matmul_mxfp4_bf16(act: &Tensor, blocks: &Tensor, scales: &Tensor) -> Result<Tensor> {
     let (rows, in_dim) = act.dims2()?;
     let (out_dim, nblocks, bytes) = blocks.dims3()?;

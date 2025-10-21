@@ -114,67 +114,41 @@ pub mod experts {
     impl Module for ExpertMlp {
         fn forward(&self, xs: &Tensor) -> Result<Tensor> {
             let gu = xs.apply(&self.gate_up)?;
-            let gu = gu.to_dtype(DType::F32)?;
-            let (_n, two_inter) = gu.dims2()?;
-            let inter = two_inter / 2;
+
+            // Use fused CUDA kernel for activation if available
+            let fused = if gu.device().is_cuda() {
+                candle::mxfp4::fused_expert_activation_cuda(&gu, self.alpha, self.limit)?
+            } else {
+                // Fallback to original implementation for non-CUDA
+                let gu = gu.to_dtype(DType::F32)?;
+                let (_n, two_inter) = gu.dims2()?;
+                let inter = two_inter / 2;
+
+                let device = gu.device();
+                let even_indices: Vec<u32> = (0..inter).map(|i| (i * 2) as u32).collect();
+                let odd_indices: Vec<u32> = (0..inter).map(|i| (i * 2 + 1) as u32).collect();
+
+                let even_idx_tensor = Tensor::from_vec(even_indices, inter, device)?;
+                let odd_idx_tensor = Tensor::from_vec(odd_indices, inter, device)?;
+
+                let mut gate = gu.index_select(&even_idx_tensor, D::Minus1)?;
+                let mut up = gu.index_select(&odd_idx_tensor, D::Minus1)?;
+
+                gate = gate.clamp(f32::NEG_INFINITY, self.limit)?;
+                up = up.clamp(-self.limit, self.limit)?;
+
+                let alpha_t = Tensor::new(self.alpha, xs.device())?.to_dtype(DType::F32)?;
+                let gate_alpha = gate.broadcast_mul(&alpha_t)?;
+                let sig = ops::sigmoid(&gate_alpha)?;
+                let glu = gate.broadcast_mul(&sig)?;
+
+                let one_t = Tensor::new(1.0f32, xs.device())?.to_dtype(DType::F32)?;
+                let up_plus = up.broadcast_add(&one_t)?;
+                let fused = up_plus.broadcast_mul(&glu)?;
+                fused.to_dtype(xs.dtype())?
+            };
 
             let dump_l1 = std::env::var("CANDLE_DUMP_L1").ok().as_deref() == Some("1");
-
-            // Interleaved split: gate = even indices [0,2,4,...], up = odd indices [1,3,5,...]
-            // Python: gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-            // Use index_select to extract even/odd indices
-            let device = gu.device();
-            let even_indices: Vec<u32> = (0..inter).map(|i| (i * 2) as u32).collect();
-            let odd_indices: Vec<u32> = (0..inter).map(|i| (i * 2 + 1) as u32).collect();
-
-            let even_idx_tensor = Tensor::from_vec(even_indices, inter, device)?;
-            let odd_idx_tensor = Tensor::from_vec(odd_indices, inter, device)?;
-
-            let mut gate = gu.index_select(&even_idx_tensor, D::Minus1)?;
-            let mut up = gu.index_select(&odd_idx_tensor, D::Minus1)?;
-
-            if dump_l1 && xs.dims2()?.0 > 0 {
-                eprintln!("[L1 Expert] Using INTERLEAVED split (even=gate, odd=up)");
-                // Debug: print first few values of gate_up, gate, and up
-                let gu_f32 = gu.to_dtype(DType::F32)?;
-                let gu_vec = gu_f32.to_vec2::<f32>()?;
-                if !gu_vec.is_empty() {
-                    eprintln!(
-                        "[L1 Expert] gate_up first 16: {:?}",
-                        &gu_vec[0][..16.min(gu_vec[0].len())]
-                    );
-                }
-
-                let gate_vec = gate.to_vec2::<f32>()?;
-                if !gate_vec.is_empty() {
-                    eprintln!(
-                        "[L1 Expert] gate first 8: {:?}",
-                        &gate_vec[0][..8.min(gate_vec[0].len())]
-                    );
-                }
-
-                let up_vec = up.to_vec2::<f32>()?;
-                if !up_vec.is_empty() {
-                    eprintln!(
-                        "[L1 Expert] up first 8: {:?}",
-                        &up_vec[0][..8.min(up_vec[0].len())]
-                    );
-                }
-            }
-
-            // Asymmetric clamp: gate has only max, up has both min and max
-            gate = gate.clamp(f32::NEG_INFINITY, self.limit)?;
-            up = up.clamp(-self.limit, self.limit)?;
-
-            let alpha_t = Tensor::new(self.alpha, xs.device())?.to_dtype(DType::F32)?;
-            let gate_alpha = gate.broadcast_mul(&alpha_t)?;
-            let sig = ops::sigmoid(&gate_alpha)?;
-            let glu = gate.broadcast_mul(&sig)?;
-
-            let one_t = Tensor::new(1.0f32, xs.device())?.to_dtype(DType::F32)?;
-            let up_plus = up.broadcast_add(&one_t)?;
-            let fused = up_plus.broadcast_mul(&glu)?;
-            let fused = fused.to_dtype(xs.dtype())?;
 
             if dump_l1 && xs.dims2()?.0 > 0 {
                 let fused_f32 = fused.to_dtype(DType::F32)?;
@@ -237,8 +211,84 @@ pub mod experts {
         }
     }
 
+    impl GptOssExperts {
+        /// GPU-only forward pass - no CPU synchronization
+        /// Uses token-centric routing for better performance on small batches
+        fn forward_fused(&self, xs: &Tensor) -> Result<Tensor> {
+            let (b, t, h) = xs.dims3()?;
+            let xs2 = xs.reshape(((), h))?;
+            let logits = xs2.apply(&self.router)?;
+
+            let (topk_idx, probs) = self.router_topk_softmax(&logits)?;
+
+            // topk_idx: [batch_seq, k] - expert indices for each token
+            // probs: [batch_seq, k] - routing weights
+
+            let batch_seq = b * t;
+            let k = self.num_experts_per_tok;
+            let num_experts = self.experts.len();
+            let mut ys = xs2.zeros_like()?;
+
+            // Transfer routing info once (smaller than old approach)
+            let topk_idx_vec = topk_idx.to_vec2::<u32>()?;  // [batch_seq, k]
+            let probs_vec = probs.to_vec2::<f32>()?;  // [batch_seq, k]
+
+            // Build expert->tokens mapping on CPU (fast for small batch)
+            use std::collections::HashMap;
+            let mut expert_tokens: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
+
+            for tok in 0..batch_seq {
+                for k_i in 0..k {
+                    let expert_id = topk_idx_vec[tok][k_i] as usize;
+                    let weight = probs_vec[tok][k_i];
+                    expert_tokens
+                        .entry(expert_id)
+                        .or_insert_with(Vec::new)
+                        .push((tok, weight));
+                }
+            }
+
+            // Process each expert that has tokens assigned
+            for (expert_id, token_list) in expert_tokens.iter() {
+                if token_list.is_empty() {
+                    continue;
+                }
+
+                // Extract token indices and weights
+                let token_ids: Vec<u32> = token_list.iter().map(|(t, _)| *t as u32).collect();
+                let weights: Vec<f32> = token_list.iter().map(|(_, w)| *w).collect();
+
+                let count = token_ids.len();
+
+                // Transfer to GPU
+                let ids_tensor = Tensor::from_vec(token_ids, count, xs2.device())?;
+                let weights_tensor = Tensor::from_vec(weights, count, xs2.device())?
+                    .to_dtype(xs2.dtype())?;  // Match dtype with activations
+
+                // Select inputs
+                let selected_inputs = xs2.index_select(&ids_tensor, 0)?;
+
+                // Forward through expert
+                let expert_outputs = self.experts[*expert_id].forward(&selected_inputs)?;
+
+                // Apply routing weights
+                let weighted_outputs = expert_outputs.broadcast_mul(&weights_tensor.unsqueeze(1)?)?;
+
+                // Accumulate to result
+                ys = ys.index_add(&ids_tensor, &weighted_outputs, 0)?;
+            }
+
+            let result = ys.reshape((b, t, h))?;
+            Ok(result)
+        }
+    }
+
     impl Module for GptOssExperts {
         fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+            // Use fused GPU-only path
+            return self.forward_fused(xs);
+
+            /* OLD CPU-sync path - keeping for reference but commented out
             let (b, t, h) = xs.dims3()?;
             let xs2 = xs.reshape(((), h))?;
             let logits = xs2.apply(&self.router)?;
@@ -318,6 +368,7 @@ pub mod experts {
 
             let result = ys.reshape((b, t, h))?;
             Ok(result)
+            */
         }
     }
 }
