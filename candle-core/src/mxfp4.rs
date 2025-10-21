@@ -299,11 +299,15 @@ pub fn matmul_mxfp4_bf16_cuda(
 
     let mut out_slice = unsafe { dev.alloc::<bf16>(rows * out_dim)? };
 
+    const TILE_COLS: usize = 32;
+    const TILE_K_BLOCKS: usize = 8;
+    let grid_y = (out_dim + TILE_COLS - 1) / TILE_COLS;
+
     let func = dev.get_or_load_func("matmul_mxfp4_bf16", &candle_kernels::QUANTIZED)?;
     let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (rows as u32, out_dim as u32, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
+        grid_dim: (rows as u32, grid_y as u32, 1),
+        block_dim: (32, 4, 1),
+        shared_mem_bytes: (TILE_K_BLOCKS * 32 * core::mem::size_of::<f32>()) as u32,
     };
     let mut builder = func.builder();
     builder.arg(&act_view);

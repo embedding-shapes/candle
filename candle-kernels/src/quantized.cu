@@ -2612,39 +2612,92 @@ extern "C" __global__ void matmul_mxfp4_bf16(
     const int act_row_stride,
     const int out_row_stride
 ) {
-    GGML_UNUSED(in_dim);
-    const int row = blockIdx.x;
-    const int col = blockIdx.y;
-    const int lane = threadIdx.x; // assume 32 threads per block
+    constexpr int warp_size = 32;
+    constexpr int elems_per_block = 32;
+    constexpr int bytes_per_block = 16;
+    constexpr int cols_per_warp = 8;
+    constexpr int lanes_per_column = warp_size / cols_per_warp; // 4 lanes cooperate per column.
+    constexpr int elems_per_lane = elems_per_block / lanes_per_column; // 8 values per lane.
+    constexpr int tile_k_blocks = 8; // decode 8*32 activations at a time.
 
-    if (row >= rows || col >= out_dim || lane >= 32) {
+    const int warps_per_block = blockDim.y;
+    const int tile_cols = cols_per_warp * warps_per_block;
+
+    const int row = blockIdx.x;
+    if (row >= rows) {
         return;
     }
 
-    const int elems_per_block = 32;
-    const int bytes_per_block = 16;
-    const int block_base = col * nblocks * bytes_per_block;
-    const int scale_base = col * nblocks;
+    const int tile_col = blockIdx.y;
+    const int lane = threadIdx.x; // [0, 31]
+    const int warp = threadIdx.y; // [0, warps_per_block)
+
+    const int lane_column = lane / lanes_per_column;      // local column index within the warp.
+    const int lane_offset = lane % lanes_per_column;       // which subset of the block we handle.
+
+    const int column = tile_col * tile_cols + warp * cols_per_warp + lane_column;
+    const bool column_active = column < out_dim;
+
     const __nv_bfloat16* act_row = act + (size_t)row * (size_t)act_row_stride;
-    const uint8_t* block_row = blocks + block_base;
-    const uint8_t* scale_row = scales + scale_base;
+    const uint8_t* block_col = column_active
+        ? blocks + (size_t)column * (size_t)nblocks * (size_t)bytes_per_block
+        : nullptr;
+    const uint8_t* scale_col = column_active
+        ? scales + (size_t)column * (size_t)nblocks
+        : nullptr;
+
+    extern __shared__ float act_shared[];
 
     float acc = 0.0f;
 
-    for (int b = 0; b < nblocks; ++b) {
-        const uint8_t packed = block_row[b * bytes_per_block + (lane >> 1)];
-        const uint8_t nibble = (lane & 1) ? (packed >> 4) : (packed & 0x0f);
-        const float decoded = 0.5f * (float)MXFP4_FP4_LUT[nibble];
-        const float scale = pow2_e8m0_device(scale_row[b]);
-        const int act_idx = b * elems_per_block + lane;
-        const float act_val = __bfloat162float(act_row[act_idx]);
-        acc += act_val * (decoded * scale);
+    for (int block_start = 0; block_start < nblocks; block_start += tile_k_blocks) {
+        const int blocks_this_iter = min(tile_k_blocks, nblocks - block_start);
+        const int shared_span = blocks_this_iter * elems_per_block;
+
+        for (int idx = warp * warp_size + lane; idx < shared_span; idx += warps_per_block * warp_size) {
+            const int act_idx = block_start * elems_per_block + idx;
+            const float value = act_idx < in_dim
+                ? __bfloat162float(act_row[act_idx])
+                : 0.0f;
+            act_shared[idx] = value;
+        }
+
+        __syncthreads();
+
+        if (column_active) {
+#pragma unroll
+            for (int b = 0; b < tile_k_blocks; ++b) {
+                if (b >= blocks_this_iter) {
+                    break;
+                }
+
+                const uint8_t* block_ptr = block_col + (size_t)(block_start + b) * (size_t)bytes_per_block;
+                const float scale = pow2_e8m0_device(scale_col[block_start + b]) * 0.5f;
+
+#pragma unroll
+                for (int step = 0; step < elems_per_lane; ++step) {
+                    const int elem = lane_offset * elems_per_lane + step; // [0, 31]
+                    const int byte_index = elem >> 1;
+                    const uint8_t packed = block_ptr[byte_index];
+                    const uint8_t nibble = (elem & 1) ? (packed >> 4) & 0x0f : (packed & 0x0f);
+                    const float weight = scale * (float)MXFP4_FP4_LUT[nibble];
+                    const float act_val = act_shared[b * elems_per_block + elem];
+                    acc += act_val * weight;
+                }
+            }
+        }
+
+        __syncthreads();
     }
 
-    acc = warp_reduce_sum(acc);
+    unsigned mask = 0xffffffffu;
+    for (int offset = lanes_per_column / 2; offset > 0; offset >>= 1) {
+        const float other = __shfl_xor_sync(mask, acc, offset);
+        acc += other;
+    }
 
-    if (lane == 0) {
-        out[(size_t)row * (size_t)out_row_stride + col] = __float2bfloat16(acc);
+    if (column_active && lane_offset == 0) {
+        out[(size_t)row * (size_t)out_row_stride + column] = __float2bfloat16(acc);
     }
 }
 
