@@ -299,7 +299,7 @@ pub fn matmul_mxfp4_bf16_cuda(
 
     let mut out_slice = unsafe { dev.alloc::<bf16>(rows * out_dim)? };
 
-    const TILE_COLS: usize = 32;
+    const TILE_COLS: usize = 16;
     const TILE_K_BLOCKS: usize = 8;
     let grid_y = (out_dim + TILE_COLS - 1) / TILE_COLS;
 

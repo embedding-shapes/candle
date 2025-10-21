@@ -2544,8 +2544,12 @@ static __device__ __forceinline__ float pow2_e8m0_device(uint8_t bexp) {
     if (bexp == 0xFFu) {
         return __int_as_float(0x7FC00000); // quiet NaN
     }
-    const int e = (int)bexp - 127;
-    return exp2f((float)e);
+    if (bexp == 0u) {
+        // Smallest positive representable power-of-two: 2^-127.
+        return __uint_as_float(0x00800000) * 0.5f;
+    }
+    const uint32_t bits = ((uint32_t)bexp) << 23;
+    return __uint_as_float(bits);
 }
 
 __device__ __constant__ int8_t MXFP4_FP4_LUT[16] = {
@@ -2615,9 +2619,9 @@ extern "C" __global__ void matmul_mxfp4_bf16(
     constexpr int warp_size = 32;
     constexpr int elems_per_block = 32;
     constexpr int bytes_per_block = 16;
-    constexpr int cols_per_warp = 8;
-    constexpr int lanes_per_column = warp_size / cols_per_warp; // 4 lanes cooperate per column.
-    constexpr int elems_per_lane = elems_per_block / lanes_per_column; // 8 values per lane.
+    constexpr int cols_per_warp = 4;
+    constexpr int lanes_per_column = warp_size / cols_per_warp; // 8 lanes cooperate per column.
+    constexpr int elems_per_lane = elems_per_block / lanes_per_column; // 4 values per lane.
     constexpr int tile_k_blocks = 8; // decode 8*32 activations at a time.
 
     const int warps_per_block = blockDim.y;
