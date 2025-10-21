@@ -1682,12 +1682,12 @@ pub fn load_expert_linear_mxfp4_grouped(
     let blocks = blocks_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb, 16)
     let scales = scales_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb)
 
-    // Use internal MXFP4 dequantization (verified to match float4 crate's F4E2M1/E8M0 decoding)
+    // Dequantize normally: this produces [out_dim, in_dim]
     let mut weight = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
 
     if matches!(std::env::var("CANDLE_DUMP_L1").ok().as_deref(), Some("1")) && expert_idx == 3 && base.contains("gate_up") {
         eprintln!("[MXFP4] Expert 3 gate_up_proj weight shape after dequant: {:?}", weight.dims());
-        eprintln!("[MXFP4] Expected: ({}, {})", out_dim, in_dim);
+        eprintln!("[MXFP4] Expected: ({}, {}) [out_dim, in_dim] for candle::Linear", out_dim, in_dim);
     }
 
     if !weight.device().same_device(vb.device()) {

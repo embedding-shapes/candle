@@ -11,182 +11,138 @@
 **Python output** (correct):
 ```
 Top prediction: <|channel|> (id=200005) with p=1.0000
-Response: <|channel|>analysis<|message|>The user asks: "What is the capital of France?"
-This is a straightforward question. Provide answer: Paris.<|end|>...
+Response: <|channel|>analysis<|message|>User asks "What is the capital of France?" ...
 ```
 
 **Rust output** (wrong):
 ```
 Top prediction: , (id=11) with p=0.5859
 <|channel|> (id=200005) has p=0.000000
-Response: , ( else, [, j, [,Leftrich -bits won....g*,, do. SApp P, (α.:, split I...
+Response: , ( else, [, j, [,Leftrich -bits won....
 ```
 
-The model predicts completely different next tokens, indicating **final logits are wrong**.
+The outputs diverge completely - Python predicts `<|channel|>` with near certainty, Rust assigns it near-zero probability.
 
-## Key Findings from Latest Investigation
+## Investigation Timeline & Key Findings
 
-### ✅ Router Logits Are CORRECT
+### ✅ Verified Correct Components
 
-**Discovery**: Router logits between Rust and Python **DO match**!
-- Rust raw router logits for last token Expert 3: `1.78125`
-- Python raw router logits for last token Expert 3: `1.7734375`
-- Difference: ~0.008 (within BF16 precision)
+1. **Embeddings** - Match exactly
+2. **lm_head weights** - Match exactly
+3. **Layer-0 input_layernorm output** - Matches within BF16 precision
+4. **Layer-0 attention (Q/K/V/O projections)** - Match within BF16 precision
+5. **Layer-0 post-attention-residual** - Matches
+6. **Layer-0 post-attention-norm** (MLP input) - Matches within BF16 precision
+   - Python: `[-0.09375, 0.51953125, 0.345703125, ...]`
+   - Rust: `[-0.09375, 0.51953125, 0.34570313, ...]`
+7. **Router logits** - Match within BF16 precision
+   - Python: `1.7734375`, Rust: `1.78125` (difference ~0.008)
+   - Earlier confusion: Python's router returns softmax probabilities, not raw logits
+8. **Router expert selection** - Correct: experts [3, 30, 11, 9]
+9. **MXFP4 dequantization math** - Spec-compliant (F4E2M1 + E8M0)
+10. **Gate/up interleaving** - Implemented correctly (even=gate, odd=up)
+11. **Asymmetric clamping** - Correct (gate: max-only at 7.0, up: min-max at ±7.0)
 
-**Confusion resolved**: Earlier tests showed Python router returning `0.427734375` for Expert 3, which was actually the **softmax probability after top-k selection**, NOT the raw logit. The Python `GptOssTopKRouter.forward()` returns a sparse tensor with softmax probabilities, not raw logits.
+### ❌ Divergence Point: MLP Output
 
-```python
-# Python router behavior:
-router_logits = F.linear(hidden_states, self.weight, self.bias)  # Raw logits
-router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
-router_top_value = torch.nn.functional.softmax(router_top_value, dim=1)  # Softmax on top-k
-router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)  # Sparse
-return router_scores, router_indices  # Returns softmax probs, not logits!
-```
-
-### ✅ MLP Input Matches
-
-Layer-0 post-attention-norm output (MLP input) for last token:
-- Python: `[-0.09375, 0.51953125, 0.345703125, -0.2275390625, -0.67578125, 0.41796875, -0.125, -0.625]`
-- Rust: `[-0.09375, 0.51953125, 0.34570313, -0.23242188, -0.6796875, 0.41796875, -0.12695313, -0.625]`
-- **Match within BF16 precision** ✅
-
-### ❌ MLP Output Does NOT Match
-
-Layer-0 MLP output for last token (from `/tmp/simple_mlp_test.py`):
+Layer-0 MLP output for last token shows **significant mismatch**:
 - Python: `[0.334, -0.316, 0.046, -0.289, -0.387, 2.469, -0.052, -0.135]`
 - Rust: `[0.330, -0.336, -0.187, -0.213, -0.828, -5.5, -0.0005, -0.055]`
-- **Significant mismatch** ❌
 
-This MLP output mismatch cascades through all remaining layers, causing wrong final logits and incoherent generation.
+This cascades through all 24 layers, resulting in completely wrong final logits.
 
-### ❌ Final Hidden State Does NOT Match
+### 🔍 MXFP4 Weight Layout Analysis (2025-10-21 Session)
 
-Rust debug output shows:
-```
-Hidden (after final norm) last token [:8]: [3.4375, -0.087402344, 10.0, 1.4765625, -6.59375, -3.609375, -1.453125, -10.375]
-```
+#### Python Transformers Implementation
+- **Storage**: safetensors has blocks `[E, out=5760, nb=90, 16]` and scales `[E, out, nb]`
+- **Process**: Reshapes blocks to `[E, out, nb*16]`, then transposes to `[E, nb*16, out]`
+- **Swizzle**: Applies hardware-specific layout transformations
+- **Result**: Sets shape to `[E, in=2880, out=5760]`
+- **Usage**: `input @ weight` (no transpose)
 
-This needs to be compared with Python's final hidden state.
+#### OpenAI Reference PyTorch Implementation
+- **Storage**: Same MXFP4 format in safetensors
+- **Process**: Dequantizes directly without transpose
+- **Result**: Weights are `[E, out=5760, in=2880]`
+- **Usage**: `torch.einsum("beck,bk->bec", weight, input)` which computes `weight[out,in] @ input[in]`
 
-## Verified Correct Components
+#### Current Rust Implementation
+- **Process**: Dequantizes directly without transpose
+- **Result**: Weights are `[out=5760, in=2880]` per expert
+- **Usage**: `candle::Linear` which does `input @ weight.T`
+- **Equivalence**: `input[batch,in] @ weight.T` = `input[batch,in] @ [in,out]` = `[batch,out]` ✓
 
-1. ✅ Embeddings match exactly
-2. ✅ lm_head weights match exactly
-3. ✅ Layer-0 input_layernorm output matches
-4. ✅ Layer-0 Q/K/V/O projections match (within BF16 precision)
-5. ✅ Layer-0 post-attention-residual matches
-6. ✅ Layer-0 post-attention-norm matches
-7. ✅ **Router logits match** (clarified in this session)
-8. ✅ Router expert selection correct: experts [3, 30, 11, 9]
-9. ✅ MXFP4 dequantization math is spec-compliant
-10. ✅ Gate/up interleaving is implemented correctly (even=gate, odd=up)
-11. ✅ Asymmetric clamping: gate max-only, up min-max (both 7.0)
+#### Analysis Conclusion
+All three approaches are **mathematically equivalent**:
+- Python transformers: `[batch,in] @ [in,out]`
+- OpenAI reference: `[out,in] @ [in]` via einsum
+- Rust candle: `[batch,in] @ [out,in].T` = `[batch,in] @ [in,out]`
 
-## Known Issues / Uncertainties
+**The weight layout is NOT the problem.**
 
-### Issue: Interleaved Split Didn't Change Output
+### 🔴 Critical Observation: Suspicious Behavior
 
-When switching from halves-based split to interleaved split (even=gate, odd=up), the MLP output **remained exactly the same**. This is suspicious and suggests:
-1. Either the weights themselves happen to work with both layouts (unlikely)
-2. Or there's another issue masking the interleaving fix
-3. Or the change wasn't actually applied correctly despite debug output confirming it
+When interleaved split was implemented (fixing from halves to even/odd indices), **the MLP output remained exactly the same**. This suggests:
+1. The fix didn't actually take effect, OR
+2. There's a more fundamental bug masking the fix, OR
+3. Some other component is wrong
 
-### Next Steps: Ground-Up Testing Strategy
+### 📊 Current Divergence Magnitude
 
-Create small, isolated Rust/Python test pairs to validate each component:
+Final hidden states show massive difference:
+- Python gives `<|channel|>` probability = **1.0000**
+- Rust gives `<|channel|>` probability = **0.000000**
 
-1. **Test embeddings**: Verify token embeddings match for exact prompt
-2. **Test layer-0 attention**: Verify attention output matches
-3. **Test layer-0 MLP**:
-   - Test router forward pass
-   - Test single expert forward (Expert 3) with known input
-   - Test gate_up projection
-   - Test gate/up split
-   - Test GLU computation
-   - Test down projection
-   - Test expert aggregation
-4. **Test final hidden state**: Verify output after all 24 layers + final norm
-5. **Test lm_head**: Verify logits computation
+This is not a minor numerical difference - it's a fundamental computation error.
 
-## Testing Framework
+## References
 
-### Existing Tests
-- `gpt_oss_step2_mxfp4_parity.rs` - MXFP4 dequantization parity
-- `gpt_oss_step3_matmul.rs` - Matrix multiplication test
-- `gpt_oss_step6_cpu_vs_gpu.rs` - index_select CPU vs GPU
-- Many component tests in `candle-transformers/tests/`
+### OpenAI Official Repository
+Located in `./openai-gpt-oss/` - contains reference PyTorch implementation:
+- `gpt_oss/torch/model.py` - Model architecture
+- `gpt_oss/torch/weights.py` - MXFP4 dequantization reference
+- Confirms weight layout: `[num_experts, out, in]` with einsum usage
 
-### Python Test Scripts (in /tmp/)
-- `simple_mlp_test.py` - Basic MLP input/output capture
-- `test_routing_detail.py` - Router logits analysis
-- `test_router_manual.py` - Manual router computation
+### Test Scripts
+Located in `/tmp/`:
+- `simple_mlp_test.py` - Captures MLP input/output
+- `test_routing_detail.py` - Router analysis
+- `test_mxfp4_dequant_layout.py` - Layout verification
+- `test_actual_mxfp4_values.py` - Direct weight comparison
+- Many others for component testing
 
-## Commands for Testing
+## Next Steps
+
+The bug is **NOT** in:
+- MXFP4 weight layout/transpose
+- Router computation
+- Attention computation
+- Embeddings or lm_head
+
+The bug **IS** in the MLP forward computation somewhere. Need to create a **minimal focused parity test**:
+
+1. Load identical input tensor in Python and Rust
+2. Run through layer-0 MLP expert-3 ONLY
+3. Compare gate_up output, GLU output, down output
+4. Identify exact operation that diverges
+
+## Commands
 
 ```bash
-# Run Rust with debug output (single token generation)
+# Rust with debug
 CANDLE_DUMP_L1=1 cargo run --release --features cuda,flash-attn --example gpt-oss-20b \
   --prompt "What is the capital of France?" --sample-len 1
 
-# Run Python reference (full generation)
+# Python reference
 uv run python gpt_oss_transformers.py
 
-# Run parity tests
+# Component tests
 cargo test --release --features cuda --test <test_name> -- --nocapture
 ```
 
 ## Important Notes
 
-- **DO NOT run `cargo clean`** - flash-attn takes 5+ minutes to recompile
+- **DO NOT run `cargo clean`** - flash-attn takes 5+ minutes to rebuild
 - **Always use `uv run python`** to respect .venv
-- **Test prompt**: "What is the capital of France?"
-- **Model path**: `~/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee/`
-- **Python model** uses MXFP4GptOssExperts which fuses all 32 experts into single tensors
-
-## Focus Area
-
-The divergence starts at **Layer-0 MLP output**. Since router logits and MLP input match, the issue must be in:
-- Expert MLP forward computation (gate_up projection, split, GLU, down projection)
-- Expert output aggregation
-- Or weight loading/layout for expert MLP weights
-
-Need to create focused tests comparing Rust vs Python for single expert forward pass with known inputs.
-
-## ROOT CAUSE IDENTIFIED (2025-10-21)
-
-### MXFP4 Weight Layout Mismatch
-
-**Python** (transformers/integrations/mxfp4.py):
-- Line 394: Reshapes blocks from `[E, out, nb, 16]` to `[E, out, -1]`
-- Line 403: **Transposes blocks** before swizzling: `blocks.transpose(-2, -1)`
-- Line 408: Sets final weight shape to `[E, in, out]` (for gate_up_proj)
-- Matmul: `input @ weight` (NO transpose during forward)
-- Result: Weights stored in `[in_features, out_features]` layout
-
-**Rust** (candle-transformers/src/models/gpt_oss.rs):
-- Line 1686: Dequantizes blocks directly with shape `[out_dim, in_dim]`
-- NO transpose of blocks before or after dequantization
-- candle_nn::Linear (line 49-70 of linear.rs): Does `input @ weight.T`
-- Result: Weights stored in `[out_features, in_features]` layout
-
-### The Problem
-
-Simply transposing after dequantization causes a **double-transpose issue**:
-1. Rust dequants to `[out, in]` then transposes to `[in, out]`
-2. Candle Linear transposes back: `weight.T` → `[out, in]`
-3. This causes shape mismatch: trying to do `[batch, in] @ [out, in]` which is invalid
-
-The error: `shape mismatch in matmul, lhs: [10, 2880], rhs: [5760, 2880]`
-- lhs is input: `[batch=10, in=2880]`
-- rhs is weight after Linear's transpose: `[out=5760, in=2880]` (wrong!)
-
-### Required Fix
-
-One of these approaches is needed:
-
-1. **Change MXFP4 dequantization** to actually transpose/reshape blocks before dequant to match Python's `blocks.transpose(-2, -1)` operation, OR
-2. **Create a "pre-transposed" Linear variant** that doesn't apply `.T` during forward, for use with MXFP4 weights, OR
-3. **Change how blocks are interpreted** during dequantization to produce `[in, out]` layout by modifying the dequant_mxfp4_to_bf16 function's block iteration order
-
-The fix requires deeper changes to either the MXFP4 dequantization process or the Linear layer behavior - not just a simple transpose after loading.
+- Model: `~/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee/`
+- Test prompt: "What is the capital of France?"
