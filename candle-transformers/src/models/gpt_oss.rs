@@ -86,7 +86,7 @@ pub mod config {
 
 pub mod experts {
     use crate::models::deepseek2::TopKLastDimOp;
-    use candle::{DType, Module, Result, Tensor, D};
+    use candle::{DType, IndexOp, Module, Result, Tensor, D};
     use candle_nn::{ops, Linear};
 
     // Configurable constants
@@ -245,55 +245,30 @@ pub mod experts {
 
             let (topk_idx, probs) = self.router_topk_softmax(&logits)?;
 
+            // Optimized routing: minimize CPU↔GPU transfers
+            // Key: sync once, then keep all computation on GPU
+            let n_experts = self.experts.len();
+
+            // ONE-TIME D2H sync for routing info
             let probs = probs.to_dtype(DType::F32)?;
             let probs_host = probs.to_vec2::<f32>()?;
             let idx_host = topk_idx.to_vec2::<u32>()?;
 
-            let dump_l1 = std::env::var("CANDLE_DUMP_L1").ok().as_deref() == Some("1");
-            if dump_l1 {
-                let last_idx = probs_host.len() - 1;
-                eprintln!(
-                    "[L1 MLP Router] Last token routes to: {:?}",
-                    &idx_host[last_idx]
-                );
-                eprintln!(
-                    "[L1 MLP Router] Last token probs: {:?}",
-                    &probs_host[last_idx]
-                );
-
-                // Debug: print raw router logits for last token
-                let logits_f32 = logits.to_dtype(DType::F32)?;
-                let logits_host = logits_f32.to_vec2::<f32>()?;
-                eprintln!(
-                    "[L1 MLP Router] Last token raw logits (all 32): {:?}",
-                    &logits_host[last_idx]
-                );
-
-                // Debug: print top-k values before softmax
-                let topk_result = logits.contiguous()?.topk(self.num_experts_per_tok)?;
-                let topk_vals_f32 = topk_result.values.to_dtype(DType::F32)?;
-                let topk_vals_host = topk_vals_f32.to_vec2::<f32>()?;
-                eprintln!(
-                    "[L1 MLP Router] Last token top-4 logits (before softmax): {:?}",
-                    &topk_vals_host[last_idx]
-                );
-            }
-
-            let n_experts = self.experts.len();
+            // CPU-side organization (fast)
             let mut token_ids: Vec<Vec<u32>> = vec![Vec::new(); n_experts];
             let mut token_wts: Vec<Vec<f32>> = vec![Vec::new(); n_experts];
-            for (row, (row_probs, row_experts)) in
-                probs_host.iter().zip(idx_host.iter()).enumerate()
-            {
+            for (row, (row_probs, row_experts)) in probs_host.iter().zip(idx_host.iter()).enumerate() {
                 for (&p, &e) in row_probs.iter().zip(row_experts.iter()) {
                     token_ids[e as usize].push(row as u32);
                     token_wts[e as usize].push(p);
                 }
             }
 
+            // Count assignments per expert
             let counts: Vec<usize> = token_ids.iter().map(|ids| ids.len()).collect();
             let total_assignments: usize = counts.iter().sum();
 
+            // Flatten into single arrays for BATCHED H2D transfer (much faster!)
             let mut flat_ids = Vec::with_capacity(total_assignments);
             let mut flat_wts = Vec::with_capacity(total_assignments);
             for e_idx in 0..n_experts {
@@ -301,6 +276,7 @@ pub mod experts {
                 flat_wts.extend_from_slice(&token_wts[e_idx]);
             }
 
+            // SINGLE H2D transfer for all indices and weights
             let ids_all = if total_assignments == 0 {
                 Tensor::zeros((0,), DType::U32, xs2.device())?
             } else {
@@ -315,72 +291,30 @@ pub mod experts {
                     .reshape((total_assignments, 1))?
             };
 
-            let mut offset = 0usize;
-            let dump_l1 = std::env::var("CANDLE_DUMP_L1").ok().as_deref() == Some("1");
-
+            // GPU-resident expert processing
             let mut ys = xs2.zeros_like()?;
+            let mut offset = 0usize;
+
             for (e_idx, expert) in self.experts.iter().enumerate() {
                 let count = counts[e_idx];
                 if count == 0 {
                     continue;
                 }
 
+                // Extract this expert's slice from the batched tensors (NO H2D!)
                 let ids_t = ids_all.narrow(0, offset, count)?;
                 let wts_t = weights_all.narrow(0, offset, count)?;
+
+                // All ops GPU-only
                 let x_sel = xs2.index_select(&ids_t, 0)?;
-                if dump_l1 {
-                    eprintln!(
-                        "[L1 MLP] Expert {}: {} tokens, weights: {:?}",
-                        e_idx,
-                        count,
-                        &token_wts[e_idx]
-                    );
-                }
                 let y_sel = expert.forward(&x_sel)?;
-                if dump_l1 && token_ids[e_idx].contains(&((probs_host.len() - 1) as u32)) {
-                    let y_sel_f32 = y_sel.to_dtype(DType::F32)?;
-                    let y_sel_vec = y_sel_f32.to_vec2::<f32>()?;
-                    let last_in_batch = token_ids[e_idx]
-                        .iter()
-                        .position(|&id| id == ((probs_host.len() - 1) as u32))
-                        .unwrap();
-                    eprintln!(
-                        "[L1 MLP] Expert {} last token output (before weight): {:?}",
-                        e_idx,
-                        &y_sel_vec[last_in_batch][..8]
-                    );
-                }
                 let y_sel = y_sel.broadcast_mul(&wts_t)?;
-                if dump_l1 && token_ids[e_idx].contains(&((probs_host.len() - 1) as u32)) {
-                    let y_sel_f32 = y_sel.to_dtype(DType::F32)?;
-                    let y_sel_vec = y_sel_f32.to_vec2::<f32>()?;
-                    let last_in_batch = token_ids[e_idx]
-                        .iter()
-                        .position(|&id| id == ((probs_host.len() - 1) as u32))
-                        .unwrap();
-                    let weight = token_wts[e_idx][last_in_batch];
-                    eprintln!(
-                        "[L1 MLP] Expert {} last token output (after weight {}): {:?}",
-                        e_idx,
-                        weight,
-                        &y_sel_vec[last_in_batch][..8]
-                    );
-                }
                 ys = ys.index_add(&ids_t, &y_sel, 0)?;
+
                 offset += count;
             }
+
             let result = ys.reshape((b, t, h))?;
-            if dump_l1 {
-                let result_f32 = result.to_dtype(DType::F32)?;
-                let result_vec = result_f32.to_vec3::<f32>()?;
-                if !result_vec.is_empty() && !result_vec[0].is_empty() {
-                    let last_idx = result_vec[0].len() - 1;
-                    eprintln!(
-                        "[L1 MLP] Final aggregated last token [:8]: {:?}",
-                        &result_vec[0][last_idx][..8]
-                    );
-                }
-            }
             Ok(result)
         }
     }
