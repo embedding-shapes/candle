@@ -8,6 +8,8 @@
 
 use candle::{DType, Result, Tensor, D};
 use candle_nn::Linear;
+use float4::{MXFP4Block, F4E2M1, E8M0};
+use half::bf16;
 
 // Centralized GPT-OSS implementation: inline submodules.
 // Keep public API paths stable (config::, experts::, rotary::, model::).
@@ -113,14 +115,40 @@ pub mod experts {
             let (_n, two_inter) = gu.dims2()?;
             let inter = two_inter / 2;
 
-            // Python uses interleaved layout: gate_up[..., ::2], gate_up[..., 1::2]
-            // Extract even indices for gate, odd indices for up
-            let gate_indices: Vec<u32> = (0..inter).map(|i| (i * 2) as u32).collect();
-            let up_indices: Vec<u32> = (0..inter).map(|i| (i * 2 + 1) as u32).collect();
-            let gate_idx_t = Tensor::new(gate_indices.as_slice(), gu.device())?;
-            let up_idx_t = Tensor::new(up_indices.as_slice(), gu.device())?;
-            let mut gate = gu.index_select(&gate_idx_t, D::Minus1)?;
-            let mut up = gu.index_select(&up_idx_t, D::Minus1)?;
+            let dump_l1 = std::env::var("CANDLE_DUMP_L1").ok().as_deref() == Some("1");
+
+            // Interleaved split: gate = even indices [0,2,4,...], up = odd indices [1,3,5,...]
+            // Python: gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+            // Use index_select to extract even/odd indices
+            let device = gu.device();
+            let even_indices: Vec<u32> = (0..inter).map(|i| (i * 2) as u32).collect();
+            let odd_indices: Vec<u32> = (0..inter).map(|i| (i * 2 + 1) as u32).collect();
+
+            let even_idx_tensor = Tensor::from_vec(even_indices, inter, device)?;
+            let odd_idx_tensor = Tensor::from_vec(odd_indices, inter, device)?;
+
+            let mut gate = gu.index_select(&even_idx_tensor, D::Minus1)?;
+            let mut up = gu.index_select(&odd_idx_tensor, D::Minus1)?;
+
+            if dump_l1 && xs.dims2()?.0 > 0 {
+                eprintln!("[L1 Expert] Using INTERLEAVED split (even=gate, odd=up)");
+                // Debug: print first few values of gate_up, gate, and up
+                let gu_f32 = gu.to_dtype(DType::F32)?;
+                let gu_vec = gu_f32.to_vec2::<f32>()?;
+                if !gu_vec.is_empty() {
+                    eprintln!("[L1 Expert] gate_up first 16: {:?}", &gu_vec[0][..16.min(gu_vec[0].len())]);
+                }
+
+                let gate_vec = gate.to_vec2::<f32>()?;
+                if !gate_vec.is_empty() {
+                    eprintln!("[L1 Expert] gate first 8: {:?}", &gate_vec[0][..8.min(gate_vec[0].len())]);
+                }
+
+                let up_vec = up.to_vec2::<f32>()?;
+                if !up_vec.is_empty() {
+                    eprintln!("[L1 Expert] up first 8: {:?}", &up_vec[0][..8.min(up_vec[0].len())]);
+                }
+            }
 
             // Asymmetric clamp: gate has only max, up has both min and max
             gate = gate.clamp(f32::NEG_INFINITY, self.limit)?;
@@ -174,6 +202,24 @@ pub mod experts {
             let probs_host = probs.to_vec2::<f32>()?;
             let idx_host = topk_idx.to_vec2::<u32>()?;
 
+            let dump_l1 = std::env::var("CANDLE_DUMP_L1").ok().as_deref() == Some("1");
+            if dump_l1 {
+                let last_idx = probs_host.len() - 1;
+                eprintln!("[L1 MLP Router] Last token routes to: {:?}", &idx_host[last_idx]);
+                eprintln!("[L1 MLP Router] Last token probs: {:?}", &probs_host[last_idx]);
+
+                // Debug: print raw router logits for last token
+                let logits_f32 = logits.to_dtype(DType::F32)?;
+                let logits_host = logits_f32.to_vec2::<f32>()?;
+                eprintln!("[L1 MLP Router] Last token raw logits (all 32): {:?}", &logits_host[last_idx]);
+
+                // Debug: print top-k values before softmax
+                let topk_result = logits.contiguous()?.topk(self.num_experts_per_tok)?;
+                let topk_vals_f32 = topk_result.values.to_dtype(DType::F32)?;
+                let topk_vals_host = topk_vals_f32.to_vec2::<f32>()?;
+                eprintln!("[L1 MLP Router] Last token top-4 logits (before softmax): {:?}", &topk_vals_host[last_idx]);
+            }
+
             let n_experts = self.experts.len();
             let mut token_ids: Vec<Vec<u32>> = vec![Vec::new(); n_experts];
             let mut token_wts: Vec<Vec<f32>> = vec![Vec::new(); n_experts];
@@ -183,6 +229,8 @@ pub mod experts {
                     token_wts[e as usize].push(p);
                 }
             }
+
+            let dump_l1 = std::env::var("CANDLE_DUMP_L1").ok().as_deref() == Some("1");
 
             let mut ys = xs2.zeros_like()?;
             for (e_idx, expert) in self.experts.iter().enumerate() {
@@ -195,6 +243,9 @@ pub mod experts {
                     .reshape(((), 1))?
                     .to_dtype(xs2.dtype())?;
                 let x_sel = xs2.index_select(&ids_t, 0)?;
+                if dump_l1 {
+                    eprintln!("[L1 MLP] Expert {}: {} tokens, weights: {:?}", e_idx, ids.len(), &token_wts[e_idx]);
+                }
                 let y_sel = expert.forward(&x_sel)?;
                 let y_sel = y_sel.broadcast_mul(&wts_t)?;
                 ys = ys.index_add(&ids_t, &y_sel, 0)?;
@@ -1476,7 +1527,99 @@ pub fn load_linear_maybe_mxfp4(
     candle_nn::linear_b(in_dim, out_dim, bias, vb_bf16)
 }
 
-/// Load a single expert’s Linear from grouped MXFP4 tensors stored under a common base
+/// Dequantize MXFP4 blocks using the external float4 crate for spec-compliant behavior.
+///
+/// This function uses the `float4` crate's MXFP4Block implementation which follows
+/// the OCP MX specification exactly, ensuring proper memory layout and dequantization.
+///
+/// # Arguments
+/// * `blocks` - U8 tensor shaped `[rows, nblocks, 16]` where each 16-byte block packs 32 FP4 values
+/// * `scales` - U8 tensor shaped `[rows, nblocks]` with E8M0 scale factors
+/// * `full_shape` - Target shape `[rows, cols]` where `cols = nblocks * 32`
+///
+/// # Returns
+/// A BF16 tensor with shape `[rows, cols]` containing the dequantized weights
+fn dequant_mxfp4_with_float4(
+    blocks: &Tensor,
+    scales: &Tensor,
+    full_shape: [usize; 2],
+) -> Result<Tensor> {
+    let [rows, cols] = full_shape;
+    if cols % MXFP4_BLOCK_ELEMS != 0 {
+        candle::bail!("MXFP4 cols must be multiple of 32, got {cols}");
+    }
+    let nblocks = cols / MXFP4_BLOCK_ELEMS;
+
+    // Validate shapes
+    if blocks.dims() != [rows, nblocks, MXFP4_BLOCK_BYTES] {
+        candle::bail!(
+            "MXFP4 blocks shape mismatch: expected [{}, {}, 16], got {:?}",
+            rows, nblocks, blocks.dims()
+        );
+    }
+    if scales.dims() != [rows, nblocks] {
+        candle::bail!(
+            "MXFP4 scales shape mismatch: expected [{}, {}], got {:?}",
+            rows, nblocks, scales.dims()
+        );
+    }
+
+    // Move to CPU for processing (float4 crate works on CPU)
+    let blocks_cpu = blocks.to_device(&candle::Device::Cpu)?;
+    let scales_cpu = scales.to_device(&candle::Device::Cpu)?;
+
+    // Materialize to CPU host vectors
+    let blocks_v = blocks_cpu.to_vec3::<u8>()?; // [rows][nblocks][16]
+    let scales_v = scales_cpu.to_vec2::<u8>()?; // [rows][nblocks]
+
+    // Output buffer - use f32 for intermediate computations then convert to bf16
+    let mut out: Vec<bf16> = vec![bf16::ZERO; rows * cols];
+
+    for r in 0..rows {
+        let row_off = r * cols;
+        let row_blocks = &blocks_v[r];
+        let row_scales = &scales_v[r];
+
+        for b in 0..nblocks {
+            // Create E8M0 scale from the u8 value
+            let scale = E8M0::from_bits(row_scales[b]);
+
+            // Unpack 16 bytes into 32 F4E2M1 values
+            // Each byte contains two 4-bit values: low nibble = even index, high nibble = odd index
+            let mut f4_values = [F4E2M1::from_bits(0); 32];
+            let packed = &row_blocks[b]; // 16 bytes
+            for j in 0..MXFP4_BLOCK_BYTES {
+                let byte = packed[j];
+                // Low nibble goes to even index (2*j)
+                f4_values[2 * j] = F4E2M1::from_bits(byte & 0x0F);
+                // High nibble goes to odd index (2*j + 1)
+                f4_values[2 * j + 1] = F4E2M1::from_bits((byte >> 4) & 0x0F);
+            }
+
+            // Create MXFP4Block and dequantize
+            let block = MXFP4Block::from_f32_slice(f4_values, scale);
+            let values = block.to_f32_array();
+
+            // Copy to output buffer, converting f32 -> bf16
+            let col_start = b * MXFP4_BLOCK_ELEMS;
+            for i in 0..MXFP4_BLOCK_ELEMS {
+                out[row_off + col_start + i] = bf16::from_f32(values[i]);
+            }
+        }
+    }
+
+    // Create tensor on CPU first
+    let result = Tensor::from_vec(out, (rows, cols), &candle::Device::Cpu)?;
+
+    // Move back to original device if needed
+    if !result.device().same_device(blocks.device()) {
+        result.to_device(blocks.device())
+    } else {
+        Ok(result)
+    }
+}
+
+/// Load a single expert's Linear from grouped MXFP4 tensors stored under a common base
 /// such as "experts.gate_up_proj" where the underlying tensors have a leading expert
 /// dimension, e.g. `blocks: [n_experts, out_dim, in_dim/32, 16]` and `scales: [n_experts, out_dim, in_dim/32]`.
 ///
@@ -1539,7 +1682,14 @@ pub fn load_expert_linear_mxfp4_grouped(
     let blocks = blocks_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb, 16)
     let scales = scales_g.narrow(0, expert_idx, 1)?.squeeze(0)?; // (out, nb)
 
+    // Use internal MXFP4 dequantization (verified to match float4 crate's F4E2M1/E8M0 decoding)
     let mut weight = candle::mxfp4::dequant_mxfp4_to_bf16(&blocks, &scales, [out_dim, in_dim])?;
+
+    if matches!(std::env::var("CANDLE_DUMP_L1").ok().as_deref(), Some("1")) && expert_idx == 3 && base.contains("gate_up") {
+        eprintln!("[MXFP4] Expert 3 gate_up_proj weight shape after dequant: {:?}", weight.dims());
+        eprintln!("[MXFP4] Expected: ({}, {})", out_dim, in_dim);
+    }
+
     if !weight.device().same_device(vb.device()) {
         weight = weight.to_device(vb.device())?;
     }
