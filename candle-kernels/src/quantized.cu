@@ -3003,9 +3003,10 @@ static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
     constexpr int blocks_per_iter = MMQ_ITER_K / 32;  // 8 blocks = 256 elements
 
     // Shared memory for weights (INT8 + scales)
-    // Layout: [mmq_y][2*MMQ_TILE_NE_K+1] for INT8 weights (65 stride for bank conflict avoidance)
-    __shared__ int weight_qs_shared[mmq_y * (2 * MMQ_TILE_NE_K + 1)];
-    __shared__ float weight_scales_shared[mmq_y * blocks_per_iter];
+    // Layout: [mmq_x][2*MMQ_TILE_NE_K+1] for INT8 weights (65 stride for bank conflict avoidance)
+    // We load mmq_x weight rows (one per output column in the tile)
+    __shared__ int weight_qs_shared[mmq_x * (2 * MMQ_TILE_NE_K + 1)];
+    __shared__ float weight_scales_shared[mmq_x * blocks_per_iter];
 
     // Thread block computes output tile [row, row+mmq_y) × [col, col+mmq_x)
     const int row_base = blockIdx.x * mmq_y;
@@ -3031,15 +3032,15 @@ static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
     for (int k_block = 0; k_block < nblocks; k_block += blocks_per_iter) {
         const int blocks_this_iter = min(blocks_per_iter, nblocks - k_block);
 
-        // Cooperatively load mmq_y rows of weights into shared memory
-        // Each thread block loads blocks_per_iter blocks (256 elements)
+        // Cooperatively load mmq_x weight rows into shared memory
+        // Each thread block loads blocks_per_iter blocks (256 elements) for mmq_x output columns
         load_tiles_mxfp4_fast<mmq_x, mmq_y>(
             blocks, scales,
             weight_qs_shared, weight_scales_shared,
-            col_base,           // row_offset in weight matrix
+            col_base,           // row_offset in weight matrix (output column dimension)
             k_block,            // block_offset in K dimension
             nblocks,            // total blocks per row
-            min(mmq_y, out_dim - col_base)  // num_rows_to_load
+            min(mmq_x, out_dim - col_base)  // num_rows_to_load (mmq_x weight rows)
         );
 
         __syncthreads();

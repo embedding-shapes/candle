@@ -461,17 +461,26 @@ pub fn matmul_mxfp4_bf16_mmq_cuda(
     // Allocate output buffer
     let mut out_slice = unsafe { dev.alloc::<bf16>(rows * out_dim)? };
 
-    // Simplified MMQ configuration: 1 thread = 1 output
-    const THREADS_PER_BLOCK: usize = 256;
-    let grid_x = rows;
-    let grid_y = (out_dim + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    // MMQ configuration matching kernel expectations
+    // The matmul_mxfp4_bf16_mmq_tiled<64, 2> kernel uses:
+    // - mmq_x = 64 (tile width in output columns)
+    // - mmq_y = 2 (tile height in output rows)
+    // - nwarps = 4 (MMQ_NWARPS)
+    // - Block layout: (32, 4, 1) = 32 threads × 4 warps = 128 threads
+    const MMQ_X: usize = 64;  // Tile width
+    const MMQ_Y: usize = 2;   // Tile height
+    const NWARPS: usize = 4;  // Number of warps per block
+    const WARP_SIZE: usize = 32;
+
+    let grid_x = (rows + MMQ_Y - 1) / MMQ_Y;
+    let grid_y = (out_dim + MMQ_X - 1) / MMQ_X;
 
     // Load and launch MMQ kernel
     let func = dev.get_or_load_func("matmul_mxfp4_bf16_mmq", &candle_kernels::QUANTIZED)?;
 
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (grid_x as u32, grid_y as u32, 1),
-        block_dim: (THREADS_PER_BLOCK as u32, 1, 1),
+        block_dim: (WARP_SIZE as u32, NWARPS as u32, 1),
         shared_mem_bytes: 0,
     };
 
