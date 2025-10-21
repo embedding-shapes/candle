@@ -8,8 +8,6 @@
 
 use candle::{DType, Result, Tensor, D};
 use candle_nn::Linear;
-use float4::{MXFP4Block, F4E2M1, E8M0};
-use half::bf16;
 
 // Centralized GPT-OSS implementation: inline submodules.
 // Keep public API paths stable (config::, experts::, rotary::, model::).
@@ -1566,98 +1564,6 @@ pub fn load_linear_maybe_mxfp4(
     // Fallback: standard BF16 linear loading under "{base}.weight" and optional bias.
     let vb_bf16 = vb.to_dtype(DType::BF16).pp(base);
     candle_nn::linear_b(in_dim, out_dim, bias, vb_bf16)
-}
-
-/// Dequantize MXFP4 blocks using the external float4 crate for spec-compliant behavior.
-///
-/// This function uses the `float4` crate's MXFP4Block implementation which follows
-/// the OCP MX specification exactly, ensuring proper memory layout and dequantization.
-///
-/// # Arguments
-/// * `blocks` - U8 tensor shaped `[rows, nblocks, 16]` where each 16-byte block packs 32 FP4 values
-/// * `scales` - U8 tensor shaped `[rows, nblocks]` with E8M0 scale factors
-/// * `full_shape` - Target shape `[rows, cols]` where `cols = nblocks * 32`
-///
-/// # Returns
-/// A BF16 tensor with shape `[rows, cols]` containing the dequantized weights
-fn dequant_mxfp4_with_float4(
-    blocks: &Tensor,
-    scales: &Tensor,
-    full_shape: [usize; 2],
-) -> Result<Tensor> {
-    let [rows, cols] = full_shape;
-    if cols % MXFP4_BLOCK_ELEMS != 0 {
-        candle::bail!("MXFP4 cols must be multiple of 32, got {cols}");
-    }
-    let nblocks = cols / MXFP4_BLOCK_ELEMS;
-
-    // Validate shapes
-    if blocks.dims() != [rows, nblocks, MXFP4_BLOCK_BYTES] {
-        candle::bail!(
-            "MXFP4 blocks shape mismatch: expected [{}, {}, 16], got {:?}",
-            rows, nblocks, blocks.dims()
-        );
-    }
-    if scales.dims() != [rows, nblocks] {
-        candle::bail!(
-            "MXFP4 scales shape mismatch: expected [{}, {}], got {:?}",
-            rows, nblocks, scales.dims()
-        );
-    }
-
-    // Move to CPU for processing (float4 crate works on CPU)
-    let blocks_cpu = blocks.to_device(&candle::Device::Cpu)?;
-    let scales_cpu = scales.to_device(&candle::Device::Cpu)?;
-
-    // Materialize to CPU host vectors
-    let blocks_v = blocks_cpu.to_vec3::<u8>()?; // [rows][nblocks][16]
-    let scales_v = scales_cpu.to_vec2::<u8>()?; // [rows][nblocks]
-
-    // Output buffer - use f32 for intermediate computations then convert to bf16
-    let mut out: Vec<bf16> = vec![bf16::ZERO; rows * cols];
-
-    for r in 0..rows {
-        let row_off = r * cols;
-        let row_blocks = &blocks_v[r];
-        let row_scales = &scales_v[r];
-
-        for b in 0..nblocks {
-            // Create E8M0 scale from the u8 value
-            let scale = E8M0::from_bits(row_scales[b]);
-
-            // Unpack 16 bytes into 32 F4E2M1 values
-            // Each byte contains two 4-bit values: low nibble = even index, high nibble = odd index
-            let mut f4_values = [F4E2M1::from_bits(0); 32];
-            let packed = &row_blocks[b]; // 16 bytes
-            for j in 0..MXFP4_BLOCK_BYTES {
-                let byte = packed[j];
-                // Low nibble goes to even index (2*j)
-                f4_values[2 * j] = F4E2M1::from_bits(byte & 0x0F);
-                // High nibble goes to odd index (2*j + 1)
-                f4_values[2 * j + 1] = F4E2M1::from_bits((byte >> 4) & 0x0F);
-            }
-
-            // Create MXFP4Block and dequantize
-            let block = MXFP4Block::from_f32_slice(f4_values, scale);
-            let values = block.to_f32_array();
-
-            // Copy to output buffer, converting f32 -> bf16
-            let col_start = b * MXFP4_BLOCK_ELEMS;
-            for i in 0..MXFP4_BLOCK_ELEMS {
-                out[row_off + col_start + i] = bf16::from_f32(values[i]);
-            }
-        }
-    }
-
-    // Create tensor on CPU first
-    let result = Tensor::from_vec(out, (rows, cols), &candle::Device::Cpu)?;
-
-    // Move back to original device if needed
-    if !result.device().same_device(blocks.device()) {
-        result.to_device(blocks.device())
-    } else {
-        Ok(result)
-    }
 }
 
 /// Load a single expert's Linear from grouped MXFP4 tensors stored under a common base

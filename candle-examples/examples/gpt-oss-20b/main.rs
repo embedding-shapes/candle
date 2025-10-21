@@ -1,14 +1,14 @@
 use anyhow::{bail, Context as _, Result};
 use clap::Parser;
 
-use candle::{DType, IndexOp, Module, Tensor};
+use candle::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::gpt_oss::config::GptOssConfig;
 use candle_transformers::models::gpt_oss::model::GptOssModel;
 
 use openai_harmony::{chat::{Message, Role}};
-use gpt_oss_tokenizer::{render_then_encode, load_stop_token_ids, extract_final_assistant_text_from_decoded, allowed_specials_for_next};
+use gpt_oss_tokenizer::{render_then_encode, load_stop_token_ids, extract_final_assistant_text_from_decoded};
 
 // Constants
 const DEFAULT_SNAPSHOT_DIR: &str =
@@ -163,21 +163,6 @@ fn main() -> Result<()> {
     let hf_tok = tokenizers::Tokenizer::from_file(&tok_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
 
-    // Build a conservative global set of Harmony specials that are suppressed by default
-    // and re-enabled step-by-step via the Harmony grammar. This mirrors the unit tests.
-    let mut globally_forbidden_special_ids: std::collections::BTreeSet<u32> = Default::default();
-    for sym in [
-        "<|channel|>",
-        "<|message|>",
-        "<|end|>",
-        "<|return|>",
-        "<|call|>",
-        "<|constrain|>",
-        "<|start|>",
-    ] {
-        if let Some(id) = hf_tok.token_to_id(sym) { globally_forbidden_special_ids.insert(id); }
-    }
-
     // Set up the logits processor / sampler.
     let sampling = if args.temperature <= 0.0 {
         Sampling::ArgMax
@@ -274,42 +259,9 @@ fn main() -> Result<()> {
                 }
             }
         }
-        // Decode the context so far and compute the Harmony-allowed specials for the next step.
-        // Then apply a probability mask that disables disallowed specials, keeping only those
-        // required by the grammar enabled for sampling.
-        let decoded_so_far = hf_tok
-            .decode(&tokens, /*skip_special_tokens=*/ false)
-            .unwrap_or_else(|_| String::new());
-        let allow_syms = allowed_specials_for_next(&decoded_so_far);
-        let mut allowed_ids: std::collections::BTreeSet<u32> = Default::default();
-        for s in allow_syms.iter() {
-            if let Some(id) = hf_tok.token_to_id(s) { allowed_ids.insert(id); }
-        }
-        // Compute the set of disallowed special ids this step.
-        let to_mask: Vec<u32> = globally_forbidden_special_ids
-            .iter()
-            .copied()
-            .filter(|id| !allowed_ids.contains(id))
-            .collect();
-        // Harmony grammar: immediately after "<|start|>assistant" we must emit "<|channel|>",
-        // and immediately after "<|channel|>" we must emit "<|message|>". At those two
-        // boundary steps, disable all non-special tokens so sampling can only choose the
-        // required special token. After "<|message|>", do not force specials; free text
-        // is allowed (terminators remain allowed but not forced).
-        let must_force_special = allow_syms.contains("<|channel|>") || allow_syms.contains("<|message|>");
-        let next = sampler.sample_f(&last, |prs: &mut [f32]| {
-            for id in &to_mask {
-                let idx = *id as usize;
-                if idx < prs.len() { prs[idx] = 0.0; }
-            }
-            if must_force_special {
-                // Zero out all non-special tokens and any specials not explicitly allowed.
-                // Retain only the allowed special ids in `allowed_ids`.
-                for (i, p) in prs.iter_mut().enumerate() {
-                    if !allowed_ids.contains(&(i as u32)) { *p = 0.0; }
-                }
-            }
-        })?;
+        // Sample next token. The model was trained on Harmony protocol and naturally
+        // follows the correct sequence without forcing. Just sample with temperature.
+        let next = sampler.sample(&last)?;
         tokens.push(next);
         index_pos += context_size;
         // Streaming: decode and extract after each token; emit only the newly appended portion.
