@@ -3053,11 +3053,14 @@ static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
 
         // Compute partial dot products using loaded weights
         // Each thread processes its assigned outputs based on threadIdx
+        // Note: Only num_rows_to_load weight rows were loaded into shared memory
+        const int num_rows_loaded = min(mmq_x, out_dim - col_base);
+
         #pragma unroll
         for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
             const int j_local = j0 + threadIdx.y;
 
-            if (j_local >= mmq_x || col_base + j_local >= out_dim) {
+            if (j_local >= mmq_x || col_base + j_local >= out_dim || j_local >= num_rows_loaded) {
                 continue;
             }
 
@@ -3085,6 +3088,12 @@ static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
 
                     // Get weight data from shared memory
                     const int weight_row = j_local;
+
+                    // Check if this weight row was actually loaded into shared memory
+                    if (weight_row >= num_rows_loaded) {
+                        continue;  // Skip if this row wasn't loaded
+                    }
+
                     const float scale = weight_scales_shared[weight_row * blocks_per_iter + b];
                     // shared_offset is in units of int (4 bytes), but we need byte offset for int8
                     const int shared_offset_ints = weight_row * (2 * MMQ_TILE_NE_K + 1);
@@ -3093,6 +3102,14 @@ static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
 
                     // Get activation data
                     const int k_offset = (k_block + b) * 32;
+
+                    // Check if this block is within bounds for activations
+                    if (k_offset + 32 > in_dim) {
+                        // This shouldn't happen if nblocks is computed correctly,
+                        // but add safety check to prevent out-of-bounds access
+                        continue;
+                    }
+
                     const __nv_bfloat16* act_block = act_row + k_offset;
 
                     // Compute dot product for one block (32 elements)
@@ -3131,6 +3148,13 @@ static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
                 continue;
             }
 
+            // Only write if this thread actually computed values
+            // For mmq_y < WARP_SIZE, acc_idx_i = i_local, so we need i_local < mmq_y
+            // For mmq_y >= WARP_SIZE, acc_idx_i = i0 / WARP_SIZE, which is always valid
+            if (mmq_y < WARP_SIZE && i_local >= mmq_y) {
+                continue;  // This thread didn't compute anything
+            }
+
             const int acc_idx_i = (mmq_y >= WARP_SIZE) ? (i0 / WARP_SIZE) : i_local;
             const int acc_idx_j = j0 / nwarps;
 
@@ -3156,7 +3180,7 @@ extern "C" __global__ void matmul_mxfp4_bf16_mmq(
 ) {
     // Use minimal tile size for testing: mmq_x=64, mmq_y=2
     // For production, increase to mmq_y=64 or 128
-    matmul_mxfp4_bf16_mmq_tiled<64, 2>(
+    matmul_mxfp4_bf16_mmq_tiled<64, 128>(
         act, blocks, scales, out,
         rows, out_dim, nblocks, in_dim,
         act_row_stride, out_row_stride
