@@ -1,0 +1,69 @@
+use super::GptOssLayerType;
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+pub struct RopeScalingConfig {
+    #[serde(default, alias = "type")]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub rope_type: Option<String>,
+    #[serde(default)]
+    pub factor: Option<f32>,
+    #[serde(default)]
+    pub beta_fast: Option<f32>,
+    #[serde(default)]
+    pub beta_slow: Option<f32>,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GptOssConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    #[serde(default)]
+    pub head_dim: Option<usize>,
+
+    // MoE
+    pub num_local_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub intermediate_size: usize,
+
+    // Positional
+    pub max_position_embeddings: usize,
+    #[serde(default)]
+    pub rope_theta: Option<f32>,
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScalingConfig>,
+
+    // Attention layout
+    #[serde(default)]
+    pub layer_types: Vec<GptOssLayerType>,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+
+    // Numerics / norms
+    #[serde(default)]
+    pub rms_norm_eps: Option<f64>,
+
+    // Feed-forward variant tuning
+    #[serde(default)]
+    pub swiglu_limit: Option<f32>,
+}
+
+impl GptOssConfig {
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+            .unwrap_or_else(|| self.hidden_size / self.num_attention_heads)
+    }
+
+    pub fn effective_layer_types(&self) -> Vec<GptOssLayerType> {
+        if self.layer_types.is_empty() {
+            vec![GptOssLayerType::FullAttention; self.num_hidden_layers]
+        } else {
+            self.layer_types.clone()
+        }
+    }
+}
