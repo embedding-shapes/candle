@@ -537,7 +537,7 @@ pub fn fused_expert_activation_cuda(
     alpha: f32,
     limit: f32,
 ) -> Result<Tensor> {
-    use crate::{cuda_backend::WrapErr, op::BackpropOp, storage::Storage, CudaStorage};
+    use crate::{cuda_backend::WrapErr, storage::Storage, CudaStorage};
     use cudarc::driver::PushKernelArg;
 
     let (batch, two_expert_dim) = gate_up.dims2()?;

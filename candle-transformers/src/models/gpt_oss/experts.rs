@@ -139,7 +139,6 @@ impl GptOssExperts {
 
         let batch_seq = b * t;
         let k = self.num_experts_per_tok;
-        let num_experts = self.experts.len();
         let mut ys = xs2.zeros_like()?;
 
         // Transfer routing info once (smaller than old approach)
