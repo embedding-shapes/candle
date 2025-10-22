@@ -20,16 +20,16 @@
 #include "quantized_dequant_vec_dot.cuh"
 
 // Individual Q-type implementations
-#include "q4_0.cuh"
-#include "q4_1.cuh"
-#include "q5_0.cuh"
-#include "q5_1.cuh"
-#include "q8_0.cuh"
-#include "q2_k.cuh"
-#include "q3_k.cuh"
-#include "q4_k.cuh"
-#include "q5_k.cuh"
-#include "q6_k.cuh"
+#include "q4_0.cu"
+#include "q4_1.cu"
+#include "q5_0.cu"
+#include "q5_1.cu"
+#include "q8_0.cu"
+#include "q2_k.cu"
+#include "q3_k.cu"
+#include "q4_k.cu"
+#include "q5_k.cu"
+#include "q6_k.cu"
 
 // MXFP4 kernel implementations
 #include "mxfp4.cuh"

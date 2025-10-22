@@ -94,3 +94,61 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #define QR_MXFP4  2   // Ratio (related to expansion when dequantizing)
 #define QI_MXFP4  4   // 4-way interleaving in quantized representation (QK_MXFP4/(4*QR_MXFP4))
 
+
+// Additional MXFP4 helper functions
+// -----------------------------------------------------------------------------
+// MXFP4 (FP4 E2M1 + E8M0 scale) fused dequantize to BF16
+// Input layout:
+//  - blocks: [rows, nblocks, 16] (two FP4 per byte => 32 values per block)
+//  - scales: [rows, nblocks] (u8 E8M0 biased exponent; scale = 2^(u8-127), 0xFF reserved/NaN)
+// Output layout:
+//  - out: [rows, cols] where cols = nblocks * 32 (BF16)
+// Grid config suggestion: dim3 grid(rows, nblocks), dim3 block(32)
+
+static __device__ __forceinline__ float decode_fp4_e2m1_device(uint8_t n) {
+    // s e e m  (E2M1), bias = 1
+    const uint8_t s = (n >> 3) & 0x1;
+    const uint8_t e = (n >> 1) & 0x3;
+    const uint8_t m = (n >> 0) & 0x1;
+    const float sign = s ? -1.0f : 1.0f;
+    if (e == 0) {
+        // subnormal: 2^(1-bias) * (m * 2^-1) = 2^0 * (m * 0.5)
+        const float frac = (float)m * 0.5f;
+        return sign * frac; // since 2^(0) == 1
+    } else {
+        // normal: 2^(E-bias) * (1 + m/2)
+        const float frac = 1.0f + (float)m * 0.5f;
+        const int exp = (int)e - 1; // bias=1
+        return sign * ldexpf(frac, exp);
+    }
+}
+
+static __device__ __forceinline__ float pow2_e8m0_device(uint8_t bexp) {
+    // Biased 8-bit exponent: scale = 2^(u8 - 127); 0xFF reserved => NaN
+    if (bexp == 0xFFu) {
+        return __int_as_float(0x7FC00000); // quiet NaN
+    }
+    if (bexp == 0u) {
+        // Smallest positive representable power-of-two: 2^-127.
+        return __uint_as_float(0x00800000) * 0.5f;
+    }
+    const uint32_t bits = ((uint32_t)bexp) << 23;
+    return __uint_as_float(bits);
+}
+
+__device__ __constant__ int8_t MXFP4_FP4_LUT[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12,
+    0, -1, -2, -3, -4, -6, -8, -12
+};
+
+__device__ __constant__ int8_t MXFP4_INT8_LUT[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12,
+    0, -1, -2, -3, -4, -6, -8, -12
+};
+
+__device__ __forceinline__ int pack_int8x4(int8_t x0, int8_t x1, int8_t x2, int8_t x3) {
+    return (static_cast<int>(static_cast<uint8_t>(x0))      ) |
+           (static_cast<int>(static_cast<uint8_t>(x1)) <<  8) |
+           (static_cast<int>(static_cast<uint8_t>(x2)) << 16) |
+           (static_cast<int>(static_cast<uint8_t>(x3)) << 24);
+}
