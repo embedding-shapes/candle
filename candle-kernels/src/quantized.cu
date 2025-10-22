@@ -2914,23 +2914,20 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fast(
                 const int aux_q4 = get_int_b1(block_data, kqsx);
                 const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
 
-                // Store to shared memory as a contiguous, interleaved stream of 32 int8 values per block.
-                // The compute path expects weights laid out as w[0..31] matching activation order.
-                // get_int_from_table_16 returns 8 dequantized bytes split as:
-                //   v.x -> even indices (0,2,4,6), v.y -> odd indices (1,3,5,7)
-                // We interleave them into [e0,o0,e1,o1,e2,o2,e3,o3] at the proper byte offset.
-                const int row_stride_ints = (2 * MMQ_TILE_NE_K + 1);
+                // Store to shared memory in SEQUENTIAL order (our BF16 activations are sequential)
+                // get_int_from_table_16 returns: v.x = even nibbles, v.y = odd nibbles
+                // Interleave bytes to get sequential order: nibble0,nibble1,nibble2,...
+                const int row_stride_ints = (2 * MMQ_TILE_NE_K + 1);  // 65 ints
                 int8_t* row_bytes = reinterpret_cast<int8_t*>(&weight_qs_shared[row_local * row_stride_ints]);
-                const int block_byte_base = kbx * 32 + kqsx * 8; // 8 bytes contributed by this thread
+                const int byte_offset = kbx * 32 + kqsx * 8;  // 8 bytes per thread (one kqsx)
 
-                const uint32_t even = static_cast<uint32_t>(v.x);
-                const uint32_t odd  = static_cast<uint32_t>(v.y);
+                // Interleave: even nibble, odd nibble, even nibble, odd nibble, ...
+                const int8_t* vx_bytes = reinterpret_cast<const int8_t*>(&v.x);
+                const int8_t* vy_bytes = reinterpret_cast<const int8_t*>(&v.y);
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    const uint8_t eb = (even >> (8 * i)) & 0xffu;
-                    const uint8_t ob = (odd  >> (8 * i)) & 0xffu;
-                    row_bytes[block_byte_base + 2 * i + 0] = static_cast<int8_t>(eb);
-                    row_bytes[block_byte_base + 2 * i + 1] = static_cast<int8_t>(ob);
+                    row_bytes[byte_offset + 2*i + 0] = vx_bytes[i];  // even nibble (0,2,4,6)
+                    row_bytes[byte_offset + 2*i + 1] = vy_bytes[i];  // odd nibble (1,3,5,7)
                 }
             }
         }
@@ -2967,20 +2964,17 @@ static __device__ __forceinline__ void vec_dot_mxfp4_bf16_mmq(
         if (b >= blocks_this_iter) break;
 
         const float scale = weight_scales_shared[weight_row * blocks_per_iter + b];
-        const int shared_offset = weight_row * (2 * MMQ_TILE_NE_K + 1) + b * 32;
+        // Each block is 32 INT8 values = 32 bytes = 8 ints
+        const int shared_offset_ints = weight_row * (2 * MMQ_TILE_NE_K + 1) + b * 8;
 
-        // Each block has 32 elements, process in groups of 4 for __dp4a
+        // Each block has 32 elements, process in groups of 4 (one int contains 4 INT8 values)
         #pragma unroll
         for (int k = 0; k < 32; k += 4) {
-            // Load 4 INT8 weights (packed in one int)
-            int weight_int8_4;
-            {
-                const int8_t* w_ptr = (const int8_t*)&weight_qs_shared[shared_offset + k];
-                weight_int8_4 = *((int*)w_ptr);
-            }
+            // Load 4 INT8 weights from one int (4 bytes)
+            const int k_int = k / 4;  // Convert element index to int index (0,1,2,...,7)
+            int weight_int8_4 = weight_qs_shared[shared_offset_ints + k_int];
 
-            // Load 4 BF16 activations and convert to INT8 (scaled by 127)
-            // For simplicity, use FP32 path here - __dp4a with BF16 requires quantization
+            // Load 4 BF16 activations and multiply with INT8 weights
             const int act_idx = k_offset + b * 32 + k;
             float sum_4 = 0.0f;
             #pragma unroll
