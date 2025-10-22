@@ -3180,7 +3180,7 @@ extern "C" __global__ void matmul_mxfp4_bf16_mmq(
 ) {
     // Use minimal tile size for testing: mmq_x=64, mmq_y=2
     // For production, increase to mmq_y=64 or 128
-    matmul_mxfp4_bf16_mmq_tiled<64, 128>(
+    matmul_mxfp4_bf16_mmq_tiled<64, 32>(
         act, blocks, scales, out,
         rows, out_dim, nblocks, in_dim,
         act_row_stride, out_row_stride
