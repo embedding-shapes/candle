@@ -19,7 +19,7 @@
 // Dequantization and vector dot product templates
 #include "quantized_dequant_vec_dot.cuh"
 
-// Individual Q-type implementations
+// Individual Q-type vec_dot implementations
 #include "q4_0.cuh"
 #include "q4_1.cuh"
 #include "q5_0.cuh"
@@ -32,7 +32,13 @@
 #include "q6_k.cuh"
 
 // MXFP4 kernel implementations
-#include "mxfp4.cuh"
+#include "mxfp4_dequant.cuh"
+#include "mxfp4_load_tiles.cuh"
+#include "mxfp4_matmul_mmq.cuh"
+#include "mxfp4_matmul_direct.cuh"
+
+// Q-type MMQ implementations (allocate/load tiles, vec_dot, mul_mat)
+#include "q_types_mmq.cuh"
 
 // Special kernels (fused expert activation)
 #include "special.cuh"
