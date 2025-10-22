@@ -464,13 +464,13 @@ pub fn matmul_mxfp4_bf16_mmq_cuda(
     let mut out_slice = unsafe { dev.alloc::<bf16>(rows * out_dim)? };
 
     // MMQ configuration matching kernel expectations
-    // The matmul_mxfp4_bf16_mmq_tiled<64, 2> kernel uses:
+    // The matmul_mxfp4_bf16_mmq_tiled<64, 32> kernel uses:
     // - mmq_x = 64 (tile width in output columns)
-    // - mmq_y = 2 (tile height in output rows)
+    // - mmq_y = 32 (tile height in output rows)
     // - nwarps = 4 (MMQ_NWARPS)
     // - Block layout: (32, 4, 1) = 32 threads × 4 warps = 128 threads
     const MMQ_X: usize = 64;  // Tile width
-    const MMQ_Y: usize = 2;   // Tile height
+    const MMQ_Y: usize = 32;   // Tile height (MUST match kernel template parameter!)
     const NWARPS: usize = 4;  // Number of warps per block
     const WARP_SIZE: usize = 32;
 
