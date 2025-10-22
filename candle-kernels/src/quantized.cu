@@ -2885,8 +2885,7 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fast(
 ) {
     constexpr int nwarps = MMQ_NWARPS;
     const int warp_id = threadIdx.y;
-    const int lane_id = threadIdx.x;
-    const int tid = warp_id * 32 + lane_id;
+    const int lane_id = threadIdx.x; // 0..31 within warp
 
     // How many blocks we're loading in K dimension (typically MMQ_ITER_K / 32 = 8 blocks)
     constexpr int blocks_per_iter = MMQ_ITER_K / 32;
@@ -2895,8 +2894,9 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fast(
     // For MXFP4: each block has 32 elements packed in 16 bytes
     // We use get_int_from_table_16 to dequantize 8 FP4 values → 8 INT8 values per call
 
-    const int kbx = tid / QI_MXFP4;    // Which block in K dimension (0-31 for 128 threads, 8 blocks)
-    const int kqsx = tid % QI_MXFP4;   // Which 4-byte position within block (0-3)
+    // Map lanes to per-block loaders: 8 lanes (each handling 4 bytes) per 32-value block
+    const int kbx  = lane_id / QI_MXFP4; // 0..7 blocks per iteration
+    const int kqsx = lane_id % QI_MXFP4; // 0..3 4-byte chunks within block
 
     // Load quantized weights and scales
     #pragma unroll
@@ -2914,12 +2914,24 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fast(
                 const int aux_q4 = get_int_b1(block_data, kqsx);
                 const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
 
-                // Store to shared memory: [row_local][k_elem]
-                // Use 2*MMQ_TILE_NE_K + 1 stride to avoid bank conflicts
-                const int k0 = kbx * 8 + kqsx;  // Starting element index (0-255)
-                const int shared_offset = row_local * (2 * MMQ_TILE_NE_K + 1);
-                weight_qs_shared[shared_offset + k0 + 0]        = v.x;  // 4 values
-                weight_qs_shared[shared_offset + k0 + QI_MXFP4] = v.y;  // 4 values
+                // Store to shared memory as a contiguous, interleaved stream of 32 int8 values per block.
+                // The compute path expects weights laid out as w[0..31] matching activation order.
+                // get_int_from_table_16 returns 8 dequantized bytes split as:
+                //   v.x -> even indices (0,2,4,6), v.y -> odd indices (1,3,5,7)
+                // We interleave them into [e0,o0,e1,o1,e2,o2,e3,o3] at the proper byte offset.
+                const int row_stride_ints = (2 * MMQ_TILE_NE_K + 1);
+                int8_t* row_bytes = reinterpret_cast<int8_t*>(&weight_qs_shared[row_local * row_stride_ints]);
+                const int block_byte_base = kbx * 32 + kqsx * 8; // 8 bytes contributed by this thread
+
+                const uint32_t even = static_cast<uint32_t>(v.x);
+                const uint32_t odd  = static_cast<uint32_t>(v.y);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint8_t eb = (even >> (8 * i)) & 0xffu;
+                    const uint8_t ob = (odd  >> (8 * i)) & 0xffu;
+                    row_bytes[block_byte_base + 2 * i + 0] = static_cast<int8_t>(eb);
+                    row_bytes[block_byte_base + 2 * i + 1] = static_cast<int8_t>(ob);
+                }
             }
         }
 
@@ -3013,9 +3025,9 @@ static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
     const int col_base = blockIdx.y * mmq_x;
 
     // Accumulator: each thread handles multiple outputs
-    // Size: (mmq_y/warp_size) × (mmq_x/nwarps)
-    // Use max(1, ...) to avoid zero-sized arrays
-    constexpr int acc_rows = (mmq_y >= WARP_SIZE) ? (mmq_y / WARP_SIZE) : 1;
+    // Size: (mmq_y/warp_size) × (mmq_x/nwarps) when mmq_y >= WARP_SIZE
+    // Size: mmq_y × (mmq_x/nwarps) when mmq_y < WARP_SIZE
+    constexpr int acc_rows = (mmq_y >= WARP_SIZE) ? (mmq_y / WARP_SIZE) : mmq_y;
     constexpr int acc_cols = mmq_x / nwarps;
     float acc[acc_rows][acc_cols];
 
@@ -3067,8 +3079,9 @@ static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
                 const __nv_bfloat16* act_row = act + (row_base + i_local) * act_row_stride;
 
                 // Accumulator index in the acc array
-                // Handle case when mmq_y < WARP_SIZE
-                const int acc_idx_i = (mmq_y >= WARP_SIZE) ? (i0 / WARP_SIZE) : 0;
+                // When mmq_y >= WARP_SIZE: multiple i0 iterations, acc_idx_i = i0 / WARP_SIZE
+                // When mmq_y < WARP_SIZE: single i0=0, acc_idx_i = i_local (one acc row per output row)
+                const int acc_idx_i = (mmq_y >= WARP_SIZE) ? (i0 / WARP_SIZE) : i_local;
                 const int acc_idx_j = j0 / nwarps;
 
                 // Process blocks_per_iter blocks (typically 8 blocks = 256 elements)
@@ -3079,8 +3092,10 @@ static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
                     // Get weight data from shared memory
                     const int weight_row = j_local;
                     const float scale = weight_scales_shared[weight_row * blocks_per_iter + b];
-                    const int shared_offset = weight_row * (2 * MMQ_TILE_NE_K + 1) + b * 32;
-                    const int8_t* weight_int8 = (const int8_t*)&weight_qs_shared[shared_offset];
+                    // shared_offset is in units of int (4 bytes), but we need byte offset for int8
+                    const int shared_offset_ints = weight_row * (2 * MMQ_TILE_NE_K + 1);
+                    const int8_t* weight_row_base = (const int8_t*)&weight_qs_shared[shared_offset_ints];
+                    const int8_t* weight_int8 = weight_row_base + b * 32;
 
                     // Get activation data
                     const int k_offset = (k_block + b) * 32;
@@ -3110,7 +3125,7 @@ static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
         const int col = col_base + j_local;
 
         if (col >= out_dim) {
-            return;
+            continue;  // Skip this column, not all threads
         }
 
         #pragma unroll
@@ -3122,7 +3137,7 @@ static __device__ __forceinline__ void matmul_mxfp4_bf16_mmq_tiled(
                 continue;
             }
 
-            const int acc_idx_i = (mmq_y >= WARP_SIZE) ? (i0 / WARP_SIZE) : 0;
+            const int acc_idx_i = (mmq_y >= WARP_SIZE) ? (i0 / WARP_SIZE) : i_local;
             const int acc_idx_j = j0 / nwarps;
 
             out[row * out_row_stride + col] = __float2bfloat16(acc[acc_idx_i][acc_idx_j]);

@@ -10,6 +10,8 @@
 //! - Final output shape is [rows, cols] with `cols = blocks * 32`.
 
 use crate::{bail, DType, Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use crate::backend::BackendDevice; // for dev.synchronize()
 use half::bf16;
 
 // Constants
@@ -475,6 +477,17 @@ pub fn matmul_mxfp4_bf16_mmq_cuda(
     let grid_x = (rows + MMQ_Y - 1) / MMQ_Y;
     let grid_y = (out_dim + MMQ_X - 1) / MMQ_X;
 
+    // Optional debug
+    let debug = matches!(
+        std::env::var("CANDLE_MXFP4_DEBUG_MMQ").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    );
+    if debug {
+        eprintln!(
+            "[MMQ] launch rows={} out_dim={} in_dim={} nblocks={} act_row_stride={} grid=({}, {}) block=(32,{})",
+            rows, out_dim, in_dim, nblocks, act_row_stride, grid_x, grid_y, NWARPS
+        );
+    }
     // Load and launch MMQ kernel
     let func = dev.get_or_load_func("matmul_mxfp4_bf16_mmq", &candle_kernels::QUANTIZED)?;
 
@@ -499,6 +512,10 @@ pub fn matmul_mxfp4_bf16_mmq_cuda(
         out_dim as i32  // out_row_stride
     );
     unsafe { builder.launch(cfg) }.w()?;
+    if debug {
+        // Synchronize to surface kernel errors at the exact call site
+        dev.synchronize().map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+    }
 
     // Wrap output in tensor
     let out_storage = CudaStorage::wrap_cuda_slice(out_slice, dev.clone());

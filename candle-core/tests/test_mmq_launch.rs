@@ -71,5 +71,29 @@ fn test_mmq_launch_config() -> candle_core::Result<()> {
     let vals = result.to_vec2::<bf16>()?;
     eprintln!("  First 5 output values: {:?}", &vals[0][..5.min(vals[0].len())]);
 
+    // Now compare against non-MMQ path
+    std::env::remove_var("CANDLE_MXFP4_USE_MMQ");
+    eprintln!("\nRunning non-MMQ path for comparison...");
+    let result_ref = candle_core::mxfp4::matmul_mxfp4_bf16(&act, &blocks, &scales)?;
+    let vals_ref = result_ref.to_vec2::<bf16>()?;
+    eprintln!("  First 5 reference values: {:?}", &vals_ref[0][..5.min(vals_ref[0].len())]);
+
+    // Compare differences
+    let diff: Vec<f32> = vals[0].iter().zip(&vals_ref[0])
+        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+        .collect();
+    let max_diff = diff.iter().copied().fold(0.0f32, f32::max);
+    let mean_diff = diff.iter().sum::<f32>() / diff.len() as f32;
+    eprintln!("  Max diff: {:.6}", max_diff);
+    eprintln!("  Mean diff: {:.6}", mean_diff);
+
+    // Check if results match within tolerance
+    let tolerance = 0.1;  // BF16 tolerance
+    if max_diff > tolerance {
+        eprintln!("ERROR: MMQ and non-MMQ results differ by more than {}", tolerance);
+        eprintln!("This suggests a bug in the MMQ kernel!");
+        return Err(candle_core::Error::Msg("MMQ kernel produces incorrect results".to_string()));
+    }
+
     Ok(())
 }
